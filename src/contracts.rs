@@ -438,6 +438,62 @@ where
         Ok(())
     }
 
+    #[cfg(feature = "async")]
+    /// Update the status of all witnesses and single-use seal definitions.
+    ///
+    /// Applies rollbacks or forwards if required and recomputes the state of the affected
+    /// contracts.
+    pub async fn update_contract_witnesses_async<E: core::error::Error>(
+        &mut self,
+        contract_id: Option<ContractId>,
+        resolver: impl AsyncFn(
+            <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId,
+        ) -> Result<WitnessStatus, E>,
+        last_block_height: u64,
+        min_conformations: u32,
+    ) -> Result<(), MultiError<SyncError<E>, <Sp::Stock as Stock>::Error>> {
+        let mut changed_statuses = IndexMap::<_, WitnessStatus>::new();
+        let contract_ids = match contract_id {
+            Some(contract_id) => {
+                if !self.has_contract(contract_id) {
+                    return Err(MultiError::A(SyncError::ContractNotFound(contract_id)));
+                }
+                IndexSet::from([contract_id])
+            }
+            _ => self.persistence.contract_ids().collect::<IndexSet<_>>(),
+        };
+
+        for contract_id in contract_ids {
+            self.with_contract_mut_async(
+                contract_id,
+                async |contract| -> Result<(), MultiError<SyncError<E>, <Sp::Stock as Stock>::Error>> {
+                    for witness_id in contract.witness_ids() {
+                        let old_status = contract.witness_status(witness_id);
+                        if matches!(old_status, WitnessStatus::Mined(height) if last_block_height - height.get() > min_conformations as u64) {
+                            continue
+                        }
+                        let new_status = match changed_statuses.get(&witness_id) {
+                            None => resolver(witness_id)
+                                .await
+                                .map_err(SyncError::Status)
+                                .map_err(MultiError::A),
+                            Some(witness_id) => Ok(*witness_id),
+                        }?;
+                        if new_status != old_status {
+                            changed_statuses.insert(witness_id, new_status);
+                        }
+                    }
+                    contract
+                        .sync(changed_statuses.iter().map(|(id, status)| (*id, *status)))
+                        .map_err(MultiError::from_other_a)?;
+                    Ok(())
+                },
+            ).await?;
+        }
+
+        Ok(())
+    }
+
     /// Include an operation and its witness to the history of known operations and the contract
     /// state.
     ///
@@ -724,6 +780,7 @@ mod _fs {
 #[derive(Debug, Display, Error, From)]
 #[display(doc_comments)]
 pub enum SyncError<E: core::error::Error> {
+    ContractNotFound(ContractId),
     /// unable to synchronize wallet. Details: {0}
     Wallet(E),
 
