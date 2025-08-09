@@ -248,6 +248,13 @@ where
         self.persistence.contract_ids()
     }
 
+    pub fn contract_witness_ids(
+        &self,
+        contract_id: ContractId,
+    ) -> Vec<<<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId> {
+        self.with_contract(contract_id, |contract| contract.witness_ids().collect(), Some(vec![]))
+    }
+
     /// Get the contract state.
     ///
     /// The call does not recompute the contract state, but does a seal resolution,
@@ -371,7 +378,7 @@ where
                     for witness_id in contract.witness_ids() {
                         let old_status = contract.witness_status(witness_id);
                         if matches!(old_status, WitnessStatus::Mined(height) if last_block_height - height.get() > min_conformations as u64) {
-                            continue
+                            continue;
                         }
                         let new_status = match changed_statuses.get(&witness_id) {
                             None => resolver(witness_id)
@@ -415,7 +422,7 @@ where
                     for witness_id in contract.witness_ids() {
                         let old_status = contract.witness_status(witness_id);
                         if matches!(old_status, WitnessStatus::Mined(height) if last_block_height - height.get() > min_conformations as u64) {
-                            continue
+                            continue;
                         }
                         let new_status = match changed_statuses.get(&witness_id) {
                             None => resolver(witness_id)
@@ -470,7 +477,7 @@ where
                     for witness_id in contract.witness_ids() {
                         let old_status = contract.witness_status(witness_id);
                         if matches!(old_status, WitnessStatus::Mined(height) if last_block_height - height.get() > min_conformations as u64) {
-                            continue
+                            continue;
                         }
                         let new_status = match changed_statuses.get(&witness_id) {
                             None => resolver(witness_id)
