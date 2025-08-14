@@ -110,7 +110,9 @@ where
 
     fn cli_witness(&self, wid: Seal::WitnessId) -> Seal::Client { self.hoard.get_expect(wid) }
 
-    fn witness_status(&self, wid: Seal::WitnessId) -> WitnessStatus { self.mine.get_expect(wid) }
+    fn witness_status(&self, wid: Seal::WitnessId) -> WitnessStatus {
+        self.mine.get(wid).unwrap_or(WitnessStatus::Archived)
+    }
 
     fn witness_ids(&self) -> impl Iterator<Item = <Self::Seal as RgbSeal>::WitnessId> {
         self.stand.keys()
