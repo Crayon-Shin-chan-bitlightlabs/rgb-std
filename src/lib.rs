@@ -75,6 +75,8 @@ pub use contract::{
     Assignment, ConsumeError, Contract, ContractState, CreateParams, EitherSeal, ImmutableState,
     OwnedState,
 };
+#[cfg(feature = "async")]
+pub use contracts::TxidResolver;
 #[cfg(feature = "binfile")]
 pub use contracts::CONSIGN_MAGIC_NUMBER;
 pub use contracts::{

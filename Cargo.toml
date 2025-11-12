@@ -36,6 +36,7 @@ indexmap = "2.9.0"
 chrono = "0.4.41"
 serde = "1.0"
 serde_with = "1.14"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 
 [package]
 name = "rgb-std"
@@ -76,6 +77,7 @@ indexmap.workspace = true
 chrono.workspace = true
 serde = { workspace = true, optional = true }
 serde_with = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 rand = "0.9.1"
@@ -85,7 +87,7 @@ rgb-persist-fs.workspace = true
 default = ["std", "bitcoin"]
 all = ["std", "bitcoin", "liquid", "prime", "binfile", "uri", "stl", "serde", "async"]
 std = ["rgb-invoice/std", "indexmap/std"]
-async = []
+async = ["tokio"]
 
 bitcoin = ["bp-core", "bp-invoice", "rgb-core/bitcoin", "rgb-invoice/bitcoin"]
 liquid = ["rgb-core/liquid", "rgb-invoice/liquid"]

@@ -47,6 +47,14 @@ use crate::{
     SigBlob, StateName, Stockpile, WitnessStatus,
 };
 
+#[cfg(feature = "async")]
+pub trait TxidResolver<Sp: Stockpile, E: core::error::Error> {
+    async fn resolve(
+        &self,
+        witness_id: <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId,
+    ) -> Result<WitnessStatus, E>;
+}
+
 pub const CONSIGN_VERSION: u16 = 0;
 #[cfg(feature = "binfile")]
 pub use _fs::CONSIGN_MAGIC_NUMBER;
@@ -81,7 +89,9 @@ pub struct WalletState<Seal> {
 }
 
 impl<Seal> Default for WalletState<Seal> {
-    fn default() -> Self { Self { immutable: bmap! {}, owned: bmap! {}, aggregated: bmap! {} } }
+    fn default() -> Self {
+        Self { immutable: bmap! {}, owned: bmap! {}, aggregated: bmap! {} }
+    }
 }
 
 impl<Seal> WalletState<Seal> {
@@ -197,8 +207,11 @@ where
         // We need this bullshit due to a failed rust `RefCell` implementation which panics if we do
         // this block any other way.
         if self.contracts.borrow().contains_key(&id) {
-            return f(self.contracts.borrow_mut().get_mut(&id).unwrap()).await;
+            let mut contracts = self.contracts.borrow_mut();
+            let mut contract = contracts.get_mut(&id).unwrap();
+            return tokio::runtime::Handle::current().block_on(f(&mut contract));
         }
+
         if let Some(mut contract) = self.persistence.contract(id) {
             let res = f(&mut contract).await;
             self.contracts.borrow_mut().insert(id, contract);
@@ -219,9 +232,13 @@ where
         self.persistence.codex_ids()
     }
 
-    pub fn issuers_count(&self) -> usize { self.persistence.issuers_count() }
+    pub fn issuers_count(&self) -> usize {
+        self.persistence.issuers_count()
+    }
 
-    pub fn has_issuer(&self, codex_id: CodexId) -> bool { self.persistence.has_issuer(codex_id) }
+    pub fn has_issuer(&self, codex_id: CodexId) -> bool {
+        self.persistence.has_issuer(codex_id)
+    }
 
     pub fn issuers(&self) -> impl Iterator<Item = (CodexId, Issuer)> + use<'_, Sp, S, C> {
         self.persistence
@@ -234,11 +251,13 @@ where
             return Some(issuer.clone());
         };
         let issuer = self.persistence.issuer(codex_id)?;
-        self.issuers.borrow_mut().insert(codex_id, issuer);
-        self.issuers.borrow().get(&codex_id).cloned()
+        self.issuers.borrow_mut().insert(codex_id, issuer.clone());
+        Some(issuer)
     }
 
-    pub fn contracts_count(&self) -> usize { self.persistence.contracts_count() }
+    pub fn contracts_count(&self) -> usize {
+        self.persistence.contracts_count()
+    }
 
     pub fn has_contract(&self, contract_id: ContractId) -> bool {
         self.persistence.has_contract(contract_id)
@@ -453,9 +472,7 @@ where
     pub async fn update_contract_witnesses_async<E: core::error::Error>(
         &mut self,
         contract_id: Option<ContractId>,
-        resolver: impl AsyncFn(
-            <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId,
-        ) -> Result<WitnessStatus, E>,
+        resolver: impl TxidResolver<Sp, E>,
         last_block_height: u64,
         min_conformations: u32,
     ) -> Result<(), MultiError<SyncError<E>, <Sp::Stock as Stock>::Error>> {
@@ -467,7 +484,7 @@ where
                 }
                 IndexSet::from([contract_id])
             }
-            _ => self.persistence.contract_ids().collect::<IndexSet<_>>(),
+            _ => self.contract_ids().collect::<IndexSet<_>>(),
         };
 
         for contract_id in contract_ids {
@@ -480,7 +497,7 @@ where
                             continue;
                         }
                         let new_status = match changed_statuses.get(&witness_id) {
-                            None => resolver(witness_id)
+                            None => resolver.resolve(witness_id)
                                 .await
                                 .map_err(SyncError::Status)
                                 .map_err(MultiError::A),
