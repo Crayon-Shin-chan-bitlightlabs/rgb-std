@@ -35,7 +35,6 @@ use crate::{
     parse_consignment, Consignment, ContractMeta, Identity, Issue, Issuer, IssuerError, IssuerSpec,
     OpRels, Pile, PileSession, VerifiedOperation, Witness, WitnessStatus,
 };
-
 #[derive(Copy, Clone, PartialEq, Eq, Debug, From)]
 #[cfg_attr(
     feature = "serde",
@@ -641,7 +640,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         };
         let mut ps = self.pile.session();
         ps.add_witness(opid, wid, published, &anchor, WitnessStatus::Tentative);
-        ps.commit_transaction();
+        ps.include_commit_transaction();
     }
 
     fn aux<W: WriteRaw>(
