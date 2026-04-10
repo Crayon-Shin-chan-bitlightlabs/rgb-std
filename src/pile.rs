@@ -271,6 +271,19 @@ pub trait Pile {
     /// If the method was not called, the data won't persist, and on termination the program will
     /// panic.
     fn commit_transaction(&mut self);
+
+    /// Called after each [`Pile::add_witness`] inside a consume loop to ensure written data
+    /// remains readable for subsequent verification steps within the same session.
+    ///
+    /// The default implementation calls [`Pile::commit_transaction`], which is required for
+    /// file-based backends where uncommitted writes are not visible to reads.
+    ///
+    /// Backends that buffer writes in memory and make them immediately readable (e.g. a
+    /// PostgreSQL-backed implementation using in-process aora buffers) should override this
+    /// method as a no-op to avoid a per-operation database round-trip.  The outer
+    /// [`Contract::evaluate_commit`] still calls [`Pile::commit_transaction`] once at the end
+    /// to durably persist all accumulated writes.
+    fn include_commit_transaction(&mut self) { self.commit_transaction(); }
 }
 
 #[cfg(test)]
