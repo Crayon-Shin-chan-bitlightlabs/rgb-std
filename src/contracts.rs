@@ -25,12 +25,16 @@
 use alloc::collections::BTreeMap;
 use core::borrow::Borrow;
 use core::cell::RefCell;
+#[cfg(feature = "async")]
+use core::future::Future;
 use std::collections::HashMap;
 use std::io;
 
 use amplify::confinement::{KeyedCollection, SmallOrdMap};
 use amplify::MultiError;
 use commit_verify::StrictHash;
+#[cfg(feature = "async")]
+use futures_util::{stream, StreamExt, TryStreamExt};
 use hypersonic::{
     AcceptError, AuthToken, CallParams, CodexId, ContractId, ContractName, Opid, Stock,
 };
@@ -48,6 +52,8 @@ use crate::{
 };
 
 pub const CONSIGN_VERSION: u16 = 0;
+#[cfg(feature = "async")]
+const RESOLVER_CONCURRENCY_LIMIT: usize = 16;
 #[cfg(feature = "binfile")]
 pub use _fs::CONSIGN_MAGIC_NUMBER;
 
@@ -180,27 +186,6 @@ where
         }
         if let Some(mut contract) = self.persistence.contract(id) {
             let res = f(&mut contract);
-            self.contracts.borrow_mut().insert(id, contract);
-            res
-        } else {
-            panic!("Contract {id} not found")
-        }
-    }
-
-    #[cfg(feature = "async")]
-    #[allow(clippy::await_holding_refcell_ref)]
-    async fn with_contract_mut_async<R>(
-        &mut self,
-        id: ContractId,
-        f: impl AsyncFnOnce(&mut Contract<Sp::Stock, Sp::Pile>) -> R,
-    ) -> R {
-        // We need this bullshit due to a failed rust `RefCell` implementation which panics if we do
-        // this block any other way.
-        if self.contracts.borrow().contains_key(&id) {
-            return f(self.contracts.borrow_mut().get_mut(&id).unwrap()).await;
-        }
-        if let Some(mut contract) = self.persistence.contract(id) {
-            let res = f(&mut contract).await;
             self.contracts.borrow_mut().insert(id, contract);
             res
         } else {
@@ -413,36 +398,8 @@ where
         last_block_height: u64,
         min_conformations: u32,
     ) -> Result<(), MultiError<SyncError<E>, <Sp::Stock as Stock>::Error>> {
-        let mut changed_statuses = IndexMap::<_, WitnessStatus>::new();
-        let contract_ids = self.persistence.contract_ids().collect::<IndexSet<_>>();
-        for contract_id in contract_ids {
-            self.with_contract_mut_async(
-                contract_id,
-                async |contract| -> Result<(), MultiError<SyncError<E>, <Sp::Stock as Stock>::Error>> {
-                    for witness_id in contract.witness_ids() {
-                        let old_status = contract.witness_status(witness_id);
-                        if matches!(old_status, WitnessStatus::Mined(height) if last_block_height - height.get() > min_conformations as u64) {
-                            continue;
-                        }
-                        let new_status = match changed_statuses.get(&witness_id) {
-                            None => resolver(witness_id)
-                                .await
-                                .map_err(SyncError::Status)
-                                .map_err(MultiError::A),
-                            Some(witness_id) => Ok(*witness_id),
-                        }?;
-                        if new_status != old_status {
-                            changed_statuses.insert(witness_id, new_status);
-                        }
-                    }
-                    contract
-                        .sync(changed_statuses.iter().map(|(id, status)| (*id, *status)))
-                        .map_err(MultiError::from_other_a)?;
-                    Ok(())
-                },
-            ).await?;
-        }
-        Ok(())
+        self.update_contract_witnesses_async(None, resolver, last_block_height, min_conformations)
+            .await
     }
 
     #[cfg(feature = "async")]
@@ -459,7 +416,7 @@ where
         last_block_height: u64,
         min_conformations: u32,
     ) -> Result<(), MultiError<SyncError<E>, <Sp::Stock as Stock>::Error>> {
-        let mut changed_statuses = IndexMap::<_, WitnessStatus>::new();
+        let mut resolved_statuses = IndexMap::<_, WitnessStatus>::new();
         let contract_ids = match contract_id {
             Some(contract_id) => {
                 if !self.has_contract(contract_id) {
@@ -471,31 +428,138 @@ where
         };
 
         for contract_id in contract_ids {
-            self.with_contract_mut_async(
+            let witnesses = self.with_contract(
                 contract_id,
-                async |contract| -> Result<(), MultiError<SyncError<E>, <Sp::Stock as Stock>::Error>> {
-                    for witness_id in contract.witness_ids() {
-                        let old_status = contract.witness_status(witness_id);
-                        if matches!(old_status, WitnessStatus::Mined(height) if last_block_height - height.get() > min_conformations as u64) {
-                            continue;
-                        }
-                        let new_status = match changed_statuses.get(&witness_id) {
-                            None => resolver(witness_id)
-                                .await
-                                .map_err(SyncError::Status)
-                                .map_err(MultiError::A),
-                            Some(witness_id) => Ok(*witness_id),
-                        }?;
-                        if new_status != old_status {
-                            changed_statuses.insert(witness_id, new_status);
-                        }
+                |contract| {
+                    contract
+                        .witness_ids()
+                        .map(|witness_id| (witness_id, contract.witness_status(witness_id)))
+                        .collect::<Vec<_>>()
+                },
+                None,
+            );
+
+            let mut changed_statuses = IndexMap::<_, WitnessStatus>::new();
+            for (witness_id, old_status) in witnesses {
+                if matches!(old_status, WitnessStatus::Mined(height) if last_block_height - height.get() > min_conformations as u64)
+                {
+                    continue;
+                }
+
+                let new_status = match resolved_statuses.get(&witness_id) {
+                    Some(status) => *status,
+                    None => {
+                        let status = resolver(witness_id)
+                            .await
+                            .map_err(SyncError::Status)
+                            .map_err(MultiError::A)?;
+                        resolved_statuses.insert(witness_id, status);
+                        status
                     }
+                };
+
+                if new_status != old_status {
+                    changed_statuses.insert(witness_id, new_status);
+                }
+            }
+
+            self.with_contract_mut(
+                contract_id,
+                |contract| -> Result<(), MultiError<SyncError<E>, <Sp::Stock as Stock>::Error>> {
                     contract
                         .sync(changed_statuses.iter().map(|(id, status)| (*id, *status)))
                         .map_err(MultiError::from_other_a)?;
                     Ok(())
                 },
-            ).await?;
+            )?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "async")]
+    /// Concurrent + Send-friendly witness update helper.
+    pub async fn update_contract_witnesses_async_send<E, R, Fut>(
+        &mut self,
+        contract_id: Option<ContractId>,
+        resolver: R,
+        last_block_height: u64,
+        min_conformations: u32,
+    ) -> Result<(), MultiError<SyncError<E>, <Sp::Stock as Stock>::Error>>
+    where
+        E: core::error::Error,
+        R: Fn(<<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId) -> Fut + Sync,
+        Fut: Future<Output = Result<WitnessStatus, E>> + Send,
+    {
+        let mut resolved_statuses = IndexMap::<_, WitnessStatus>::new();
+        let contract_ids = match contract_id {
+            Some(contract_id) => {
+                if !self.has_contract(contract_id) {
+                    return Err(MultiError::A(SyncError::ContractNotFound(contract_id)));
+                }
+                IndexSet::from([contract_id])
+            }
+            _ => self.persistence.contract_ids().collect::<IndexSet<_>>(),
+        };
+
+        let mut witness_ids = IndexSet::new();
+        for contract_id in contract_ids.iter().copied() {
+            self.with_contract(
+                contract_id,
+                |contract| {
+                    for witness_id in contract.witness_ids() {
+                        let old_status = contract.witness_status(witness_id);
+                        if matches!(old_status, WitnessStatus::Mined(height) if last_block_height - height.get() > min_conformations as u64) {
+                            continue;
+                        }
+                        witness_ids.insert(witness_id);
+                    }
+                },
+                None,
+            );
+        }
+
+        let resolver = &resolver;
+        let resolved = stream::iter(witness_ids.into_iter().map(|witness_id| {
+            let resolver = resolver;
+            async move {
+                let status = resolver(witness_id)
+                    .await
+                    .map_err(SyncError::Status)
+                    .map_err(MultiError::A)?;
+                Ok::<_, MultiError<SyncError<E>, <Sp::Stock as Stock>::Error>>((witness_id, status))
+            }
+        }))
+        .buffer_unordered(RESOLVER_CONCURRENCY_LIMIT)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+        resolved_statuses.extend(resolved);
+
+        for contract_id in contract_ids {
+            self.with_contract_mut(
+                contract_id,
+                |contract| -> Result<(), MultiError<SyncError<E>, <Sp::Stock as Stock>::Error>> {
+                    let mut changed_statuses = IndexMap::<_, WitnessStatus>::new();
+                    for witness_id in contract.witness_ids() {
+                        let old_status = contract.witness_status(witness_id);
+                        if matches!(old_status, WitnessStatus::Mined(height) if last_block_height - height.get() > min_conformations as u64) {
+                            continue;
+                        }
+
+                        if let Some(new_status) = resolved_statuses.get(&witness_id).copied() {
+                            if new_status != old_status {
+                                changed_statuses.insert(witness_id, new_status);
+                            }
+                        }
+                    }
+
+                    contract
+                        .sync(changed_statuses.iter().map(|(id, status)| (*id, *status)))
+                        .map_err(MultiError::from_other_a)?;
+                    Ok(())
+                },
+            )?;
         }
 
         Ok(())
