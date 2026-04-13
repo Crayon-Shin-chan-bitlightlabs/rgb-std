@@ -75,6 +75,7 @@ rgb-core.workspace = true
 rgb-invoice.workspace = true
 indexmap.workspace = true
 chrono.workspace = true
+futures-util = { version = "0.3", default-features = false, features = ["alloc"], optional = true }
 serde = { workspace = true, optional = true }
 serde_with = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
@@ -87,7 +88,7 @@ rgb-persist-fs.workspace = true
 default = ["std", "bitcoin"]
 all = ["std", "bitcoin", "liquid", "prime", "binfile", "uri", "stl", "serde", "async"]
 std = ["rgb-invoice/std", "indexmap/std"]
-async = ["tokio"]
+async = ["tokio", "dep:futures-util"]
 
 bitcoin = ["bp-core", "bp-invoice", "rgb-core/bitcoin", "rgb-invoice/bitcoin"]
 liquid = ["rgb-core/liquid", "rgb-invoice/liquid"]
@@ -127,4 +128,3 @@ features = ["all"]
 
 [lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = ['cfg(coverage_nightly)'] }
-
