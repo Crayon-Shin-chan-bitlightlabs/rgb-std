@@ -647,8 +647,7 @@ dependencies = [
 [[package]]
 name = "hypersonic"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11c00803ea8486e44382493683450a73426a3d41c338b187fa420e770b72ebd6"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=feat%2Fsession-ledger#0061a2e7a41f4a1f1f95d7a85107ef77a7a93dd6"
 dependencies = [
  "aluvm",
  "amplify",
@@ -1180,8 +1179,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "sonic-api"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01c04bac27874c60a101fcb8c62d8181e671bfd277ec6f2ed16275b6fd6b1ac1"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=feat%2Fsession-ledger#0061a2e7a41f4a1f1f95d7a85107ef77a7a93dd6"
 dependencies = [
  "aluvm",
  "amplify",
@@ -1204,8 +1202,7 @@ dependencies = [
 [[package]]
 name = "sonic-callreq"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5239b3802292549a1ce7e2edd7200180f5f6bc16c04307e8c28556d3629e0670"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=feat%2Fsession-ledger#0061a2e7a41f4a1f1f95d7a85107ef77a7a93dd6"
 dependencies = [
  "amplify",
  "baid64",
@@ -1225,8 +1222,7 @@ dependencies = [
 [[package]]
 name = "sonic-persist-fs"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4061eafe0c5e0d78e4fd04dd6eb3bfb53508e88bbdbd4b658f43bc007e19ba1"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=feat%2Fsession-ledger#0061a2e7a41f4a1f1f95d7a85107ef77a7a93dd6"
 dependencies = [
  "amplify",
  "aora",

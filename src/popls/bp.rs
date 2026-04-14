@@ -467,15 +467,16 @@ where
         WitnessOut::new(address.payload, nonce)
     }
 
-    pub fn wallet_state(&self) -> WalletState<TxoSeal> {
-        let iter = self
-            .contracts
-            .contract_ids()
-            .map(|id| (id, self.contracts.contract_state(id)));
+    pub fn wallet_state(&mut self) -> WalletState<TxoSeal> {
+        let ids: Vec<_> = self.contracts.contract_ids().collect();
+        let iter = ids.into_iter().map(|id| {
+            let state = self.contracts.contract_state(id);
+            (id, state)
+        });
         WalletState::from_contracts_state(iter)
     }
 
-    pub fn wallet_contract_state(&self, contract_id: ContractId) -> ContractState<Outpoint> {
+    pub fn wallet_contract_state(&mut self, contract_id: ContractId) -> ContractState<Outpoint> {
         self.contracts
             .contract_state(contract_id)
             .clone()
@@ -491,7 +492,7 @@ where
     }
 
     pub fn contract_state_full(
-        &self,
+        &mut self,
         contract_id: ContractId,
     ) -> ContractState<<Sp::Pile as Pile>::Seal> {
         self.contracts.contract_state(contract_id)
@@ -594,7 +595,7 @@ where
 
     /// Check whether all state used in a request is properly re-distributed to new owners, and
     /// non-distributed state is used in the change.
-    pub fn check_request<T>(&self, request: &OpRequest<T>) -> Result<(), UnmatchedState> {
+    pub fn check_request<T>(&mut self, request: &OpRequest<T>) -> Result<(), UnmatchedState> {
         let contract_id = request.contract_id;
         let state = self.contracts.contract_state(contract_id);
         let articles = self.contracts.contract_articles(contract_id);
@@ -726,7 +727,8 @@ where
         // Constructing blank operation requests
         let mut blank_requests = Vec::new();
         let root_noise_engine = self.noise_engine();
-        for contract_id in self.contracts.contract_ids() {
+        let contract_ids_list: Vec<_> = self.contracts.contract_ids().collect();
+        for contract_id in contract_ids_list {
             if contracts.contains(&contract_id) {
                 continue;
             }

@@ -160,6 +160,7 @@ where
         Self { issuers: none!(), contracts: none!(), persistence }
     }
 
+    #[allow(dead_code)]
     fn with_contract<R>(
         &self,
         id: ContractId,
@@ -242,10 +243,10 @@ where
     }
 
     pub fn contract_witness_ids(
-        &self,
+        &mut self,
         contract_id: ContractId,
     ) -> Vec<<<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId> {
-        self.with_contract(contract_id, |contract| contract.witness_ids().collect(), Some(vec![]))
+        self.with_contract_mut(contract_id, |contract| contract.witness_ids())
     }
 
     /// Get the contract state.
@@ -257,14 +258,16 @@ where
     ///
     /// If the contract id is not known.
     pub fn contract_state(
-        &self,
+        &mut self,
         contract_id: ContractId,
     ) -> ContractState<<Sp::Pile as Pile>::Seal> {
-        self.with_contract(contract_id, |contract| contract.state(), None)
+        self.with_contract_mut(contract_id, |contract| contract.state())
+            .into()
     }
 
-    pub fn contract_articles(&self, contract_id: ContractId) -> Articles {
-        self.with_contract(contract_id, |contract| contract.articles().clone(), None)
+    pub fn contract_articles(&mut self, contract_id: ContractId) -> Articles {
+        self.with_contract_mut(contract_id, |contract| contract.articles().clone())
+            .into()
     }
 
     pub fn find_contract_id(&self, r: impl Into<ContractRef>) -> Option<ContractId> {
@@ -409,16 +412,15 @@ where
         let mut resolved_statuses = IndexMap::<_, WitnessStatus>::new();
         let contract_ids = self.persistence.contract_ids().collect::<IndexSet<_>>();
         for contract_id in contract_ids {
-            let witnesses = self.with_contract(
-                contract_id,
-                |contract| {
-                    contract
-                        .witness_ids()
-                        .map(|witness_id| (witness_id, contract.witness_status(witness_id)))
-                        .collect::<Vec<_>>()
-                },
-                None,
-            );
+            let witnesses = self.with_contract_mut(contract_id, |contract| {
+                let ids = contract.witness_ids();
+                ids.into_iter()
+                    .map(|wid| {
+                        let status = contract.witness_status(wid);
+                        (wid, status)
+                    })
+                    .collect::<Vec<_>>()
+            });
 
             let mut changed_statuses = IndexMap::<_, WitnessStatus>::new();
             for (witness_id, old_status) in witnesses {
@@ -479,16 +481,15 @@ where
         };
 
         for contract_id in contract_ids {
-            let witnesses = self.with_contract(
-                contract_id,
-                |contract| {
-                    contract
-                        .witness_ids()
-                        .map(|witness_id| (witness_id, contract.witness_status(witness_id)))
-                        .collect::<Vec<_>>()
-                },
-                None,
-            );
+            let witnesses = self.with_contract_mut(contract_id, |contract| {
+                let ids = contract.witness_ids();
+                ids.into_iter()
+                    .map(|wid| {
+                        let status = contract.witness_status(wid);
+                        (wid, status)
+                    })
+                    .collect::<Vec<_>>()
+            });
 
             let mut changed_statuses = IndexMap::<_, WitnessStatus>::new();
             for (witness_id, old_status) in witnesses {
@@ -554,7 +555,7 @@ where
 
         let mut witness_ids = IndexSet::new();
         for contract_id in contract_ids.iter().copied() {
-            self.with_contract(
+            self.with_contract_mut(
                 contract_id,
                 |contract| {
                     for witness_id in contract.witness_ids() {
@@ -565,7 +566,6 @@ where
                         witness_ids.insert(witness_id);
                     }
                 },
-                None,
             );
         }
 
@@ -642,7 +642,7 @@ where
     /// If the output stream failures, like when the stream cannot accept more data or got
     /// disconnected.
     pub fn export(
-        &self,
+        &mut self,
         contract_id: ContractId,
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
@@ -651,7 +651,8 @@ where
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
-        self.with_contract(contract_id, |contract| contract.export(writer), None)
+        self.with_contract_mut(contract_id, |contract| contract.export(writer))
+            .into()
     }
 
     /// Purge a contract from the system.
@@ -808,7 +809,7 @@ mod _fs {
         /// If writing to the file failures, like when the file already exists, there is no write
         /// access to it, or no sufficient disk space.
         pub fn export_to_file(
-            &self,
+            &mut self,
             path: impl AsRef<Path>,
             contract_id: ContractId,
         ) -> io::Result<()>
@@ -817,7 +818,8 @@ mod _fs {
             <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
             <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
         {
-            self.with_contract(contract_id, |contract| contract.export_to_file(path), None)
+            self.with_contract_mut(contract_id, |contract| contract.export_to_file(path))
+                .into()
         }
 
         /// Create a consignment with a history from the genesis to each of the `terminals`, and
@@ -832,7 +834,7 @@ mod _fs {
         /// If writing to the file failures, like when the file already exists, there is no write
         /// access to it, or no sufficient disk space.
         pub fn consign_to_file(
-            &self,
+            &mut self,
             path: impl AsRef<Path>,
             contract_id: ContractId,
             terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
@@ -842,11 +844,10 @@ mod _fs {
             <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
             <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
         {
-            self.with_contract(
-                contract_id,
-                |contract| contract.consign_to_file(path, terminals),
-                None,
-            )
+            self.with_contract_mut(contract_id, |contract| {
+                contract.consign_to_file(path, terminals)
+            })
+            .into()
         }
 
         /// Consume a consignment from a `file`.

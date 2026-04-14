@@ -83,7 +83,7 @@ pub use contracts::{
     ContractStateName, Contracts, IssuerError, SyncError, WalletState, CONSIGN_VERSION,
 };
 pub use hypersonic::*;
-pub use pile::{OpRels, Pile, Witness, WitnessStatus};
+pub use pile::{OpRels, Pile, PileSession, Witness, WitnessStatus};
 pub use rgb::*;
 pub use stockpile::Stockpile;
 pub use util::{ContractRef, InvalidContractRef};

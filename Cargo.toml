@@ -126,5 +126,11 @@ wasm-bindgen-test = "0.3"
 [package.metadata.docs.rs]
 features = ["all"]
 
+[patch.crates-io]
+hypersonic = { git = "https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git", branch = "feat/session-ledger" }
+sonic-persist-fs = { git = "https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git", branch = "feat/session-ledger" }
+sonic-callreq = { git = "https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git", branch = "feat/session-ledger" }
+sonic-api = { git = "https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git", branch = "feat/session-ledger" }
+
 [lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = ['cfg(coverage_nightly)'] }
