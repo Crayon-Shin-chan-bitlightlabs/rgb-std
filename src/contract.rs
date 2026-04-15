@@ -440,8 +440,76 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
     pub fn state(&mut self) -> ContractState<P::Seal> {
         let main = self.ledger.state().main.clone();
-        let mut status_cache: BTreeMap<Opid, WitnessStatus> = BTreeMap::new();
+        let genesis_opid = self.ledger.articles().genesis_opid();
+        let all_ops: BTreeMap<Opid, Operation> = self.ledger.operations().collect();
+        let (all_op_witness_ids, witness_statuses) = {
+            let mut session = self.pile.session();
+            let mut op_witness_ids = BTreeMap::new();
+            let mut statuses = BTreeMap::new();
+            for opid in all_ops.keys().copied().chain([genesis_opid]) {
+                let wids: Vec<_> = session.op_witness_ids(opid).collect();
+                for wid in &wids {
+                    statuses
+                        .entry(*wid)
+                        .or_insert_with(|| session.witness_status(*wid));
+                }
+                op_witness_ids.insert(opid, wids);
+            }
+            (op_witness_ids, statuses)
+        };
+
+        let mut best_status_cache: BTreeMap<Opid, WitnessStatus> = BTreeMap::new();
         let mut ancestor_cache: BTreeMap<Opid, WitnessStatus> = BTreeMap::new();
+        let best_op_status =
+            |opid: Opid,
+             op_witness_ids: &BTreeMap<Opid, Vec<<P::Seal as RgbSeal>::WitnessId>>,
+             statuses: &BTreeMap<<P::Seal as RgbSeal>::WitnessId, WitnessStatus>,
+             cache: &mut BTreeMap<Opid, WitnessStatus>| {
+                *cache.entry(opid).or_insert_with(|| {
+                    op_witness_ids
+                        .get(&opid)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|wid| statuses.get(wid).copied())
+                        .reduce(|best, other| best.best(other))
+                        .unwrap_or(WitnessStatus::Genesis)
+                })
+            };
+        let ancestors_from_cache = |start: Opid, ops: &BTreeMap<Opid, Operation>| {
+            let mut chain = IndexSet::new();
+            chain.insert(start);
+            let mut index = 0usize;
+            while let Some(&opid) = chain.get_index(index) {
+                if opid != genesis_opid {
+                    if let Some(op) = ops.get(&opid) {
+                        for inp in &op.immutable_in {
+                            chain.insert(inp.opid);
+                        }
+                        for inp in &op.destructible_in {
+                            chain.insert(inp.addr.opid);
+                        }
+                    }
+                }
+                index += 1;
+            }
+            chain
+        };
+        let get_status =
+            |opid: Opid,
+             direct: WitnessStatus,
+             ops: &BTreeMap<Opid, Operation>,
+             op_witness_ids: &BTreeMap<Opid, Vec<<P::Seal as RgbSeal>::WitnessId>>,
+             statuses: &BTreeMap<<P::Seal as RgbSeal>::WitnessId, WitnessStatus>,
+             best_cache: &mut BTreeMap<Opid, WitnessStatus>,
+             anc_cache: &mut BTreeMap<Opid, WitnessStatus>| {
+                let ancestor_status = *anc_cache.entry(opid).or_insert_with(|| {
+                    ancestors_from_cache(opid, ops)
+                        .iter()
+                        .map(|&anc| best_op_status(anc, op_witness_ids, statuses, best_cache))
+                        .fold(WitnessStatus::Genesis, |worst, other| worst.worst(other))
+                });
+                ancestor_status.worst(direct)
+            };
 
         let mut owned = BTreeMap::new();
         for (name, map) in main.owned {
@@ -451,12 +519,20 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     continue;
                 };
                 if let Some(seal_src) = seal.to_src() {
-                    let best = self.get_cached_op_status(addr.opid, &mut status_cache);
-                    let status = self.get_ancestor_status(
+                    let direct = best_op_status(
                         addr.opid,
-                        best,
+                        &all_op_witness_ids,
+                        &witness_statuses,
+                        &mut best_status_cache,
+                    );
+                    let status = get_status(
+                        addr.opid,
+                        direct,
+                        &all_ops,
+                        &all_op_witness_ids,
+                        &witness_statuses,
+                        &mut best_status_cache,
                         &mut ancestor_cache,
-                        &mut status_cache,
                     );
                     state.push(OwnedState {
                         addr,
@@ -464,14 +540,22 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                         status,
                     });
                 } else {
-                    let wids: Vec<_> = self.pile.session().op_witness_ids(addr.opid).collect();
-                    for wid in wids {
-                        let wstatus = self.pile.session().witness_status(wid);
-                        let status = self.get_ancestor_status(
+                    for wid in all_op_witness_ids
+                        .get(&addr.opid)
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                    {
+                        let direct =
+                            witness_statuses.get(&wid).copied().unwrap_or(WitnessStatus::Genesis);
+                        let status = get_status(
                             addr.opid,
-                            wstatus,
+                            direct,
+                            &all_ops,
+                            &all_op_witness_ids,
+                            &witness_statuses,
+                            &mut best_status_cache,
                             &mut ancestor_cache,
-                            &mut status_cache,
                         );
                         state.push(OwnedState {
                             addr,
@@ -488,52 +572,26 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         for (name, map) in main.global {
             let mut state = vec![];
             for (addr, data) in map {
-                let best = self.get_cached_op_status(addr.opid, &mut status_cache);
-                let status = self.get_ancestor_status(
+                let direct = best_op_status(
                     addr.opid,
-                    best,
+                    &all_op_witness_ids,
+                    &witness_statuses,
+                    &mut best_status_cache,
+                );
+                let status = get_status(
+                    addr.opid,
+                    direct,
+                    &all_ops,
+                    &all_op_witness_ids,
+                    &witness_statuses,
+                    &mut best_status_cache,
                     &mut ancestor_cache,
-                    &mut status_cache,
                 );
                 state.push(ImmutableState { addr, data, status });
             }
             immutable.insert(name, state);
         }
         ContractState { immutable, owned, aggregated: main.aggregated }
-    }
-
-    fn get_cached_op_status(
-        &mut self,
-        opid: Opid,
-        cache: &mut BTreeMap<Opid, WitnessStatus>,
-    ) -> WitnessStatus {
-        if let Some(&s) = cache.get(&opid) {
-            return s;
-        }
-        let s = self.best_op_status(opid);
-        cache.insert(opid, s);
-        s
-    }
-
-    fn get_ancestor_status(
-        &mut self,
-        opid: Opid,
-        or: WitnessStatus,
-        ancestor_cache: &mut BTreeMap<Opid, WitnessStatus>,
-        status_cache: &mut BTreeMap<Opid, WitnessStatus>,
-    ) -> WitnessStatus {
-        let ancestor_status = if let Some(&s) = ancestor_cache.get(&opid) {
-            s
-        } else {
-            let ancs: Vec<Opid> = self.ledger.ancestors([opid]).collect();
-            let s = ancs
-                .into_iter()
-                .map(|a| self.get_cached_op_status(a, status_cache))
-                .fold(WitnessStatus::Genesis, |worst, other| worst.worst(other));
-            ancestor_cache.insert(opid, s);
-            s
-        };
-        ancestor_status.worst(or)
     }
 
     pub fn sync(
