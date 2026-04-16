@@ -459,6 +459,25 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         self.ledger.state().raw.auth.get(&auth).copied()
     }
 
+    /// Returns owned entries for a specific state without computing witness-derived statuses.
+    pub fn owned_state_entries(&self, name: &StateName) -> Vec<(CellAddr, P::Seal, StrictVal)>
+    where P::Seal: Clone {
+        let Some(states) = self.ledger.state().main.owned.get(name) else {
+            return vec![];
+        };
+
+        let mut entries = Vec::with_capacity(states.len());
+        for (addr, data) in states {
+            let Some(seal) = self.pile.seal(*addr) else {
+                continue;
+            };
+            if let Some(seal) = seal.to_src() {
+                entries.push((*addr, seal, data.clone()));
+            }
+        }
+        entries
+    }
+
     /// Get the contract state.
     ///
     /// The call does not recompute the contract state, but does a seal resolution,
@@ -799,6 +818,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <P::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
+        self.witnesses().count();
         self.ledger
             .export_aux(terminals, writer, |opid, op, writer| self.aux(opid, op, writer))
     }

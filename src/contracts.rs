@@ -27,7 +27,7 @@ use core::borrow::Borrow;
 use core::cell::RefCell;
 #[cfg(feature = "async")]
 use core::future::Future;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 
 use amplify::confinement::{KeyedCollection, SmallOrdMap};
@@ -36,7 +36,7 @@ use commit_verify::StrictHash;
 #[cfg(feature = "async")]
 use futures_util::{stream, StreamExt, TryStreamExt};
 use hypersonic::{
-    AcceptError, AuthToken, CallParams, CodexId, ContractId, ContractName, Opid, Stock,
+    AcceptError, AuthToken, CallParams, CellAddr, CodexId, ContractId, ContractName, Opid, Stock,
 };
 use indexmap::{IndexMap, IndexSet};
 use rgb::RgbSeal;
@@ -253,6 +253,21 @@ where
         contract_id: ContractId,
     ) -> ContractState<<Sp::Pile as Pile>::Seal> {
         self.with_contract(contract_id, |contract| contract.state(), None)
+    }
+
+    pub fn contract_owned_state_entries(
+        &self,
+        contract_id: ContractId,
+        state_name: &StateName,
+    ) -> Vec<(CellAddr, <Sp::Pile as Pile>::Seal, StrictVal)>
+    where
+        <Sp::Pile as Pile>::Seal: Clone,
+    {
+        self.with_contract(
+            contract_id,
+            |contract| contract.owned_state_entries(state_name),
+            Some(vec![]),
+        )
     }
 
     pub fn contract_articles(&self, contract_id: ContractId) -> Articles {
@@ -606,8 +621,8 @@ where
 
     /// Purge a contract from the system.
     pub fn purge(&mut self, contract_id: ContractId) -> Result<(), Sp::Error> {
-        self.contracts.borrow_mut().remove(&contract_id);
         self.persistence.purge(contract_id)?;
+        self.contracts.borrow_mut().remove(&contract_id);
         Ok(())
     }
 
@@ -634,6 +649,58 @@ where
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
         self.with_contract_mut(contract_id, |contract| contract.consign(terminals, writer))
+    }
+
+    /// Create a consignment with a history from the genesis to each of the `terminals` addressed
+    /// by contract cell addresses, and serialize it to a strictly encoded stream `writer`.
+    ///
+    /// This is a convenience wrapper over [`Self::consign`] for callers that already operate on
+    /// resolved owned-state cell addresses instead of raw auth tokens.
+    pub fn consign_by_addrs(
+        &mut self,
+        contract_id: ContractId,
+        terminals: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<()>
+    where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        self.with_contract_mut(contract_id, |contract| {
+            let addresses = terminals
+                .into_iter()
+                .map(|addr| *addr.borrow())
+                .collect::<HashSet<_>>();
+            let auths = contract
+                .full_state()
+                .raw
+                .auth
+                .iter()
+                .filter(|(_, addr)| addresses.contains(addr))
+                .map(|(auth, _)| *auth)
+                .collect::<Vec<_>>();
+
+            contract.consign(auths, writer)
+        })
+    }
+
+    /// Resolve raw auth tokens into known contract cell addresses.
+    pub fn resolve_addrs(
+        &self,
+        contract_id: ContractId,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+    ) -> HashSet<CellAddr> {
+        self.with_contract(
+            contract_id,
+            |contract| {
+                terminals
+                    .into_iter()
+                    .filter_map(|auth| contract.full_state().raw.auth.get(auth.borrow()).copied())
+                    .collect()
+            },
+            Some(HashSet::new()),
+        )
     }
 
     /// Consume a consignment stream.
