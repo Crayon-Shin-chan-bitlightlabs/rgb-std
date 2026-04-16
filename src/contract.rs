@@ -438,6 +438,27 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         self.ledger.state().raw.auth.get(&auth).copied()
     }
 
+    pub fn owned_state_entries(&mut self, name: &StateName) -> Vec<(CellAddr, P::Seal, StrictVal)>
+    where
+        P::Seal: Clone,
+    {
+        let Some(states) = self.ledger.state().main.owned.get(name) else {
+            return vec![];
+        };
+
+        let mut entries = Vec::with_capacity(states.len());
+        let mut session = self.pile.session();
+        for (addr, data) in states {
+            let Some(seal) = session.seal(*addr) else {
+                continue;
+            };
+            if let Some(seal) = seal.to_src() {
+                entries.push((*addr, seal, data.clone()));
+            }
+        }
+        entries
+    }
+
     pub fn state(&mut self) -> ContractState<P::Seal> {
         let main = self.ledger.state().main.clone();
         let genesis_opid = self.ledger.articles().genesis_opid();
