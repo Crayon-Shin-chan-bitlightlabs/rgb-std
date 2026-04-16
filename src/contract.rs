@@ -778,6 +778,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <P::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
+        // Warm up witness-backed storage so per-op witness reads during export avoid repeated
+        // cold I/O penalties on backends that lazily page witness records.
+        let _ = self.witnesses();
+
         // Collect terminal opids
         let terminal_opids: Vec<Opid> = terminals
             .into_iter()
