@@ -818,6 +818,8 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <P::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
+        // Warm up witness-backed storage so subsequent per-op witness reads during export avoid
+        // repeated cold I/O penalties on file-based backends.
         self.witnesses().count();
         self.ledger
             .export_aux(terminals, writer, |opid, op, writer| self.aux(opid, op, writer))
