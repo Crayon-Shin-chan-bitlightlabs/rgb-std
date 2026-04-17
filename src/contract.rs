@@ -99,6 +99,8 @@ pub struct OwnedState<Seal> {
     pub status: WitnessStatus,
 }
 
+type ResolvedOwnedEntry<Seal> = (CellAddr, Assignment<Seal>);
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ImmutableState {
@@ -457,6 +459,23 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             }
         }
         entries
+    }
+
+    pub fn resolved_owned_state_entries(&mut self, name: &StateName) -> Vec<OwnedState<P::Seal>>
+    where
+        P::Seal: Clone,
+    {
+        self.state().owned.remove(name).unwrap_or_default()
+    }
+
+    pub fn resolved_owned_assignments(&mut self, name: &StateName) -> Vec<ResolvedOwnedEntry<P::Seal>>
+    where
+        P::Seal: Clone,
+    {
+        self.resolved_owned_state_entries(name)
+            .into_iter()
+            .map(|owned| (owned.addr, owned.assignment))
+            .collect()
     }
 
     pub fn state(&mut self) -> ContractState<P::Seal> {

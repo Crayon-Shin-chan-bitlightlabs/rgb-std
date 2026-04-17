@@ -46,9 +46,9 @@ use strict_encoding::{
 use strict_types::StrictVal;
 
 use crate::{
-    parse_consignment, Articles, Consensus, Consignment, ConsumeError, Contract, ContractRef,
-    ContractState, CreateParams, Identity, ImmutableState, Issuer, Operation, OwnedState, Pile,
-    SigBlob, StateName, Stockpile, WitnessStatus,
+    parse_consignment, Articles, Assignment, Consensus, Consignment, ConsumeError, Contract,
+    ContractRef, ContractState, CreateParams, Identity, ImmutableState, Issuer, Operation,
+    OwnedState, Pile, SigBlob, StateName, Stockpile, WitnessStatus,
 };
 
 #[cfg(feature = "async")]
@@ -275,6 +275,34 @@ where
     {
         self.with_contract_mut(contract_id, |contract| contract.owned_state_entries(state_name))
             .into()
+    }
+
+    pub fn contract_resolved_owned_state_entries(
+        &mut self,
+        contract_id: ContractId,
+        state_name: &StateName,
+    ) -> Vec<OwnedState<<Sp::Pile as Pile>::Seal>>
+    where
+        <Sp::Pile as Pile>::Seal: Clone,
+    {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.resolved_owned_state_entries(state_name)
+        })
+        .into()
+    }
+
+    pub fn contract_resolved_owned_assignments(
+        &mut self,
+        contract_id: ContractId,
+        state_name: &StateName,
+    ) -> Vec<(CellAddr, Assignment<<Sp::Pile as Pile>::Seal>)>
+    where
+        <Sp::Pile as Pile>::Seal: Clone,
+    {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.resolved_owned_assignments(state_name)
+        })
+        .into()
     }
 
     pub fn contract_articles(&mut self, contract_id: ContractId) -> Articles {
