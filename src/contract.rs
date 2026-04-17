@@ -161,6 +161,14 @@ pub struct ContractState<Seal> {
     pub aggregated: BTreeMap<StateName, StrictVal>,
 }
 
+struct ResolvedStateContext<Seal: RgbSeal> {
+    genesis_opid: Opid,
+    all_ops: BTreeMap<Opid, Operation>,
+    all_op_witness_ids: BTreeMap<Opid, Vec<Seal::WitnessId>>,
+}
+
+type ResolvedOwnedEntry<Seal> = (CellAddr, Assignment<Seal>);
+
 impl<Seal> ContractState<Seal> {
     pub fn map<To>(self, f: impl Fn(Seal) -> To) -> ContractState<To> {
         ContractState {
@@ -286,6 +294,165 @@ pub struct Contract<S: Stock, P: Pile> {
 }
 
 impl<S: Stock, P: Pile> Contract<S, P> {
+    fn resolved_state_context(&self) -> ResolvedStateContext<P::Seal> {
+        let genesis_opid = self.ledger.articles().genesis_opid();
+        let all_ops: BTreeMap<Opid, Operation> = self.ledger.operations().collect();
+        let all_op_witness_ids = {
+            let mut map = BTreeMap::new();
+            for opid in all_ops.keys().copied() {
+                let wids: Vec<_> = self.pile.op_witness_ids(opid).collect();
+                map.insert(opid, wids);
+            }
+            let genesis_wids: Vec<_> = self.pile.op_witness_ids(genesis_opid).collect();
+            map.insert(genesis_opid, genesis_wids);
+            map
+        };
+
+        ResolvedStateContext { genesis_opid, all_ops, all_op_witness_ids }
+    }
+
+    fn best_op_status_cached(
+        pile: &P,
+        opid: Opid,
+        op_witness_ids: &BTreeMap<Opid, Vec<<P::Seal as RgbSeal>::WitnessId>>,
+        cache: &mut BTreeMap<Opid, WitnessStatus>,
+    ) -> WitnessStatus {
+        *cache.entry(opid).or_insert_with(|| {
+            op_witness_ids
+                .get(&opid)
+                .into_iter()
+                .flatten()
+                .map(|wid| pile.witness_status(*wid))
+                .reduce(|best, other| best.best(other))
+                .unwrap_or(WitnessStatus::Genesis)
+        })
+    }
+
+    fn ancestors_from_cache(
+        start: Opid,
+        genesis_opid: Opid,
+        ops: &BTreeMap<Opid, Operation>,
+    ) -> IndexSet<Opid> {
+        let mut chain = IndexSet::new();
+        chain.insert(start);
+        let mut index = 0usize;
+        while let Some(&opid) = chain.get_index(index) {
+            if opid != genesis_opid {
+                if let Some(op) = ops.get(&opid) {
+                    for inp in &op.immutable_in {
+                        chain.insert(inp.opid);
+                    }
+                    for inp in &op.destructible_in {
+                        chain.insert(inp.addr.opid);
+                    }
+                }
+            }
+            index += 1;
+        }
+        chain
+    }
+
+    fn status_with_context(
+        &self,
+        opid: Opid,
+        direct: WitnessStatus,
+        ctx: &ResolvedStateContext<P::Seal>,
+        best_cache: &mut BTreeMap<Opid, WitnessStatus>,
+        anc_cache: &mut BTreeMap<Opid, WitnessStatus>,
+    ) -> WitnessStatus {
+        let anc_worst = *anc_cache.entry(opid).or_insert_with(|| {
+            Self::ancestors_from_cache(opid, ctx.genesis_opid, &ctx.all_ops)
+                .iter()
+                .map(|&anc| {
+                    Self::best_op_status_cached(
+                        &self.pile,
+                        anc,
+                        &ctx.all_op_witness_ids,
+                        best_cache,
+                    )
+                })
+                .fold(WitnessStatus::Genesis, |worst, other| worst.worst(other))
+        });
+        anc_worst.worst(direct)
+    }
+
+    fn resolve_owned_entries_with_context(
+        &self,
+        entries: impl IntoIterator<Item = (CellAddr, StrictVal)>,
+        ctx: &ResolvedStateContext<P::Seal>,
+        best_cache: &mut BTreeMap<Opid, WitnessStatus>,
+        anc_cache: &mut BTreeMap<Opid, WitnessStatus>,
+    ) -> Vec<OwnedState<P::Seal>>
+    where
+        P::Seal: Clone,
+    {
+        let mut resolved = Vec::new();
+        for (addr, data) in entries {
+            let Some(seal) = self.pile.seal(addr) else {
+                continue;
+            };
+            if let Some(seal) = seal.to_src() {
+                let direct = Self::best_op_status_cached(
+                    &self.pile,
+                    addr.opid,
+                    &ctx.all_op_witness_ids,
+                    best_cache,
+                );
+                let status =
+                    self.status_with_context(addr.opid, direct, ctx, best_cache, anc_cache);
+                resolved.push(OwnedState { addr, assignment: Assignment { seal, data }, status });
+            } else {
+                for wid in ctx
+                    .all_op_witness_ids
+                    .get(&addr.opid)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                {
+                    let direct = self.pile.witness_status(wid);
+                    let status =
+                        self.status_with_context(addr.opid, direct, ctx, best_cache, anc_cache);
+                    resolved.push(OwnedState {
+                        addr,
+                        assignment: Assignment { seal: seal.resolve(wid), data: data.clone() },
+                        status,
+                    });
+                }
+            }
+        }
+        resolved
+    }
+
+    fn resolve_owned_assignments_with_witnesses(
+        &self,
+        entries: impl IntoIterator<Item = (CellAddr, StrictVal)>,
+        op_witness_ids: &BTreeMap<Opid, Vec<<P::Seal as RgbSeal>::WitnessId>>,
+    ) -> Vec<ResolvedOwnedEntry<P::Seal>>
+    where
+        P::Seal: Clone,
+    {
+        let mut resolved = Vec::new();
+        for (addr, data) in entries {
+            let Some(seal) = self.pile.seal(addr) else {
+                continue;
+            };
+            if let Some(seal) = seal.to_src() {
+                resolved.push((addr, Assignment { seal, data }));
+            } else {
+                for wid in op_witness_ids
+                    .get(&addr.opid)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                {
+                    resolved
+                        .push((addr, Assignment { seal: seal.resolve(wid), data: data.clone() }));
+                }
+            }
+        }
+        resolved
+    }
+
     /// Initializes contract from contract articles, consignment and a persistence configuration.
     pub fn with(
         articles: Articles,
@@ -478,161 +645,83 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         entries
     }
 
+    /// Returns owned entries for a specific state using the same witness/seal resolution
+    /// semantics as [`Self::state`], without materializing the full contract state.
+    pub fn resolved_owned_state_entries(&self, name: &StateName) -> Vec<OwnedState<P::Seal>>
+    where P::Seal: Clone {
+        let Some(states) = self.ledger.state().main.owned.get(name) else {
+            return vec![];
+        };
+
+        let ctx = self.resolved_state_context();
+        let mut best_status_cache = BTreeMap::new();
+        let mut ancestor_cache = BTreeMap::new();
+        self.resolve_owned_entries_with_context(
+            states.iter().map(|(addr, data)| (*addr, data.clone())),
+            &ctx,
+            &mut best_status_cache,
+            &mut ancestor_cache,
+        )
+    }
+
+    /// Returns witness-resolved owned assignments for a specific state without computing status.
+    pub fn resolved_owned_assignments(&self, name: &StateName) -> Vec<ResolvedOwnedEntry<P::Seal>>
+    where P::Seal: Clone {
+        let Some(states) = self.ledger.state().main.owned.get(name) else {
+            return vec![];
+        };
+
+        let op_witness_ids = {
+            let mut map = BTreeMap::new();
+            for addr in states.keys() {
+                map.entry(addr.opid)
+                    .or_insert_with(|| self.pile.op_witness_ids(addr.opid).collect());
+            }
+            map
+        };
+
+        self.resolve_owned_assignments_with_witnesses(
+            states.iter().map(|(addr, data)| (*addr, data.clone())),
+            &op_witness_ids,
+        )
+    }
+
     /// Get the contract state.
     ///
     /// The call does not recompute the contract state, but does a seal resolution,
     /// taking into account the status of the witnesses in the whole history.
     pub fn state(&self) -> ContractState<P::Seal> {
-        // Pre-load all operations into memory in a single pass to avoid N+1 DB queries
-        // in the ancestor traversal below. For contracts with many operations this avoids
-        // O(S * depth) individual DB round-trips, reducing them to a single bulk fetch.
-        let genesis_opid = self.ledger.articles().genesis_opid();
-        let all_ops: BTreeMap<Opid, Operation> = self.ledger.operations().collect();
-
-        // Pre-load all (opid -> witness_ids) mapping in one go so that
-        // best_op_status_cached below does not need per-opid Pile calls in a hot loop.
-        let all_op_witness_ids: BTreeMap<Opid, Vec<<P::Seal as RgbSeal>::WitnessId>> = {
-            let mut map = BTreeMap::new();
-            for opid in all_ops.keys().copied() {
-                let wids: Vec<_> = self.pile.op_witness_ids(opid).collect();
-                map.insert(opid, wids);
-            }
-            // Also include genesis – it may appear as an ancestor.
-            let genesis_wids: Vec<_> = self.pile.op_witness_ids(genesis_opid).collect();
-            map.insert(genesis_opid, genesis_wids);
-            map
-        };
-
-        // Cached per-opid best witness status, backed by the pre-loaded index.
+        let ctx = self.resolved_state_context();
         let mut best_status_cache: BTreeMap<Opid, WitnessStatus> = BTreeMap::new();
-        let best_op_status_cached =
-            |opid: Opid,
-             op_witness_ids: &BTreeMap<Opid, Vec<<P::Seal as RgbSeal>::WitnessId>>,
-             pile: &P,
-             cache: &mut BTreeMap<Opid, WitnessStatus>| {
-                *cache.entry(opid).or_insert_with(|| {
-                    op_witness_ids
-                        .get(&opid)
-                        .into_iter()
-                        .flatten()
-                        .map(|wid| pile.witness_status(*wid))
-                        .reduce(|best, other| best.best(other))
-                        .unwrap_or(WitnessStatus::Genesis)
-                })
-            };
-
-        // Pure-memory ancestors traversal – no DB calls.
-        let ancestors_from_cache = |start: Opid, ops: &BTreeMap<Opid, Operation>| {
-            let mut chain = IndexSet::new();
-            chain.insert(start);
-            let mut index = 0usize;
-            while let Some(&opid) = chain.get_index(index) {
-                if opid != genesis_opid {
-                    if let Some(op) = ops.get(&opid) {
-                        for inp in &op.immutable_in {
-                            chain.insert(inp.opid);
-                        }
-                        for inp in &op.destructible_in {
-                            chain.insert(inp.addr.opid);
-                        }
-                    }
-                }
-                index += 1;
-            }
-            chain
-        };
-
-        // Cached per-opid ancestor-worst status.
         let mut ancestor_cache: BTreeMap<Opid, WitnessStatus> = BTreeMap::new();
-
-        // Compute status for a state item: worst status across all ancestors.
-        // `or` is the status of the direct witness (for seal-resolved states).
-        let get_status = |opid: Opid,
-                          or: WitnessStatus,
-                          ops: &BTreeMap<Opid, Operation>,
-                          op_wids: &BTreeMap<Opid, Vec<<P::Seal as RgbSeal>::WitnessId>>,
-                          pile: &P,
-                          best_cache: &mut BTreeMap<Opid, WitnessStatus>,
-                          anc_cache: &mut BTreeMap<Opid, WitnessStatus>| {
-            let anc_worst = *anc_cache.entry(opid).or_insert_with(|| {
-                ancestors_from_cache(opid, ops)
-                    .iter()
-                    .map(|&anc| best_op_status_cached(anc, op_wids, pile, best_cache))
-                    .fold(WitnessStatus::Genesis, |worst, other| worst.worst(other))
-            });
-            anc_worst.worst(or)
-        };
-
         let state = self.ledger.state().main.clone();
         let mut owned = bmap! {};
         for (name, map) in state.owned {
-            let mut state = vec![];
-            for (addr, data) in map {
-                let Some(seal) = self.pile.seal(addr) else {
-                    continue;
-                };
-                if let Some(seal) = seal.to_src() {
-                    let direct = best_op_status_cached(
-                        addr.opid,
-                        &all_op_witness_ids,
-                        &self.pile,
-                        &mut best_status_cache,
-                    );
-                    let status = get_status(
-                        addr.opid,
-                        direct,
-                        &all_ops,
-                        &all_op_witness_ids,
-                        &self.pile,
-                        &mut best_status_cache,
-                        &mut ancestor_cache,
-                    );
-                    state.push(OwnedState { addr, assignment: Assignment { seal, data }, status });
-                } else {
-                    // We insert a copy of state for each of the witnesses created for the operation
-                    for wid in all_op_witness_ids
-                        .get(&addr.opid)
-                        .into_iter()
-                        .flatten()
-                        .copied()
-                    {
-                        let direct = self.pile.witness_status(wid);
-                        let status = get_status(
-                            addr.opid,
-                            direct,
-                            &all_ops,
-                            &all_op_witness_ids,
-                            &self.pile,
-                            &mut best_status_cache,
-                            &mut ancestor_cache,
-                        );
-                        state.push(OwnedState {
-                            addr,
-                            assignment: Assignment { seal: seal.resolve(wid), data: data.clone() },
-                            status,
-                        });
-                    }
-                }
-            }
-            owned.insert(name, state);
+            owned.insert(
+                name,
+                self.resolve_owned_entries_with_context(
+                    map.into_iter(),
+                    &ctx,
+                    &mut best_status_cache,
+                    &mut ancestor_cache,
+                ),
+            );
         }
 
         let mut immutable = bmap! {};
         for (name, map) in state.global {
             let mut state = vec![];
             for (addr, data) in map {
-                let direct = best_op_status_cached(
-                    addr.opid,
-                    &all_op_witness_ids,
+                let direct = Self::best_op_status_cached(
                     &self.pile,
+                    addr.opid,
+                    &ctx.all_op_witness_ids,
                     &mut best_status_cache,
                 );
-                let status = get_status(
+                let status = self.status_with_context(
                     addr.opid,
                     direct,
-                    &all_ops,
-                    &all_op_witness_ids,
-                    &self.pile,
+                    &ctx,
                     &mut best_status_cache,
                     &mut ancestor_cache,
                 );
