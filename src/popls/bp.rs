@@ -46,6 +46,7 @@ use hypersonic::{
     NamedState, Operation, Satisfaction, StateAtom, StateCalc, StateCalcError, StateName,
     StateUnknown, Stock,
 };
+use indexmap::IndexSet;
 use invoice::bp::{Address, WitnessOut};
 use invoice::{RgbBeneficiary, RgbInvoice};
 use rgb::RgbSealDef;
@@ -820,7 +821,10 @@ where
         dbc: Option<TapretProof>,
         prevouts: &[Outpoint],
     ) -> Result<(), IncludeError> {
+        let mut touched_contracts = IndexSet::new();
+
         for prefab in bundle {
+            touched_contracts.insert(prefab.operation.contract_id);
             let protocol_id = ProtocolId::from(prefab.operation.contract_id.to_byte_array());
             let opid = prefab.operation.opid();
             let mut map = bmap! {};
@@ -839,7 +843,11 @@ where
                 fallback_proof: default!(),
             };
             self.contracts
-                .include(prefab.operation.contract_id, opid, witness, anchor);
+                .include_uncommitted(prefab.operation.contract_id, opid, witness, anchor);
+        }
+
+        for contract_id in touched_contracts {
+            self.contracts.commit_contract_pile(contract_id);
         }
         Ok(())
     }

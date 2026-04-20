@@ -741,6 +741,8 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         ps.include_commit_transaction();
     }
 
+    pub(crate) fn commit_pile_transaction(&mut self) { self.pile.session().commit_transaction(); }
+
     fn aux<W: WriteRaw>(
         &mut self,
         opid: Opid,

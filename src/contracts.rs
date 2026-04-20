@@ -668,7 +668,22 @@ where
         pub_witness: &<<Sp::Pile as Pile>::Seal as RgbSeal>::Published,
         anchor: <<Sp::Pile as Pile>::Seal as RgbSeal>::Client,
     ) {
+        self.include_uncommitted(contract_id, opid, pub_witness, anchor);
+        self.commit_contract_pile(contract_id);
+    }
+
+    pub(crate) fn include_uncommitted(
+        &mut self,
+        contract_id: ContractId,
+        opid: Opid,
+        pub_witness: &<<Sp::Pile as Pile>::Seal as RgbSeal>::Published,
+        anchor: <<Sp::Pile as Pile>::Seal as RgbSeal>::Client,
+    ) {
         self.with_contract_mut(contract_id, |contract| contract.include(opid, anchor, pub_witness))
+    }
+
+    pub(crate) fn commit_contract_pile(&mut self, contract_id: ContractId) {
+        self.with_contract_mut(contract_id, Contract::commit_pile_transaction)
     }
 
     /// Export a contract to a strictly encoded stream.
