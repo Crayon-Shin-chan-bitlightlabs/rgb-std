@@ -23,7 +23,7 @@ fn no_reorgs() { setup("NoReorgs"); }
 #[test]
 fn single_rollback() {
     let mut contract = setup("SingleRollback");
-    let wid = contract.witness_ids().nth(50).unwrap();
+    let wid = contract.witness_ids().into_iter().nth(50).unwrap();
     contract.sync([(wid, WitnessStatus::Archived)]).unwrap();
     // Idempotence
     contract.sync([(wid, WitnessStatus::Archived)]).unwrap();
@@ -32,8 +32,8 @@ fn single_rollback() {
 #[test]
 fn double_rollback() {
     let mut contract = setup("DoubleRollback");
-    let wid1 = contract.witness_ids().nth(50).unwrap();
-    let wid2 = contract.witness_ids().nth(60).unwrap();
+    let wid1 = contract.witness_ids().into_iter().nth(50).unwrap();
+    let wid2 = contract.witness_ids().into_iter().nth(60).unwrap();
     contract
         .sync([(wid1, WitnessStatus::Archived), (wid2, WitnessStatus::Archived)])
         .unwrap();
@@ -42,7 +42,7 @@ fn double_rollback() {
 #[test]
 fn rollback_forward() {
     let mut contract = setup("RollbackForward");
-    let wid = contract.witness_ids().nth(50).unwrap();
+    let wid = contract.witness_ids().into_iter().nth(50).unwrap();
     contract.sync([(wid, WitnessStatus::Archived)]).unwrap();
     contract.sync([(wid, WitnessStatus::Offchain)]).unwrap();
     // Idempotence
@@ -55,8 +55,8 @@ fn rollback_forward() {
 fn rbf() {
     let mut contract = setup("Rbf");
 
-    let old_txid = contract.witness_ids().nth(50).unwrap();
-    let opid = contract.ops_by_witness_id(old_txid).next().unwrap();
+    let old_txid = contract.witness_ids().into_iter().nth(50).unwrap();
+    let opid = contract.ops_by_witness_id(old_txid).into_iter().next().unwrap();
 
     let tx = Tx::strict_dumb();
     let rbf_txid = tx.txid();

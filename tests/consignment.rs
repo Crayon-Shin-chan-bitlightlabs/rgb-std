@@ -21,11 +21,11 @@ use crate::utils::setup;
 #[test]
 #[should_panic(expected = "single-use seals are not closed properly with witness")]
 fn export_import_contract() {
-    let contract = setup("Consign");
+    let mut contract = setup("Consign");
 
     let filename = "tests/data/imex.rgb";
 
-    let terminals = contract.full_state().raw.auth.keys().collect::<Vec<_>>();
+    let terminals = contract.full_state().raw.auth.keys().copied().collect::<Vec<_>>();
 
     fs::remove_file(filename).ok();
     contract.consign_to_file(filename, terminals).unwrap();
