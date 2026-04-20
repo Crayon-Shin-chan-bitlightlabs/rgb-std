@@ -441,9 +441,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     }
 
     pub fn owned_state_entries(&mut self, name: &StateName) -> Vec<(CellAddr, P::Seal, StrictVal)>
-    where
-        P::Seal: Clone,
-    {
+    where P::Seal: Clone {
         let Some(states) = self.ledger.state().main.owned.get(name) else {
             return vec![];
         };
@@ -462,13 +460,14 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     }
 
     pub fn resolved_owned_state_entries(&mut self, name: &StateName) -> Vec<OwnedState<P::Seal>>
-    where
-        P::Seal: Clone,
-    {
+    where P::Seal: Clone {
         self.state().owned.remove(name).unwrap_or_default()
     }
 
-    pub fn resolved_owned_assignments(&mut self, name: &StateName) -> Vec<ResolvedOwnedEntry<P::Seal>>
+    pub fn resolved_owned_assignments(
+        &mut self,
+        name: &StateName,
+    ) -> Vec<ResolvedOwnedEntry<P::Seal>>
     where
         P::Seal: Clone,
     {
@@ -534,22 +533,21 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             }
             chain
         };
-        let get_status =
-            |opid: Opid,
-             direct: WitnessStatus,
-             ops: &BTreeMap<Opid, Operation>,
-             op_witness_ids: &BTreeMap<Opid, Vec<<P::Seal as RgbSeal>::WitnessId>>,
-             statuses: &BTreeMap<<P::Seal as RgbSeal>::WitnessId, WitnessStatus>,
-             best_cache: &mut BTreeMap<Opid, WitnessStatus>,
-             anc_cache: &mut BTreeMap<Opid, WitnessStatus>| {
-                let ancestor_status = *anc_cache.entry(opid).or_insert_with(|| {
-                    ancestors_from_cache(opid, ops)
-                        .iter()
-                        .map(|&anc| best_op_status(anc, op_witness_ids, statuses, best_cache))
-                        .fold(WitnessStatus::Genesis, |worst, other| worst.worst(other))
-                });
-                ancestor_status.worst(direct)
-            };
+        let get_status = |opid: Opid,
+                          direct: WitnessStatus,
+                          ops: &BTreeMap<Opid, Operation>,
+                          op_witness_ids: &BTreeMap<Opid, Vec<<P::Seal as RgbSeal>::WitnessId>>,
+                          statuses: &BTreeMap<<P::Seal as RgbSeal>::WitnessId, WitnessStatus>,
+                          best_cache: &mut BTreeMap<Opid, WitnessStatus>,
+                          anc_cache: &mut BTreeMap<Opid, WitnessStatus>| {
+            let ancestor_status = *anc_cache.entry(opid).or_insert_with(|| {
+                ancestors_from_cache(opid, ops)
+                    .iter()
+                    .map(|&anc| best_op_status(anc, op_witness_ids, statuses, best_cache))
+                    .fold(WitnessStatus::Genesis, |worst, other| worst.worst(other))
+            });
+            ancestor_status.worst(direct)
+        };
 
         let mut owned = BTreeMap::new();
         for (name, map) in main.owned {
@@ -586,8 +584,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                         .flatten()
                         .copied()
                     {
-                        let direct =
-                            witness_statuses.get(&wid).copied().unwrap_or(WitnessStatus::Genesis);
+                        let direct = witness_statuses
+                            .get(&wid)
+                            .copied()
+                            .unwrap_or(WitnessStatus::Genesis);
                         let status = get_status(
                             addr.opid,
                             direct,

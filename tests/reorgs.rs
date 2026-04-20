@@ -56,7 +56,11 @@ fn rbf() {
     let mut contract = setup("Rbf");
 
     let old_txid = contract.witness_ids().into_iter().nth(50).unwrap();
-    let opid = contract.ops_by_witness_id(old_txid).into_iter().next().unwrap();
+    let opid = contract
+        .ops_by_witness_id(old_txid)
+        .into_iter()
+        .next()
+        .unwrap();
 
     let tx = Tx::strict_dumb();
     let rbf_txid = tx.txid();

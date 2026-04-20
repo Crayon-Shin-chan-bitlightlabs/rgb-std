@@ -25,7 +25,13 @@ fn export_import_contract() {
 
     let filename = "tests/data/imex.rgb";
 
-    let terminals = contract.full_state().raw.auth.keys().copied().collect::<Vec<_>>();
+    let terminals = contract
+        .full_state()
+        .raw
+        .auth
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
 
     fs::remove_file(filename).ok();
     contract.consign_to_file(filename, terminals).unwrap();
