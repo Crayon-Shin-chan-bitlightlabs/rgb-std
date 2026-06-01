@@ -30,6 +30,7 @@ use alloc::collections::{btree_set, BTreeMap, BTreeSet};
 use alloc::vec;
 use core::mem;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use amplify::confinement::{
     Collection, KeyedCollection, NonEmptyVec, SmallOrdMap, SmallOrdSet, U8 as U8MAX,
@@ -60,6 +61,13 @@ use crate::{
     EitherSeal, Identity, Issuer, IssuerError, OwnedState, Pile, SigBlob, Stockpile, WalletState,
     WitnessStatus,
 };
+
+const RGB_STD_SLOW_STAGE_THRESHOLD: Duration = Duration::from_millis(500);
+
+fn slow_rgb_stage_elapsed(started_at: Instant) -> Option<u128> {
+    let elapsed = started_at.elapsed();
+    (elapsed >= RGB_STD_SLOW_STAGE_THRESHOLD).then_some(elapsed.as_millis())
+}
 
 /// Trait abstracting a specific implementation of a bitcoin wallet.
 pub trait WalletProvider {
@@ -513,6 +521,7 @@ where
         giveaway: Option<Sats>,
     ) -> Result<OpRequest<Option<WoutAssignment>>, FulfillError> {
         let contract_id = invoice.scope;
+        let total_started_at = Instant::now();
 
         // Determine method
         let articles = self.contracts.contract_articles(contract_id);
@@ -529,31 +538,91 @@ where
         let value = invoice.data.as_ref().ok_or(FulfillError::ValueMissed)?;
 
         // Do coinselection
+        let wallet_state_started_at = Instant::now();
         let state = self.wallet_contract_state(contract_id);
+        let owned_state_names = state.owned.len();
+        let owned_state_entries = state
+            .owned
+            .values()
+            .map(|entries| entries.len())
+            .sum::<usize>();
         let state = state
             .owned
             .get(&state_name)
             .ok_or(FulfillError::StateUnavailable)?;
+        let selected_state_entries = state.len();
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(wallet_state_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "fulfill_wallet_contract_state",
+                elapsed_ms,
+                ?contract_id,
+                %state_name,
+                owned_state_names,
+                owned_state_entries,
+                selected_state_entries,
+                "Slow rgb-std stage"
+            );
+        }
         // NB: we do state accumulation with `calc` inside coinselect
+        let coinselect_started_at = Instant::now();
         let mut using = coinselect
             .coinselect(value, &mut calc, state)
             .ok_or(FulfillError::StateInsufficient)?;
+        let selected_using = using.len();
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(coinselect_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "fulfill_coinselect",
+                elapsed_ms,
+                ?contract_id,
+                %state_name,
+                selected_state_entries,
+                selected_using,
+                "Slow rgb-std stage"
+            );
+        }
         // Now we need to include all other allocations under the same contract that use the
         // selected UTXOs.
         let (addrs, outpoints) = using
             .iter()
             .copied()
             .unzip::<_, _, BTreeSet<_>, BTreeSet<_>>();
-        using.extend(
-            state
-                .iter()
-                .filter(|s| outpoints.contains(&s.assignment.seal) && !addrs.contains(&s.addr))
-                .filter_map(|s| {
-                    calc.accumulate(&s.assignment.data).ok()?;
-                    Some((s.addr, s.assignment.seal))
-                }),
-        );
-        let using = using
+        let include_same_outpoints_started_at = Instant::now();
+        let mut same_outpoint_scan = 0usize;
+        let mut same_outpoint_hits = 0usize;
+        let mut same_outpoint_added = 0usize;
+        let mut same_outpoint_accumulate_failed = 0usize;
+        for s in state {
+            same_outpoint_scan += 1;
+            if !outpoints.contains(&s.assignment.seal) || addrs.contains(&s.addr) {
+                continue;
+            }
+            same_outpoint_hits += 1;
+            if calc.accumulate(&s.assignment.data).is_ok() {
+                same_outpoint_added += 1;
+                using.push((s.addr, s.assignment.seal));
+            } else {
+                same_outpoint_accumulate_failed += 1;
+            }
+        }
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(include_same_outpoints_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "fulfill_include_same_outpoints",
+                elapsed_ms,
+                ?contract_id,
+                %state_name,
+                selected_state_entries,
+                selected_using,
+                same_outpoint_scan,
+                same_outpoint_hits,
+                same_outpoint_added,
+                same_outpoint_accumulate_failed,
+                "Slow rgb-std stage"
+            );
+        }
+        let using: Vec<UsedState> = using
             .into_iter()
             .map(|(addr, outpoint)| UsedState { addr, outpoint, satisfaction: None })
             .collect();
@@ -575,12 +644,43 @@ where
         let mut owned = vec![state];
 
         // Add change
+        let diff_started_at = Instant::now();
         let diff = calc.diff()?;
+        let diff_count = diff.len();
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(diff_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "fulfill_calc_diff",
+                elapsed_ms,
+                ?contract_id,
+                %state_name,
+                diff_count,
+                "Slow rgb-std stage"
+            );
+        }
         let seal = EitherSeal::Alt(None);
         for data in diff {
             let assignment = Assignment { seal: seal.clone(), data };
             let state = NamedState { name: state_name.clone(), state: assignment };
             owned.push(state);
+        }
+
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(total_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "fulfill_total",
+                elapsed_ms,
+                ?contract_id,
+                %state_name,
+                owned_state_names,
+                owned_state_entries,
+                selected_state_entries,
+                selected_using,
+                same_outpoint_added,
+                request_using = using.len(),
+                request_owned = owned.len(),
+                "Slow rgb-std stage"
+            );
         }
 
         // Construct operation request
@@ -713,28 +813,52 @@ where
         requests: impl IntoIterator<Item = OpRequest<PrefabSeal>>,
         change: Option<Vout>,
     ) -> Result<PrefabBundle, MultiError<BundleError, <Sp::Stock as Stock>::Error>> {
+        let total_started_at = Instant::now();
         let ops = requests.into_iter().map(|params| self.prefab(params));
 
         let mut outpoints = BTreeSet::<Outpoint>::new();
         let mut contracts = BTreeSet::new();
         let mut prefabs = BTreeSet::new();
+        let mut request_count = 0usize;
+        let mut prefab_started_at = Instant::now();
         for prefab in ops {
+            request_count += 1;
             let prefab = prefab.map_err(MultiError::from_other_a)?;
             contracts.insert(prefab.operation.contract_id);
             outpoints.extend(&prefab.closes);
             prefabs.insert(prefab);
+        }
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(prefab_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "bundle_prefab_requests",
+                elapsed_ms,
+                request_count,
+                contracts = contracts.len(),
+                outpoints = outpoints.len(),
+                prefabs = prefabs.len(),
+                "Slow rgb-std stage"
+            );
         }
 
         // Constructing blank operation requests
         let mut blank_requests = Vec::new();
         let root_noise_engine = self.noise_engine();
         let contract_ids_list: Vec<_> = self.contracts.contract_ids().collect();
+        let blank_scan_started_at = Instant::now();
+        let mut blank_contracts_scanned = 0usize;
+        let mut blank_owned_entries_scanned = 0usize;
+        let mut blank_using_total = 0usize;
+        let mut blank_owned_total = 0usize;
         for contract_id in contract_ids_list {
             if contracts.contains(&contract_id) {
                 continue;
             }
+            blank_contracts_scanned += 1;
             // We need to clone here not to conflict with mutable calls below
             let owned = self.contracts.contract_state(contract_id).owned.clone();
+            blank_owned_entries_scanned +=
+                owned.values().map(|entries| entries.len()).sum::<usize>();
             let (using, prev): (Vec<_>, Vec<_>) = owned
                 .iter()
                 .flat_map(|(name, map)| map.iter().map(move |owned| (name, owned)))
@@ -751,6 +875,7 @@ where
             if using.is_empty() {
                 continue;
             };
+            blank_using_total += using.len();
 
             let articles = self.contracts.contract_articles(contract_id);
             let api = articles.default_api();
@@ -785,6 +910,7 @@ where
                     owned.push(state);
                 }
             }
+            blank_owned_total += owned.len();
 
             let params = OpRequest {
                 contract_id,
@@ -796,7 +922,25 @@ where
             };
             blank_requests.push(params);
         }
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(blank_scan_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "bundle_blank_scan",
+                elapsed_ms,
+                contracts = contracts.len(),
+                outpoints = outpoints.len(),
+                all_contracts = contracts.len() + blank_contracts_scanned,
+                blank_contracts_scanned,
+                blank_owned_entries_scanned,
+                blank_requests = blank_requests.len(),
+                blank_using_total,
+                blank_owned_total,
+                "Slow rgb-std stage"
+            );
+        }
 
+        prefab_started_at = Instant::now();
+        let blank_request_count = blank_requests.len();
         for request in blank_requests {
             let prefab = self.prefab(request).map_err(|err| match err {
                 MultiError::A(e) => MultiError::A(BundleError::Blank(e)),
@@ -804,6 +948,30 @@ where
                 MultiError::C(_) => unreachable!(),
             })?;
             prefabs.push(prefab);
+        }
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(prefab_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "bundle_prefab_blanks",
+                elapsed_ms,
+                blank_request_count,
+                prefabs = prefabs.len(),
+                "Slow rgb-std stage"
+            );
+        }
+
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(total_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "bundle_total",
+                elapsed_ms,
+                request_count,
+                blank_request_count,
+                contracts = contracts.len(),
+                outpoints = outpoints.len(),
+                prefabs = prefabs.len(),
+                "Slow rgb-std stage"
+            );
         }
 
         Ok(PrefabBundle(

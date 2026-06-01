@@ -29,6 +29,7 @@ use core::cell::RefCell;
 use core::future::Future;
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::time::{Duration, Instant};
 
 use amplify::confinement::{KeyedCollection, SmallOrdMap};
 use amplify::MultiError;
@@ -50,6 +51,13 @@ use crate::{
     ContractRef, ContractState, CreateParams, Identity, ImmutableState, Issuer, Operation,
     OwnedState, Pile, SigBlob, StateName, Stockpile, WitnessStatus,
 };
+
+const RGB_STD_SLOW_STAGE_THRESHOLD: Duration = Duration::from_millis(500);
+
+fn slow_rgb_stage_elapsed(started_at: Instant) -> Option<u128> {
+    let elapsed = started_at.elapsed();
+    (elapsed >= RGB_STD_SLOW_STAGE_THRESHOLD).then_some(elapsed.as_millis())
+}
 
 #[cfg(feature = "async")]
 pub trait TxidResolver<Sp: Stockpile, E: core::error::Error> {
@@ -615,6 +623,7 @@ where
         R: Fn(<<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId) -> Fut + Sync,
         Fut: Future<Output = Result<WitnessStatus, E>> + Send,
     {
+        let total_started_at = Instant::now();
         let mut resolved_statuses = IndexMap::<_, WitnessStatus>::new();
         let contract_ids = match contract_id {
             Some(contract_id) => {
@@ -625,24 +634,45 @@ where
             }
             _ => self.contract_ids().collect::<IndexSet<_>>(),
         };
+        let contract_count = contract_ids.len();
 
         let mut witness_ids = IndexSet::new();
+        let collect_started_at = Instant::now();
+        let mut scanned_witnesses = 0usize;
+        let mut skipped_mature_mined = 0usize;
         for contract_id in contract_ids.iter().copied() {
-            self.with_contract_mut(
-                contract_id,
-                |contract| {
-                    for witness_id in contract.witness_ids() {
-                        let old_status = contract.witness_status(witness_id);
-                        if matches!(old_status, WitnessStatus::Mined(height) if last_block_height - height.get() > min_conformations as u64) {
-                            continue;
-                        }
-                        witness_ids.insert(witness_id);
+            self.with_contract_mut(contract_id, |contract| {
+                for witness_id in contract.witness_ids() {
+                    scanned_witnesses += 1;
+                    let old_status = contract.witness_status(witness_id);
+                    if matches!(old_status, WitnessStatus::Mined(height) if last_block_height - height.get() > min_conformations as u64)
+                    {
+                        skipped_mature_mined += 1;
+                        continue;
                     }
-                },
+                    witness_ids.insert(witness_id);
+                }
+            });
+        }
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(collect_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "update_witnesses_collect",
+                elapsed_ms,
+                requested_contract = ?contract_id,
+                contract_count,
+                scanned_witnesses,
+                unique_witnesses = witness_ids.len(),
+                skipped_mature_mined,
+                last_block_height,
+                min_conformations,
+                "Slow rgb-std stage"
             );
         }
 
         let resolver = &resolver;
+        let resolve_started_at = Instant::now();
+        let unique_witnesses = witness_ids.len();
         let resolved = stream::iter(witness_ids.into_iter().map(|witness_id| {
             let resolver = resolver;
             async move {
@@ -656,15 +686,33 @@ where
         .buffer_unordered(RESOLVER_CONCURRENCY_LIMIT)
         .try_collect::<Vec<_>>()
         .await?;
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(resolve_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "update_witnesses_resolve",
+                elapsed_ms,
+                requested_contract = ?contract_id,
+                contract_count,
+                unique_witnesses,
+                resolved = resolved.len(),
+                resolver_concurrency = RESOLVER_CONCURRENCY_LIMIT,
+                "Slow rgb-std stage"
+            );
+        }
 
         resolved_statuses.extend(resolved);
 
+        let sync_started_at = Instant::now();
+        let mut sync_scanned_witnesses = 0usize;
+        let mut changed_statuses_total = 0usize;
+        let mut synced_contracts = 0usize;
         for contract_id in contract_ids {
             self.with_contract_mut(
                 contract_id,
                 |contract| -> Result<(), MultiError<SyncError<E>, <Sp::Stock as Stock>::Error>> {
                     let mut changed_statuses = IndexMap::<_, WitnessStatus>::new();
                     for witness_id in contract.witness_ids() {
+                        sync_scanned_witnesses += 1;
                         let old_status = contract.witness_status(witness_id);
                         if matches!(old_status, WitnessStatus::Mined(height) if last_block_height - height.get() > min_conformations as u64) {
                             continue;
@@ -676,6 +724,10 @@ where
                             }
                         }
                     }
+                    changed_statuses_total += changed_statuses.len();
+                    if !changed_statuses.is_empty() {
+                        synced_contracts += 1;
+                    }
 
                     contract
                         .sync(changed_statuses.iter().map(|(id, status)| (*id, *status)))
@@ -683,6 +735,34 @@ where
                     Ok(())
                 },
             )?;
+        }
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(sync_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "update_witnesses_sync",
+                elapsed_ms,
+                requested_contract = ?contract_id,
+                contract_count,
+                sync_scanned_witnesses,
+                changed_statuses_total,
+                synced_contracts,
+                "Slow rgb-std stage"
+            );
+        }
+
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(total_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "update_witnesses_total",
+                elapsed_ms,
+                requested_contract = ?contract_id,
+                contract_count,
+                scanned_witnesses,
+                unique_witnesses,
+                changed_statuses_total,
+                synced_contracts,
+                "Slow rgb-std stage"
+            );
         }
 
         Ok(())

@@ -8,6 +8,7 @@ use core::error::Error;
 use core::marker::PhantomData;
 use std::collections::HashSet;
 use std::io;
+use std::time::{Duration, Instant};
 
 use amplify::confinement::SmallOrdMap;
 use amplify::{IoError, MultiError};
@@ -35,6 +36,13 @@ use crate::{
     parse_consignment, Consignment, ContractMeta, Identity, Issue, Issuer, IssuerError, IssuerSpec,
     OpRels, Pile, PileSession, VerifiedOperation, Witness, WitnessStatus,
 };
+
+const RGB_STD_SLOW_STAGE_THRESHOLD: Duration = Duration::from_millis(500);
+
+fn slow_rgb_stage_elapsed(started_at: Instant) -> Option<u128> {
+    let elapsed = started_at.elapsed();
+    (elapsed >= RGB_STD_SLOW_STAGE_THRESHOLD).then_some(elapsed.as_millis())
+}
 #[derive(Copy, Clone, PartialEq, Eq, Debug, From)]
 #[cfg_attr(
     feature = "serde",
@@ -868,29 +876,80 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <P::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
+        let total_started_at = Instant::now();
         // Warm up witness-backed storage so per-op witness reads during export avoid repeated
         // cold I/O penalties on backends that lazily page witness records.
+        let witnesses_started_at = Instant::now();
         let _ = self.witnesses();
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(witnesses_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "consign_witnesses_warmup",
+                elapsed_ms,
+                contract_id = ?self.contract_id,
+                "Slow rgb-std stage"
+            );
+        }
 
         // Collect terminal opids
+        let terminal_started_at = Instant::now();
         let terminal_opids: Vec<Opid> = terminals
             .into_iter()
             .map(|t| self.ledger.state().addr(*t.borrow()).opid)
             .collect();
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(terminal_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "consign_collect_terminals",
+                elapsed_ms,
+                contract_id = ?self.contract_id,
+                terminals = terminal_opids.len(),
+                "Slow rgb-std stage"
+            );
+        }
         // Collect ops reachable from terminals (ancestors)
+        let ancestors_started_at = Instant::now();
         let needed: std::collections::BTreeSet<Opid> = terminal_opids.into_iter().collect();
         let all_needed: std::collections::BTreeSet<Opid> = self
             .ledger
             .ancestors(needed.iter().copied().collect::<Vec<_>>())
             .collect();
-        let ops: Vec<(Opid, Operation)> = self
-            .ledger
-            .operations()
-            .filter(|(opid, _)| all_needed.contains(opid))
-            .collect();
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(ancestors_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "consign_collect_ancestors",
+                elapsed_ms,
+                contract_id = ?self.contract_id,
+                terminal_ops = needed.len(),
+                ancestor_ops = all_needed.len(),
+                "Slow rgb-std stage"
+            );
+        }
+        let filter_ops_started_at = Instant::now();
+        let mut operations_scanned = 0usize;
+        let mut ops = Vec::new();
+        for (opid, op) in self.ledger.operations() {
+            operations_scanned += 1;
+            if all_needed.contains(&opid) {
+                ops.push((opid, op));
+            }
+        }
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(filter_ops_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "consign_filter_operations",
+                elapsed_ms,
+                contract_id = ?self.contract_id,
+                operations_scanned,
+                selected_ops = ops.len(),
+                ancestor_ops = all_needed.len(),
+                "Slow rgb-std stage"
+            );
+        }
         let count = ops.len() as u32;
         let contract_id = self.contract_id;
         let mut writer = writer;
+        let write_started_at = Instant::now();
         let genesis_opid = self.ledger.articles().genesis_opid();
         let genesis_op = self.ledger.articles().genesis().to_operation(contract_id);
         writer = 0u8.strict_encode(writer)?; // DEEDS_VERSION = 0
@@ -902,6 +961,28 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         for (opid, op) in ops {
             writer = op.strict_encode(writer)?;
             writer = self.aux(opid, &op, writer)?;
+        }
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(write_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "consign_write_operations",
+                elapsed_ms,
+                ?contract_id,
+                operations_scanned,
+                selected_ops = count,
+                "Slow rgb-std stage"
+            );
+        }
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(total_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "consign_total",
+                elapsed_ms,
+                ?contract_id,
+                operations_scanned,
+                selected_ops = count,
+                "Slow rgb-std stage"
+            );
         }
         Ok(())
     }
