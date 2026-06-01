@@ -500,6 +500,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         };
 
         let mut selected = Vec::new();
+        let mut unresolved = Vec::new();
         {
             let mut session = self.pile.session();
             for (addr, data) in states {
@@ -510,18 +511,39 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     if predicate(&seal_src) {
                         selected.push((*addr, seal_src, data.clone()));
                     }
+                } else {
+                    let wids = session.op_witness_ids(addr.opid).collect::<Vec<_>>();
+                    unresolved.push((*addr, seal, data.clone(), wids));
                 }
             }
         }
 
-        selected
+        let mut result = selected
             .into_iter()
             .map(|(addr, seal, data)| {
                 let direct = self.best_op_status(addr.opid);
                 let status = self.op_status_with_ancestors(addr.opid, direct);
                 OwnedState { addr, assignment: Assignment { seal, data }, status }
             })
-            .collect()
+            .collect::<Vec<_>>();
+
+        for (addr, seal, data, wids) in unresolved {
+            for wid in wids {
+                let seal = seal.resolve(wid);
+                if !predicate(&seal) {
+                    continue;
+                }
+                let direct = self.pile.session().witness_status(wid);
+                let status = self.op_status_with_ancestors(addr.opid, direct);
+                result.push(OwnedState {
+                    addr,
+                    assignment: Assignment { seal, data: data.clone() },
+                    status,
+                });
+            }
+        }
+
+        result
     }
 
     pub fn state(&mut self) -> ContractState<P::Seal> {
