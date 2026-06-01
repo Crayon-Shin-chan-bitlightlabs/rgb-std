@@ -6,7 +6,7 @@ use alloc::collections::BTreeMap;
 use core::borrow::Borrow;
 use core::error::Error;
 use core::marker::PhantomData;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -27,8 +27,8 @@ use rgb::{
 };
 use single_use_seals::{ClientSideWitness, PublishedWitness, SealWitness};
 use strict_encoding::{
-    DecodeError, ReadRaw, StrictDecode, StrictDumb, StrictEncode, StrictReader, StrictWriter,
-    TypeName, TypedRead, WriteRaw,
+    DecodeError, ReadRaw, StreamWriter, StrictDecode, StrictDumb, StrictEncode, StrictReader,
+    StrictWriter, TypeName, TypedRead, TypedWrite, WriteRaw,
 };
 use strict_types::StrictVal;
 
@@ -252,6 +252,7 @@ pub struct Contract<S: Stock, P: Pile> {
     pile: P,
     /// In-memory cache of valid opids for `ContractApi::is_known(&self)` which requires &self.
     valid_cache: HashSet<Opid>,
+    aux_cache: HashMap<Opid, Vec<u8>>,
 }
 
 impl<S: Stock, P: Pile> Contract<S, P> {
@@ -303,6 +304,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             pile,
             contract_id,
             valid_cache: HashSet::from([genesis_opid]),
+            aux_cache: HashMap::new(),
         };
         contract
             .evaluate_commit(consignment.into_operations())
@@ -367,6 +369,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             pile,
             contract_id,
             valid_cache: HashSet::from([genesis_opid]),
+            aux_cache: HashMap::new(),
         })
     }
 
@@ -377,7 +380,13 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let ledger = Ledger::load(stock_conf).map_err(MultiError::A)?;
         let contract_id = ledger.contract_id();
         let pile = P::load(pile_conf).map_err(MultiError::B)?;
-        let mut contract = Self { ledger, pile, contract_id, valid_cache: HashSet::new() };
+        let mut contract = Self {
+            ledger,
+            pile,
+            contract_id,
+            valid_cache: HashSet::new(),
+            aux_cache: HashMap::new(),
+        };
         contract.refresh_valid_cache();
         Ok(contract)
     }
@@ -761,6 +770,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let mut roll_back = IndexSet::new();
         let mut forward = IndexSet::new();
         for (opid, old_status) in affected_ops {
+            self.aux_cache.remove(&opid);
             let new_status = self.best_op_status(opid);
             if old_status.is_valid() == new_status.is_valid() {
                 continue;
@@ -792,6 +802,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         debug_assert_eq!(operation.opid(), opid);
         self.pile.session().add_seals(opid, seals);
         self.valid_cache.insert(opid);
+        self.aux_cache.remove(&opid);
         debug_assert_eq!(operation.contract_id, self.contract_id());
         Ok(operation)
     }
@@ -816,6 +827,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let mut ps = self.pile.session();
         ps.add_witness(opid, wid, published, &anchor, WitnessStatus::Tentative);
         ps.include_commit_transaction();
+        self.aux_cache.remove(&opid);
     }
 
     pub(crate) fn commit_pile_transaction(&mut self) { self.pile.session().commit_transaction(); }
@@ -839,6 +851,28 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         Ok(writer)
     }
 
+    fn aux_cached<W: WriteRaw>(
+        &mut self,
+        opid: Opid,
+        op: &Operation,
+        mut writer: StrictWriter<W>,
+    ) -> io::Result<StrictWriter<W>> {
+        if let Some(bytes) = self.aux_cache.get(&opid) {
+            unsafe {
+                writer.raw_writer().write_raw::<{ usize::MAX }>(bytes)?;
+            }
+            return Ok(writer);
+        }
+
+        let mem_writer = StrictWriter::with(StreamWriter::in_memory::<{ usize::MAX }>());
+        let bytes = self.aux(opid, op, mem_writer)?.unbox().unconfine();
+        unsafe {
+            writer.raw_writer().write_raw::<{ usize::MAX }>(&bytes)?;
+        }
+        self.aux_cache.insert(opid, bytes);
+        Ok(writer)
+    }
+
     pub fn export(&mut self, writer: StrictWriter<impl WriteRaw>) -> io::Result<()>
     where
         <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
@@ -857,11 +891,11 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         w = contract_id.strict_encode(w)?;
         w = 0u8.strict_encode(w)?;
         w = self.ledger.articles().strict_encode(w)?;
-        w = self.aux(genesis_opid, &genesis_op, w)?;
+        w = self.aux_cached(genesis_opid, &genesis_op, w)?;
         w = count.strict_encode(w)?;
         for (opid, op) in ops {
             w = op.strict_encode(w)?;
-            w = self.aux(opid, &op, w)?;
+            w = self.aux_cached(opid, &op, w)?;
         }
         Ok(())
     }
@@ -925,22 +959,21 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 "Slow rgb-std stage"
             );
         }
-        let filter_ops_started_at = Instant::now();
-        let mut operations_scanned = 0usize;
-        let mut ops = Vec::new();
-        for (opid, op) in self.ledger.operations() {
-            operations_scanned += 1;
-            if all_needed.contains(&opid) {
-                ops.push((opid, op));
+        let load_ops_started_at = Instant::now();
+        let genesis_opid = self.ledger.articles().genesis_opid();
+        let mut ops = Vec::with_capacity(all_needed.len());
+        for opid in all_needed.iter().rev().copied() {
+            if opid == genesis_opid {
+                continue;
             }
+            ops.push((opid, self.ledger.operation(opid)));
         }
-        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(filter_ops_started_at) {
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(load_ops_started_at) {
             tracing::warn!(
                 operation = "rgb_std",
-                stage = "consign_filter_operations",
+                stage = "consign_load_operations",
                 elapsed_ms,
                 contract_id = ?self.contract_id,
-                operations_scanned,
                 selected_ops = ops.len(),
                 ancestor_ops = all_needed.len(),
                 "Slow rgb-std stage"
@@ -950,17 +983,16 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let contract_id = self.contract_id;
         let mut writer = writer;
         let write_started_at = Instant::now();
-        let genesis_opid = self.ledger.articles().genesis_opid();
         let genesis_op = self.ledger.articles().genesis().to_operation(contract_id);
         writer = 0u8.strict_encode(writer)?; // DEEDS_VERSION = 0
         writer = contract_id.strict_encode(writer)?;
         writer = 0u8.strict_encode(writer)?;
         writer = self.ledger.articles().strict_encode(writer)?;
-        writer = self.aux(genesis_opid, &genesis_op, writer)?;
+        writer = self.aux_cached(genesis_opid, &genesis_op, writer)?;
         writer = count.strict_encode(writer)?;
         for (opid, op) in ops {
             writer = op.strict_encode(writer)?;
-            writer = self.aux(opid, &op, writer)?;
+            writer = self.aux_cached(opid, &op, writer)?;
         }
         if let Some(elapsed_ms) = slow_rgb_stage_elapsed(write_started_at) {
             tracing::warn!(
@@ -968,7 +1000,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 stage = "consign_write_operations",
                 elapsed_ms,
                 ?contract_id,
-                operations_scanned,
+                ancestor_ops = all_needed.len(),
                 selected_ops = count,
                 "Slow rgb-std stage"
             );
@@ -979,7 +1011,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 stage = "consign_total",
                 elapsed_ms,
                 ?contract_id,
-                operations_scanned,
+                ancestor_ops = all_needed.len(),
                 selected_ops = count,
                 "Slow rgb-std stage"
             );
@@ -1115,6 +1147,7 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         let opid = op.opid();
         self.ledger.apply(op).expect("unable to apply operation");
         self.valid_cache.insert(opid);
+        self.aux_cache.remove(&opid);
     }
 
     fn apply_seals(
@@ -1123,9 +1156,11 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         seals: SmallOrdMap<u16, <P::Seal as RgbSeal>::Definition>,
     ) {
         self.pile.session().add_seals(opid, seals);
+        self.aux_cache.remove(&opid);
     }
 
     fn apply_witness(&mut self, opid: Opid, witness: SealWitness<P::Seal>) {
+        self.aux_cache.remove(&opid);
         self.include(opid, witness.client, &witness.published)
     }
 }
