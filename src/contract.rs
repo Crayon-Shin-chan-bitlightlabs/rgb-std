@@ -252,6 +252,7 @@ pub struct Contract<S: Stock, P: Pile> {
     pile: P,
     /// In-memory cache of valid opids for `ContractApi::is_known(&self)` which requires &self.
     valid_cache: HashSet<Opid>,
+    op_cache: HashMap<Opid, Vec<u8>>,
     aux_cache: HashMap<Opid, Vec<u8>>,
 }
 
@@ -304,6 +305,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             pile,
             contract_id,
             valid_cache: HashSet::from([genesis_opid]),
+            op_cache: HashMap::new(),
             aux_cache: HashMap::new(),
         };
         contract
@@ -369,6 +371,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             pile,
             contract_id,
             valid_cache: HashSet::from([genesis_opid]),
+            op_cache: HashMap::new(),
             aux_cache: HashMap::new(),
         })
     }
@@ -385,6 +388,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             pile,
             contract_id,
             valid_cache: HashSet::new(),
+            op_cache: HashMap::new(),
             aux_cache: HashMap::new(),
         };
         contract.refresh_valid_cache();
@@ -851,6 +855,28 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         Ok(writer)
     }
 
+    fn op_cached<W: WriteRaw>(
+        &mut self,
+        opid: Opid,
+        op: &Operation,
+        mut writer: StrictWriter<W>,
+    ) -> io::Result<StrictWriter<W>> {
+        if let Some(bytes) = self.op_cache.get(&opid) {
+            unsafe {
+                writer.raw_writer().write_raw::<{ usize::MAX }>(bytes)?;
+            }
+            return Ok(writer);
+        }
+
+        let mem_writer = StrictWriter::with(StreamWriter::in_memory::<{ usize::MAX }>());
+        let bytes = op.strict_encode(mem_writer)?.unbox().unconfine();
+        unsafe {
+            writer.raw_writer().write_raw::<{ usize::MAX }>(&bytes)?;
+        }
+        self.op_cache.insert(opid, bytes);
+        Ok(writer)
+    }
+
     fn aux_cached<W: WriteRaw>(
         &mut self,
         opid: Opid,
@@ -894,7 +920,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         w = self.aux_cached(genesis_opid, &genesis_op, w)?;
         w = count.strict_encode(w)?;
         for (opid, op) in ops {
-            w = op.strict_encode(w)?;
+            w = self.op_cached(opid, &op, w)?;
             w = self.aux_cached(opid, &op, w)?;
         }
         Ok(())
@@ -993,7 +1019,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         writer = self.aux_cached(genesis_opid, &genesis_op, writer)?;
         writer = count.strict_encode(writer)?;
         for (opid, op) in ops {
-            writer = op.strict_encode(writer)?;
+            writer = self.op_cached(opid, &op, writer)?;
             writer = self.aux_cached(opid, &op, writer)?;
         }
         if let Some(elapsed_ms) = slow_rgb_stage_elapsed(write_started_at) {
