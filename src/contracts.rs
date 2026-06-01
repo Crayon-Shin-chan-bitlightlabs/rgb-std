@@ -787,6 +787,20 @@ where
         )
     }
 
+    pub fn resolved_owned_state_entries_filtered(
+        &mut self,
+        contract_id: ContractId,
+        name: &StateName,
+        predicate: impl FnMut(&<Sp::Pile as Pile>::Seal) -> bool,
+    ) -> Vec<OwnedState<<Sp::Pile as Pile>::Seal>>
+    where
+        <Sp::Pile as Pile>::Seal: Clone,
+    {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.resolved_owned_state_entries_filtered(name, predicate)
+        })
+    }
+
     /// Consume a consignment stream.
     ///
     /// The method:

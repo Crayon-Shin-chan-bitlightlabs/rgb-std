@@ -477,6 +477,53 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             .collect()
     }
 
+    fn op_status_with_ancestors(&mut self, opid: Opid, direct: WitnessStatus) -> WitnessStatus {
+        self.ledger
+            .ancestors([opid])
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|ancestor| self.best_op_status(ancestor))
+            .fold(WitnessStatus::Genesis, |worst, other| worst.worst(other))
+            .worst(direct)
+    }
+
+    pub fn resolved_owned_state_entries_filtered(
+        &mut self,
+        name: &StateName,
+        mut predicate: impl FnMut(&P::Seal) -> bool,
+    ) -> Vec<OwnedState<P::Seal>>
+    where
+        P::Seal: Clone,
+    {
+        let Some(states) = self.ledger.state().main.owned.get(name) else {
+            return vec![];
+        };
+
+        let mut selected = Vec::new();
+        {
+            let mut session = self.pile.session();
+            for (addr, data) in states {
+                let Some(seal) = session.seal(*addr) else {
+                    continue;
+                };
+                if let Some(seal_src) = seal.to_src() {
+                    if predicate(&seal_src) {
+                        selected.push((*addr, seal_src, data.clone()));
+                    }
+                }
+            }
+        }
+
+        selected
+            .into_iter()
+            .map(|(addr, seal, data)| {
+                let direct = self.best_op_status(addr.opid);
+                let status = self.op_status_with_ancestors(addr.opid, direct);
+                OwnedState { addr, assignment: Assignment { seal, data }, status }
+            })
+            .collect()
+    }
+
     pub fn state(&mut self) -> ContractState<P::Seal> {
         let main = self.ledger.state().main.clone();
         let genesis_opid = self.ledger.articles().genesis_opid();
