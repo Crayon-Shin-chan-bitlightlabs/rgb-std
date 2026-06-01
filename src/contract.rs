@@ -959,21 +959,22 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 "Slow rgb-std stage"
             );
         }
-        let load_ops_started_at = Instant::now();
-        let genesis_opid = self.ledger.articles().genesis_opid();
-        let mut ops = Vec::with_capacity(all_needed.len());
-        for opid in all_needed.iter().rev().copied() {
-            if opid == genesis_opid {
-                continue;
+        let filter_ops_started_at = Instant::now();
+        let mut operations_scanned = 0usize;
+        let mut ops = Vec::new();
+        for (opid, op) in self.ledger.operations() {
+            operations_scanned += 1;
+            if all_needed.contains(&opid) {
+                ops.push((opid, op));
             }
-            ops.push((opid, self.ledger.operation(opid)));
         }
-        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(load_ops_started_at) {
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(filter_ops_started_at) {
             tracing::warn!(
                 operation = "rgb_std",
-                stage = "consign_load_operations",
+                stage = "consign_filter_operations",
                 elapsed_ms,
                 contract_id = ?self.contract_id,
+                operations_scanned,
                 selected_ops = ops.len(),
                 ancestor_ops = all_needed.len(),
                 "Slow rgb-std stage"
@@ -983,6 +984,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let contract_id = self.contract_id;
         let mut writer = writer;
         let write_started_at = Instant::now();
+        let genesis_opid = self.ledger.articles().genesis_opid();
         let genesis_op = self.ledger.articles().genesis().to_operation(contract_id);
         writer = 0u8.strict_encode(writer)?; // DEEDS_VERSION = 0
         writer = contract_id.strict_encode(writer)?;
@@ -1000,7 +1002,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 stage = "consign_write_operations",
                 elapsed_ms,
                 ?contract_id,
-                ancestor_ops = all_needed.len(),
+                operations_scanned,
                 selected_ops = count,
                 "Slow rgb-std stage"
             );
@@ -1011,7 +1013,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 stage = "consign_total",
                 elapsed_ms,
                 ?contract_id,
-                ancestor_ops = all_needed.len(),
+                operations_scanned,
                 selected_ops = count,
                 "Slow rgb-std stage"
             );
