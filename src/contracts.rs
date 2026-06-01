@@ -160,6 +160,30 @@ where
         Self { issuers: none!(), contracts: none!(), persistence }
     }
 
+    #[cfg(feature = "async")]
+    pub fn witness_update_candidates(
+        &self,
+        contract_id: ContractId,
+        min_conformations: u32,
+    ) -> Option<Vec<<<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId>> {
+        self.witness_update_candidates
+            .borrow()
+            .get(&(contract_id, min_conformations))
+            .map(|candidates| candidates.iter().copied().collect())
+    }
+
+    #[cfg(feature = "async")]
+    pub fn set_witness_update_candidates(
+        &mut self,
+        contract_id: ContractId,
+        min_conformations: u32,
+        candidates: impl IntoIterator<Item = <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId>,
+    ) {
+        self.witness_update_candidates
+            .borrow_mut()
+            .insert((contract_id, min_conformations), candidates.into_iter().collect());
+    }
+
     #[allow(dead_code)]
     fn with_contract<R>(
         &self,
