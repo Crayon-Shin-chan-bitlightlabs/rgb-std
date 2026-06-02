@@ -29,7 +29,7 @@ use alloc::collections::btree_map::Entry;
 use alloc::collections::{btree_set, BTreeMap, BTreeSet};
 use alloc::vec;
 use core::mem;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use amplify::confinement::{
@@ -539,22 +539,32 @@ where
 
         // Do coinselection
         let wallet_state_started_at = Instant::now();
-        let state = self.wallet_contract_state(contract_id);
-        let owned_state_names = state.owned.len();
-        let owned_state_entries = state
-            .owned
-            .values()
-            .map(|entries| entries.len())
-            .sum::<usize>();
-        let state = state
-            .owned
-            .get(&state_name)
-            .ok_or(FulfillError::StateUnavailable)?;
+        let owned_utxos = self.wallet.utxos().collect::<HashSet<_>>();
+        let state = self
+            .contracts
+            .resolved_owned_state_entries_filtered(contract_id, &state_name, |seal| {
+                owned_utxos.contains(&seal.primary)
+            })
+            .into_iter()
+            .map(|state| OwnedState {
+                addr: state.addr,
+                assignment: Assignment {
+                    seal: state.assignment.seal.primary,
+                    data: state.assignment.data,
+                },
+                status: state.status,
+            })
+            .collect::<Vec<_>>();
+        let owned_state_names = usize::from(!state.is_empty());
+        let owned_state_entries = state.len();
         let selected_state_entries = state.len();
+        if state.is_empty() {
+            return Err(FulfillError::StateUnavailable);
+        }
         if let Some(elapsed_ms) = slow_rgb_stage_elapsed(wallet_state_started_at) {
             tracing::warn!(
                 operation = "rgb_std",
-                stage = "fulfill_wallet_contract_state",
+                stage = "fulfill_resolved_owned_state",
                 elapsed_ms,
                 ?contract_id,
                 %state_name,
@@ -567,7 +577,7 @@ where
         // NB: we do state accumulation with `calc` inside coinselect
         let coinselect_started_at = Instant::now();
         let mut using = coinselect
-            .coinselect(value, &mut calc, state)
+            .coinselect(value, &mut calc, &state)
             .ok_or(FulfillError::StateInsufficient)?;
         let selected_using = using.len();
         if let Some(elapsed_ms) = slow_rgb_stage_elapsed(coinselect_started_at) {
