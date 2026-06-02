@@ -2,11 +2,11 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use core::borrow::Borrow;
 use core::error::Error;
 use core::marker::PhantomData;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -15,10 +15,10 @@ use amplify::{IoError, MultiError};
 use chrono::{DateTime, Utc};
 use commit_verify::{ReservedBytes, StrictHash};
 use hypersonic::{
-    AcceptError, Articles, AuthToken, CallParams, CellAddr, Codex, Consensus, ContractId,
+    AcceptError, Api, Articles, AuthToken, CallParams, CellAddr, Codex, Consensus, ContractId,
     CoreParams, DataCell, EffectiveState, IssueError, IssueParams, Ledger, LibRepo, Memory,
-    MethodName, NamedState, Operation, Opid, SemanticError, Semantics, SigBlob, StateAtom,
-    StateName, Stock, StockSession, Transition,
+    MethodName, NamedState, Operation, Opid, ProcessedState, SemanticError, Semantics, SigBlob,
+    StateAtom, StateName, Stock, StockSession, Transition,
 };
 use indexmap::{IndexMap, IndexSet};
 use rgb::{
@@ -953,7 +953,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
         // Collect terminal opids
         let terminal_started_at = Instant::now();
-        let terminal_opids: Vec<Opid> = terminals
+        let terminal_opids: BTreeSet<Opid> = terminals
             .into_iter()
             .map(|t| self.ledger.state().addr(*t.borrow()).opid)
             .collect();
@@ -967,21 +967,66 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 "Slow rgb-std stage"
             );
         }
-        // Collect ops reachable from terminals (ancestors)
-        let ancestors_started_at = Instant::now();
-        let needed: std::collections::BTreeSet<Opid> = terminal_opids.into_iter().collect();
-        let all_needed: std::collections::BTreeSet<Opid> = self
-            .ledger
-            .ancestors(needed.iter().copied().collect::<Vec<_>>())
-            .collect();
-        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(ancestors_started_at) {
+        // Match Ledger::export_aux semantics: follow destroyed cells backwards from
+        // terminals and include published global-state definitions required by validation.
+        let select_ops_started_at = Instant::now();
+        let genesis_opid = self.ledger.articles().genesis_opid();
+        let mut queue = terminal_opids
+            .iter()
+            .copied()
+            .filter(|opid| *opid != genesis_opid)
+            .collect::<VecDeque<_>>();
+        let mut selected_opids = queue.iter().copied().collect::<HashSet<_>>();
+        let trace_by_opid = self.ledger.trace_iter().collect::<HashMap<_, _>>();
+        while let Some(opid) = queue.pop_front() {
+            let Some(st) = trace_by_opid.get(&opid) else {
+                continue;
+            };
+            for prev in st.destroyed.keys().map(|addr| addr.opid) {
+                if prev != genesis_opid && selected_opids.insert(prev) {
+                    queue.push_back(prev);
+                }
+            }
+        }
+
+        let mut published_ops_added = 0usize;
+        let articles = self.ledger.articles();
+        let state = self.ledger.state();
+        let mut collect_published_ops = |api: &Api, state: &ProcessedState| {
+            let mut added = 0usize;
+            for (state_name, owned) in &api.global {
+                if !owned.published {
+                    continue;
+                }
+                let Some(cells) = state.global.get(state_name) else {
+                    continue;
+                };
+                for opid in cells.keys().map(|addr| addr.opid) {
+                    if opid != genesis_opid && selected_opids.insert(opid) {
+                        added += 1;
+                    }
+                }
+            }
+            added
+        };
+        published_ops_added += collect_published_ops(&articles.semantics().default, &state.main);
+        for (api_name, api) in &articles.semantics().custom {
+            let Some(state) = state.aux.get(api_name) else {
+                continue;
+            };
+            published_ops_added += collect_published_ops(api, state);
+        }
+
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(select_ops_started_at) {
             tracing::warn!(
                 operation = "rgb_std",
-                stage = "consign_collect_ancestors",
+                stage = "consign_select_operations",
                 elapsed_ms,
                 contract_id = ?self.contract_id,
-                terminal_ops = needed.len(),
-                ancestor_ops = all_needed.len(),
+                terminal_ops = terminal_opids.len(),
+                trace_ops = trace_by_opid.len(),
+                selected_ops = selected_opids.len(),
+                published_ops_added,
                 "Slow rgb-std stage"
             );
         }
@@ -990,7 +1035,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let mut ops = Vec::new();
         for (opid, op) in self.ledger.operations() {
             operations_scanned += 1;
-            if all_needed.contains(&opid) {
+            if selected_opids.contains(&opid) {
                 ops.push((opid, op));
             }
         }
@@ -1002,7 +1047,8 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 contract_id = ?self.contract_id,
                 operations_scanned,
                 selected_ops = ops.len(),
-                ancestor_ops = all_needed.len(),
+                terminal_ops = terminal_opids.len(),
+                published_ops_added,
                 "Slow rgb-std stage"
             );
         }
@@ -1010,7 +1056,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let contract_id = self.contract_id;
         let mut writer = writer;
         let write_started_at = Instant::now();
-        let genesis_opid = self.ledger.articles().genesis_opid();
         let genesis_op = self.ledger.articles().genesis().to_operation(contract_id);
         writer = 0u8.strict_encode(writer)?; // DEEDS_VERSION = 0
         writer = contract_id.strict_encode(writer)?;
