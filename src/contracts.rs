@@ -143,6 +143,9 @@ pub struct Contracts<
 {
     issuers: RefCell<S>,
     contracts: RefCell<C>,
+    #[cfg(feature = "async")]
+    witness_update_candidates:
+        RefCell<HashMap<(ContractId, u32), HashSet<<<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId>>>,
     persistence: Sp,
 }
 
@@ -157,7 +160,13 @@ where
         S: Default,
         C: Default,
     {
-        Self { issuers: none!(), contracts: none!(), persistence }
+        Self {
+            issuers: none!(),
+            contracts: none!(),
+            #[cfg(feature = "async")]
+            witness_update_candidates: none!(),
+            persistence,
+        }
     }
 
     #[cfg(feature = "async")]
