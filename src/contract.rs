@@ -252,8 +252,7 @@ pub struct Contract<S: Stock, P: Pile> {
     pile: P,
     /// In-memory cache of valid opids for `ContractApi::is_known(&self)` which requires &self.
     valid_cache: HashSet<Opid>,
-    op_cache: HashMap<Opid, Vec<u8>>,
-    aux_cache: HashMap<Opid, Vec<u8>>,
+    op_aux_cache: HashMap<Opid, Vec<u8>>,
 }
 
 impl<S: Stock, P: Pile> Contract<S, P> {
@@ -305,8 +304,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             pile,
             contract_id,
             valid_cache: HashSet::from([genesis_opid]),
-            op_cache: HashMap::new(),
-            aux_cache: HashMap::new(),
+            op_aux_cache: HashMap::new(),
         };
         contract
             .evaluate_commit(consignment.into_operations())
@@ -371,8 +369,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             pile,
             contract_id,
             valid_cache: HashSet::from([genesis_opid]),
-            op_cache: HashMap::new(),
-            aux_cache: HashMap::new(),
+            op_aux_cache: HashMap::new(),
         })
     }
 
@@ -388,8 +385,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             pile,
             contract_id,
             valid_cache: HashSet::new(),
-            op_cache: HashMap::new(),
-            aux_cache: HashMap::new(),
+            op_aux_cache: HashMap::new(),
         };
         contract.refresh_valid_cache();
         Ok(contract)
@@ -774,7 +770,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let mut roll_back = IndexSet::new();
         let mut forward = IndexSet::new();
         for (opid, old_status) in affected_ops {
-            self.aux_cache.remove(&opid);
+            self.op_aux_cache.remove(&opid);
             let new_status = self.best_op_status(opid);
             if old_status.is_valid() == new_status.is_valid() {
                 continue;
@@ -806,7 +802,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         debug_assert_eq!(operation.opid(), opid);
         self.pile.session().add_seals(opid, seals);
         self.valid_cache.insert(opid);
-        self.aux_cache.remove(&opid);
+        self.op_aux_cache.remove(&opid);
         debug_assert_eq!(operation.contract_id, self.contract_id());
         Ok(operation)
     }
@@ -831,7 +827,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let mut ps = self.pile.session();
         ps.add_witness(opid, wid, published, &anchor, WitnessStatus::Tentative);
         ps.include_commit_transaction();
-        self.aux_cache.remove(&opid);
+        self.op_aux_cache.remove(&opid);
     }
 
     pub(crate) fn commit_pile_transaction(&mut self) { self.pile.session().commit_transaction(); }
@@ -855,13 +851,13 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         Ok(writer)
     }
 
-    fn op_cached<W: WriteRaw>(
+    fn op_aux_cached<W: WriteRaw>(
         &mut self,
         opid: Opid,
         op: &Operation,
         mut writer: StrictWriter<W>,
     ) -> io::Result<StrictWriter<W>> {
-        if let Some(bytes) = self.op_cache.get(&opid) {
+        if let Some(bytes) = self.op_aux_cache.get(&opid) {
             unsafe {
                 writer.raw_writer().write_raw::<{ usize::MAX }>(bytes)?;
             }
@@ -869,34 +865,22 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         }
 
         let mem_writer = StrictWriter::with(StreamWriter::in_memory::<{ usize::MAX }>());
-        let bytes = op.strict_encode(mem_writer)?.unbox().unconfine();
-        unsafe {
-            writer.raw_writer().write_raw::<{ usize::MAX }>(&bytes)?;
-        }
-        self.op_cache.insert(opid, bytes);
-        Ok(writer)
-    }
-
-    fn aux_cached<W: WriteRaw>(
-        &mut self,
-        opid: Opid,
-        op: &Operation,
-        mut writer: StrictWriter<W>,
-    ) -> io::Result<StrictWriter<W>> {
-        if let Some(bytes) = self.aux_cache.get(&opid) {
-            unsafe {
-                writer.raw_writer().write_raw::<{ usize::MAX }>(bytes)?;
-            }
-            return Ok(writer);
-        }
-
-        let mem_writer = StrictWriter::with(StreamWriter::in_memory::<{ usize::MAX }>());
+        let mem_writer = op.strict_encode(mem_writer)?;
         let bytes = self.aux(opid, op, mem_writer)?.unbox().unconfine();
         unsafe {
             writer.raw_writer().write_raw::<{ usize::MAX }>(&bytes)?;
         }
-        self.aux_cache.insert(opid, bytes);
+        self.op_aux_cache.insert(opid, bytes);
         Ok(writer)
+    }
+
+    fn aux_uncached<W: WriteRaw>(
+        &mut self,
+        opid: Opid,
+        op: &Operation,
+        writer: StrictWriter<W>,
+    ) -> io::Result<StrictWriter<W>> {
+        self.aux(opid, op, writer)
     }
 
     pub fn export(&mut self, writer: StrictWriter<impl WriteRaw>) -> io::Result<()>
@@ -917,11 +901,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         w = contract_id.strict_encode(w)?;
         w = 0u8.strict_encode(w)?;
         w = self.ledger.articles().strict_encode(w)?;
-        w = self.aux_cached(genesis_opid, &genesis_op, w)?;
+        w = self.aux_uncached(genesis_opid, &genesis_op, w)?;
         w = count.strict_encode(w)?;
         for (opid, op) in ops {
-            w = self.op_cached(opid, &op, w)?;
-            w = self.aux_cached(opid, &op, w)?;
+            w = self.op_aux_cached(opid, &op, w)?;
         }
         Ok(())
     }
@@ -1061,11 +1044,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         writer = contract_id.strict_encode(writer)?;
         writer = 0u8.strict_encode(writer)?;
         writer = self.ledger.articles().strict_encode(writer)?;
-        writer = self.aux_cached(genesis_opid, &genesis_op, writer)?;
+        writer = self.aux_uncached(genesis_opid, &genesis_op, writer)?;
         writer = count.strict_encode(writer)?;
         for (opid, op) in ops {
-            writer = self.op_cached(opid, &op, writer)?;
-            writer = self.aux_cached(opid, &op, writer)?;
+            writer = self.op_aux_cached(opid, &op, writer)?;
         }
         if let Some(elapsed_ms) = slow_rgb_stage_elapsed(write_started_at) {
             tracing::warn!(
@@ -1220,7 +1202,7 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         let opid = op.opid();
         self.ledger.apply(op).expect("unable to apply operation");
         self.valid_cache.insert(opid);
-        self.aux_cache.remove(&opid);
+        self.op_aux_cache.remove(&opid);
     }
 
     fn apply_seals(
@@ -1229,11 +1211,11 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         seals: SmallOrdMap<u16, <P::Seal as RgbSeal>::Definition>,
     ) {
         self.pile.session().add_seals(opid, seals);
-        self.aux_cache.remove(&opid);
+        self.op_aux_cache.remove(&opid);
     }
 
     fn apply_witness(&mut self, opid: Opid, witness: SealWitness<P::Seal>) {
-        self.aux_cache.remove(&opid);
+        self.op_aux_cache.remove(&opid);
         self.include(opid, witness.client, &witness.published)
     }
 }
