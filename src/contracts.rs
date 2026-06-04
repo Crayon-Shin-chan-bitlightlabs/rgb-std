@@ -42,6 +42,7 @@ use hypersonic::{
 };
 use indexmap::{IndexMap, IndexSet};
 use rgb::RgbSeal;
+#[cfg(feature = "async")]
 use single_use_seals::PublishedWitness;
 use strict_encoding::{
     ReadRaw, StrictDecode, StrictDumb, StrictEncode, StrictReader, StrictWriter, WriteRaw,
@@ -853,12 +854,15 @@ where
         pub_witness: &<<Sp::Pile as Pile>::Seal as RgbSeal>::Published,
         anchor: <<Sp::Pile as Pile>::Seal as RgbSeal>::Client,
     ) {
-        let witness_id = pub_witness.pub_id();
-        for ((cached_contract_id, _), candidates) in
-            self.witness_update_candidates.borrow_mut().iter_mut()
+        #[cfg(feature = "async")]
         {
-            if *cached_contract_id == contract_id {
-                candidates.insert(witness_id);
+            let witness_id = pub_witness.pub_id();
+            for ((cached_contract_id, _), candidates) in
+                self.witness_update_candidates.borrow_mut().iter_mut()
+            {
+                if *cached_contract_id == contract_id {
+                    candidates.insert(witness_id);
+                }
             }
         }
         self.with_contract_mut(contract_id, |contract| contract.include(opid, anchor, pub_witness))
@@ -1041,9 +1045,12 @@ where
 
                 let contract = self.persistence.import_contract(articles, consignment)?;
                 self.contracts.borrow_mut().insert(contract_id, contract);
-                self.witness_update_candidates
-                    .borrow_mut()
-                    .retain(|(cached_contract_id, _), _| *cached_contract_id != contract_id);
+                #[cfg(feature = "async")]
+                {
+                    self.witness_update_candidates
+                        .borrow_mut()
+                        .retain(|(cached_contract_id, _), _| *cached_contract_id != contract_id);
+                }
                 Ok(())
             } else {
                 Err(MultiError::A(ConsumeError::UnknownContract(contract_id)))
@@ -1053,9 +1060,12 @@ where
                 contract.consume_internal(reader, seal_resolver, sig_validator)
             });
             if result.is_ok() {
-                self.witness_update_candidates
-                    .borrow_mut()
-                    .retain(|(cached_contract_id, _), _| *cached_contract_id != contract_id);
+                #[cfg(feature = "async")]
+                {
+                    self.witness_update_candidates
+                        .borrow_mut()
+                        .retain(|(cached_contract_id, _), _| *cached_contract_id != contract_id);
+                }
             }
             result.map_err(|err| match err {
                 MultiError::A(a) => MultiError::A(a),
