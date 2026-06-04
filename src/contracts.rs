@@ -778,11 +778,10 @@ where
                     changed_statuses_total += changed_statuses.len();
                     if !changed_statuses.is_empty() {
                         synced_contracts += 1;
+                        contract
+                            .sync(changed_statuses.iter().map(|(id, status)| (*id, *status)))
+                            .map_err(MultiError::from_other_a)?;
                     }
-
-                    contract
-                        .sync(changed_statuses.iter().map(|(id, status)| (*id, *status)))
-                        .map_err(MultiError::from_other_a)?;
                     Ok(())
                 },
             )?;
