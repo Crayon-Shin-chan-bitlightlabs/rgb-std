@@ -4,6 +4,7 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use core::borrow::Borrow;
+use core::cell::RefCell;
 use core::error::Error;
 use core::marker::PhantomData;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -255,6 +256,29 @@ pub struct Contract<S: Stock, P: Pile> {
     valid_cache: HashSet<Opid>,
     op_aux_cache: HashMap<Opid, Vec<u8>>,
     op_aux_cache_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct ConsumeStats {
+    decoded_ops: usize,
+    known_ops: usize,
+    new_ops: usize,
+    seal_updates_empty: usize,
+    seal_updates_non_empty: usize,
+    witness_updates: usize,
+    duplicate_witness_updates: usize,
+}
+
+thread_local! {
+    static CONSUME_STATS: RefCell<Option<ConsumeStats>> = const { RefCell::new(None) };
+}
+
+fn with_consume_stats(update: impl FnOnce(&mut ConsumeStats)) {
+    CONSUME_STATS.with(|stats| {
+        if let Some(stats) = stats.borrow_mut().as_mut() {
+            update(stats);
+        }
+    });
 }
 
 impl<S: Stock, P: Pile> Contract<S, P> {
@@ -916,6 +940,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     .ops_by_witness_id(wid)
                     .any(|op| op == opid)
             {
+                with_consume_stats(|stats| stats.duplicate_witness_updates += 1);
                 return;
             }
             if prev != anchor {
@@ -1241,13 +1266,36 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             let issue_version = ReservedBytes::<1>::strict_decode(reader)?;
             let meta = ContractMeta::strict_decode(reader)?;
             let codex = Codex::strict_decode(reader)?;
+            let evaluate_started_at = Instant::now();
+            let previous_stats =
+                CONSUME_STATS.with(|stats| stats.replace(Some(ConsumeStats::default())));
             let op_reader = OpReader {
                 stream: reader,
                 seal_resolver,
                 count: u32::MAX,
                 _phantom: PhantomData,
             };
-            self.evaluate_commit(op_reader)?;
+            let evaluate_result = self.evaluate_commit(op_reader);
+            let stats = CONSUME_STATS
+                .with(|stats| stats.replace(previous_stats))
+                .unwrap_or_default();
+            if let Some(elapsed_ms) = slow_rgb_stage_elapsed(evaluate_started_at) {
+                tracing::warn!(
+                    operation = "rgb_std",
+                    stage = "consume_evaluate",
+                    elapsed_ms,
+                    contract_id = ?self.contract_id,
+                    decoded_ops = stats.decoded_ops,
+                    known_ops = stats.known_ops,
+                    new_ops = stats.new_ops,
+                    seal_updates_empty = stats.seal_updates_empty,
+                    seal_updates_non_empty = stats.seal_updates_non_empty,
+                    witness_updates = stats.witness_updates,
+                    duplicate_witness_updates = stats.duplicate_witness_updates,
+                    "Slow rgb-std stage"
+                );
+            }
+            evaluate_result?;
             let genesis = self.ledger.articles().genesis().clone();
             let issue = Issue { version: issue_version, meta, codex, genesis };
             Ok(Articles::with(semantics, issue, sig, sig_validator)?)
@@ -1302,6 +1350,7 @@ impl<'r, Seal: RgbSeal, R: ReadRaw, F: FnMut(&Operation) -> BTreeMap<u16, Seal::
         }
         let operation = Operation::strict_decode(self.stream)?;
         let mut defined_seals = SmallOrdMap::strict_decode(self.stream)?;
+        with_consume_stats(|stats| stats.decoded_ops += 1);
         defined_seals
             .extend((self.seal_resolver)(&operation))
             .map_err(|_| {
@@ -1322,7 +1371,17 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
     fn codex(&self) -> &Codex { self.ledger.articles().codex() }
     fn repo(&self) -> &impl LibRepo { self.ledger.articles() }
     fn memory(&self) -> &impl Memory { &self.ledger.state().raw }
-    fn is_known(&self, opid: Opid) -> bool { self.valid_cache.contains(&opid) }
+    fn is_known(&self, opid: Opid) -> bool {
+        let known = self.valid_cache.contains(&opid);
+        with_consume_stats(|stats| {
+            if known {
+                stats.known_ops += 1;
+            } else {
+                stats.new_ops += 1;
+            }
+        });
+        known
+    }
 
     fn apply_operation(&mut self, op: VerifiedOperation) {
         let opid = op.opid();
@@ -1337,13 +1396,16 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         seals: SmallOrdMap<u16, <P::Seal as RgbSeal>::Definition>,
     ) {
         if seals.is_empty() {
+            with_consume_stats(|stats| stats.seal_updates_empty += 1);
             return;
         }
+        with_consume_stats(|stats| stats.seal_updates_non_empty += 1);
         self.pile.session().add_seals(opid, seals);
         self.remove_op_aux_cache_entry(opid);
     }
 
     fn apply_witness(&mut self, opid: Opid, witness: SealWitness<P::Seal>) {
+        with_consume_stats(|stats| stats.witness_updates += 1);
         self.remove_op_aux_cache_entry(opid);
         self.include(opid, witness.client, &witness.published)
     }
