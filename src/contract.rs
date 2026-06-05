@@ -909,6 +909,15 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let wid = published.pub_id();
         let anchor = if self.pile.session().has_witness(wid) {
             let mut prev = self.pile.session().cli_witness(wid);
+            if prev == anchor
+                && self
+                    .pile
+                    .session()
+                    .ops_by_witness_id(wid)
+                    .any(|op| op == opid)
+            {
+                return;
+            }
             if prev != anchor {
                 prev.merge(anchor)
                     .expect("incompatible anchors — storage corrupted");
