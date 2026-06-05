@@ -597,7 +597,19 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     pub fn resolved_owned_state_entries_filtered(
         &mut self,
         name: &StateName,
+        predicate: impl FnMut(&P::Seal) -> bool,
+    ) -> Vec<OwnedState<P::Seal>>
+    where
+        P::Seal: Clone,
+    {
+        self.resolved_owned_state_entries_filtered_take(name, predicate, None)
+    }
+
+    pub fn resolved_owned_state_entries_filtered_take(
+        &mut self,
+        name: &StateName,
         mut predicate: impl FnMut(&P::Seal) -> bool,
+        limit: Option<usize>,
     ) -> Vec<OwnedState<P::Seal>>
     where
         P::Seal: Clone,
@@ -617,6 +629,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 if let Some(seal_src) = seal.to_src() {
                     if predicate(&seal_src) {
                         selected.push((*addr, seal_src, data.clone()));
+                        if limit.is_some_and(|limit| selected.len() >= limit) {
+                            break;
+                        }
                     }
                 } else {
                     let wids = session.op_witness_ids(addr.opid).collect::<Vec<_>>();
@@ -685,6 +700,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     assignment: Assignment { seal, data: data.clone() },
                     status,
                 });
+                if limit.is_some_and(|limit| result.len() >= limit) {
+                    break;
+                }
             }
         }
 
