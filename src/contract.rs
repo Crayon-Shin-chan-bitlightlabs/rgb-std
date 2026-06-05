@@ -1434,7 +1434,6 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
 
     fn apply_witness(&mut self, opid: Opid, witness: SealWitness<P::Seal>) {
         with_consume_stats(|stats| stats.witness_updates += 1);
-        self.remove_op_aux_cache_entry(opid);
         self.include(opid, witness.client, &witness.published)
     }
 }
