@@ -957,9 +957,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         if bytes_len > OP_AUX_CACHE_MAX_BYTES {
             return;
         }
-        if self.op_aux_cache_bytes.saturating_add(bytes_len) > OP_AUX_CACHE_MAX_BYTES {
-            self.op_aux_cache.clear();
-            self.op_aux_cache_bytes = 0;
+        let replaced_bytes_len = self.op_aux_cache.get(&opid).map_or(0, Vec::len);
+        let cache_bytes_after_replace = self.op_aux_cache_bytes.saturating_sub(replaced_bytes_len);
+        if cache_bytes_after_replace.saturating_add(bytes_len) > OP_AUX_CACHE_MAX_BYTES {
+            return;
         }
         if let Some(old_bytes) = self.op_aux_cache.insert(opid, bytes) {
             self.op_aux_cache_bytes = self.op_aux_cache_bytes.saturating_sub(old_bytes.len());
