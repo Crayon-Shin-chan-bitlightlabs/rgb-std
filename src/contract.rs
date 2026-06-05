@@ -463,7 +463,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         &mut self,
         start: Opid,
         genesis_opid: Opid,
-        ops: &BTreeMap<Opid, Operation>,
+        parent_ops: &BTreeMap<Opid, Vec<Opid>>,
         op_witness_ids_cache: &mut BTreeMap<Opid, Vec<<P::Seal as RgbSeal>::WitnessId>>,
         witness_status_cache: &mut BTreeMap<<P::Seal as RgbSeal>::WitnessId, WitnessStatus>,
         best_status_cache: &mut BTreeMap<Opid, WitnessStatus>,
@@ -478,12 +478,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             let mut index = 0usize;
             while let Some(&opid) = chain.get_index(index) {
                 if opid != genesis_opid {
-                    if let Some(op) = ops.get(&opid) {
-                        for inp in &op.immutable_in {
-                            chain.insert(inp.opid);
-                        }
-                        for inp in &op.destructible_in {
-                            chain.insert(inp.addr.opid);
+                    if let Some(parents) = parent_ops.get(&opid) {
+                        for parent in parents {
+                            chain.insert(*parent);
                         }
                     }
                 }
@@ -646,7 +643,19 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         }
 
         let genesis_opid = self.ledger.articles().genesis_opid();
-        let all_ops: BTreeMap<Opid, Operation> = self.ledger.operations().collect();
+        let parent_ops: BTreeMap<Opid, Vec<Opid>> = self
+            .ledger
+            .operations()
+            .map(|(opid, op)| {
+                let parents = op
+                    .immutable_in
+                    .iter()
+                    .map(|inp| inp.opid)
+                    .chain(op.destructible_in.iter().map(|inp| inp.addr.opid))
+                    .collect();
+                (opid, parents)
+            })
+            .collect();
         let mut op_witness_ids_cache = BTreeMap::new();
         let mut witness_status_cache = BTreeMap::new();
         let mut best_status_cache: BTreeMap<Opid, WitnessStatus> = BTreeMap::new();
@@ -665,7 +674,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     .ancestor_status_cached(
                         addr.opid,
                         genesis_opid,
-                        &all_ops,
+                        &parent_ops,
                         &mut op_witness_ids_cache,
                         &mut witness_status_cache,
                         &mut best_status_cache,
@@ -689,7 +698,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     .ancestor_status_cached(
                         addr.opid,
                         genesis_opid,
-                        &all_ops,
+                        &parent_ops,
                         &mut op_witness_ids_cache,
                         &mut witness_status_cache,
                         &mut best_status_cache,
