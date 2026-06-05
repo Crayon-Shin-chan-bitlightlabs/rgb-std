@@ -1071,20 +1071,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         <P::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
         let total_started_at = Instant::now();
-        // Warm up witness-backed storage so per-op witness reads during export avoid repeated
-        // cold I/O penalties on backends that lazily page witness records.
-        let witnesses_started_at = Instant::now();
-        let _ = self.witnesses();
-        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(witnesses_started_at) {
-            tracing::warn!(
-                operation = "rgb_std",
-                stage = "consign_witnesses_warmup",
-                elapsed_ms,
-                contract_id = ?self.contract_id,
-                "Slow rgb-std stage"
-            );
-        }
-
         // Collect terminal opids
         let terminal_started_at = Instant::now();
         let terminal_opids: BTreeSet<Opid> = terminals
