@@ -1413,6 +1413,18 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         known
     }
 
+    fn is_witness_known(&mut self, opid: Opid, witness: &SealWitness<P::Seal>) -> bool {
+        let wid = witness.published.pub_id();
+        let mut ps = self.pile.session();
+        let known = ps.has_witness(wid)
+            && ps.cli_witness(wid) == witness.client
+            && ps.ops_by_witness_id(wid).any(|op| op == opid);
+        if known {
+            with_consume_stats(|stats| stats.duplicate_witness_updates += 1);
+        }
+        known
+    }
+
     fn apply_operation(&mut self, op: VerifiedOperation) {
         let opid = op.opid();
         self.ledger.apply(op).expect("unable to apply operation");

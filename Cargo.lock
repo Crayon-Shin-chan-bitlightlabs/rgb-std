@@ -916,8 +916,7 @@ dependencies = [
 [[package]]
 name = "rgb-core"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "090112e02c7e100a4c0c205ff3db6d253ad8b25bcf516b4ebf4c7af265be9f2a"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/rgb-core.git?branch=temp#da326d46ad3bb481b8d464de48a9b7bd5ae9985d"
 dependencies = [
  "amplify",
  "bp-core",
