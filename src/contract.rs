@@ -7,7 +7,7 @@ use core::borrow::Borrow;
 use core::cell::RefCell;
 use core::error::Error;
 use core::marker::PhantomData;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -1120,50 +1120,71 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         // terminals and include published global-state definitions required by validation.
         let select_ops_started_at = Instant::now();
         let genesis_opid = self.ledger.articles().genesis_opid();
-        let mut queue = terminal_opids
-            .iter()
-            .copied()
-            .filter(|opid| *opid != genesis_opid)
-            .collect::<VecDeque<_>>();
-        let mut selected_opids = queue.iter().copied().collect::<HashSet<_>>();
-        let trace_by_opid = self.ledger.trace_iter().collect::<HashMap<_, _>>();
-        while let Some(opid) = queue.pop_front() {
-            let Some(st) = trace_by_opid.get(&opid) else {
-                continue;
-            };
-            for prev in st.destroyed.keys().map(|addr| addr.opid) {
-                if prev != genesis_opid && selected_opids.insert(prev) {
-                    queue.push_back(prev);
-                }
-            }
-        }
+        let mut selected_opids = HashSet::new();
+        let mut ordered_opids = Vec::new();
+        macro_rules! include_op_with_dependencies {
+            ($root:expr) => {{
+                let root = $root;
+                if root != genesis_opid && !selected_opids.contains(&root) {
+                    let mut stack = vec![(root, false)];
+                    while let Some((opid, expanded)) = stack.pop() {
+                        if opid == genesis_opid || selected_opids.contains(&opid) {
+                            continue;
+                        }
+                        if expanded {
+                            if selected_opids.insert(opid) {
+                                ordered_opids.push(opid);
+                            }
+                            continue;
+                        }
 
-        let mut published_ops_added = 0usize;
-        let articles = self.ledger.articles();
-        let state = self.ledger.state();
-        let mut collect_published_ops = |api: &Api, state: &ProcessedState| {
-            let mut added = 0usize;
-            for (state_name, owned) in &api.global {
-                if !owned.published {
-                    continue;
-                }
-                let Some(cells) = state.global.get(state_name) else {
-                    continue;
-                };
-                for opid in cells.keys().map(|addr| addr.opid) {
-                    if opid != genesis_opid && selected_opids.insert(opid) {
-                        added += 1;
+                        stack.push((opid, true));
+                        let st = self.ledger.transition(opid);
+                        for prev in st.destroyed.into_keys().map(|addr| addr.opid) {
+                            if prev != genesis_opid && !selected_opids.contains(&prev) {
+                                stack.push((prev, false));
+                            }
+                        }
                     }
                 }
-            }
-            added
-        };
-        published_ops_added += collect_published_ops(&articles.semantics().default, &state.main);
-        for (api_name, api) in &articles.semantics().custom {
-            let Some(state) = state.aux.get(api_name) else {
-                continue;
+            }};
+        }
+
+        for opid in terminal_opids.iter().copied() {
+            include_op_with_dependencies!(opid);
+        }
+
+        let mut published_roots = BTreeSet::new();
+        {
+            let articles = self.ledger.articles();
+            let state = self.ledger.state();
+            let mut collect_published_roots = |api: &Api, state: &ProcessedState| {
+                for (state_name, owned) in &api.global {
+                    if !owned.published {
+                        continue;
+                    }
+                    let Some(cells) = state.global.get(state_name) else {
+                        continue;
+                    };
+                    published_roots.extend(
+                        cells
+                            .keys()
+                            .map(|addr| addr.opid)
+                            .filter(|opid| *opid != genesis_opid),
+                    );
+                }
             };
-            published_ops_added += collect_published_ops(api, state);
+            collect_published_roots(&articles.semantics().default, &state.main);
+            for (api_name, api) in &articles.semantics().custom {
+                let Some(state) = state.aux.get(api_name) else {
+                    continue;
+                };
+                collect_published_roots(api, state);
+            }
+        }
+        let published_ops_added = published_roots.len();
+        for opid in published_roots {
+            include_op_with_dependencies!(opid);
         }
 
         if let Some(elapsed_ms) = slow_rgb_stage_elapsed(select_ops_started_at) {
@@ -1173,28 +1194,22 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 elapsed_ms,
                 contract_id = ?self.contract_id,
                 terminal_ops = terminal_opids.len(),
-                trace_ops = trace_by_opid.len(),
                 selected_ops = selected_opids.len(),
                 published_ops_added,
                 "Slow rgb-std stage"
             );
         }
         let filter_ops_started_at = Instant::now();
-        let mut operations_scanned = 0usize;
-        let mut ops = Vec::new();
-        for (opid, op) in self.ledger.operations() {
-            operations_scanned += 1;
-            if selected_opids.contains(&opid) {
-                ops.push((opid, op));
-            }
-        }
+        let ops = ordered_opids
+            .into_iter()
+            .map(|opid| (opid, self.ledger.operation(opid)))
+            .collect::<Vec<_>>();
         if let Some(elapsed_ms) = slow_rgb_stage_elapsed(filter_ops_started_at) {
             tracing::warn!(
                 operation = "rgb_std",
                 stage = "consign_filter_operations",
                 elapsed_ms,
                 contract_id = ?self.contract_id,
-                operations_scanned,
                 selected_ops = ops.len(),
                 terminal_ops = terminal_opids.len(),
                 published_ops_added,
@@ -1221,7 +1236,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 stage = "consign_write_operations",
                 elapsed_ms,
                 ?contract_id,
-                operations_scanned,
                 selected_ops = count,
                 "Slow rgb-std stage"
             );
@@ -1232,7 +1246,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 stage = "consign_total",
                 elapsed_ms,
                 ?contract_id,
-                operations_scanned,
                 selected_ops = count,
                 "Slow rgb-std stage"
             );
