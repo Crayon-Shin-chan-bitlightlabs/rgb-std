@@ -1055,15 +1055,40 @@ where
                 Err(MultiError::A(ConsumeError::UnknownContract(contract_id)))
             }
         } else {
+            #[cfg(feature = "async")]
+            let previous_witness_ids = self.with_contract_mut(contract_id, |contract| {
+                contract.witness_ids().into_iter().collect::<IndexSet<_>>()
+            });
             let result = self.with_contract_mut(contract_id, |contract| {
                 contract.consume_internal(reader, seal_resolver, sig_validator)
             });
             if result.is_ok() {
                 #[cfg(feature = "async")]
                 {
-                    self.witness_update_candidates
-                        .borrow_mut()
-                        .retain(|(cached_contract_id, _), _| *cached_contract_id != contract_id);
+                    let new_witness_ids = self.with_contract_mut(contract_id, |contract| {
+                        contract
+                            .witness_ids()
+                            .into_iter()
+                            .filter(|witness_id| !previous_witness_ids.contains(witness_id))
+                            .collect::<Vec<_>>()
+                    });
+                    if !new_witness_ids.is_empty()
+                        && self
+                            .witness_update_candidates
+                            .borrow()
+                            .keys()
+                            .any(|(cached_contract_id, _)| *cached_contract_id == contract_id)
+                    {
+                        let mut witness_update_candidates =
+                            self.witness_update_candidates.borrow_mut();
+                        for ((cached_contract_id, _), candidates) in
+                            witness_update_candidates.iter_mut()
+                        {
+                            if *cached_contract_id == contract_id {
+                                candidates.extend(new_witness_ids.iter().copied());
+                            }
+                        }
+                    }
                 }
             }
             result.map_err(|err| match err {
