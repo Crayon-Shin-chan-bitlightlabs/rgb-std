@@ -1336,6 +1336,9 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         opid: Opid,
         seals: SmallOrdMap<u16, <P::Seal as RgbSeal>::Definition>,
     ) {
+        if seals.is_empty() {
+            return;
+        }
         self.pile.session().add_seals(opid, seals);
         self.remove_op_aux_cache_entry(opid);
     }
