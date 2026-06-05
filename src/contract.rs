@@ -265,6 +265,7 @@ struct ConsumeStats {
     new_ops: usize,
     seal_updates_empty: usize,
     seal_updates_non_empty: usize,
+    duplicate_seal_updates: usize,
     witness_updates: usize,
     duplicate_witness_updates: usize,
 }
@@ -1318,6 +1319,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     new_ops = stats.new_ops,
                     seal_updates_empty = stats.seal_updates_empty,
                     seal_updates_non_empty = stats.seal_updates_non_empty,
+                    duplicate_seal_updates = stats.duplicate_seal_updates,
                     witness_updates = stats.witness_updates,
                     duplicate_witness_updates = stats.duplicate_witness_updates,
                     "Slow rgb-std stage"
@@ -1428,6 +1430,18 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
             return;
         }
         with_consume_stats(|stats| stats.seal_updates_non_empty += 1);
+        let duplicate = {
+            let mut ps = self.pile.session();
+            seals.iter().all(|(no, seal)| {
+                ps.seal(CellAddr::new(opid, *no))
+                    .as_ref()
+                    .is_some_and(|stored| stored == seal)
+            })
+        };
+        if duplicate {
+            with_consume_stats(|stats| stats.duplicate_seal_updates += 1);
+            return;
+        }
         self.pile.session().add_seals(opid, seals);
         self.remove_op_aux_cache_entry(opid);
     }
