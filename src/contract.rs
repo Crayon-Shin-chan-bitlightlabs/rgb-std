@@ -530,6 +530,19 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
     pub fn trace_ops(&mut self) -> Vec<(Opid, Transition)> { self.ledger.trace_iter().collect() }
 
+    pub fn known_seal_cells(&mut self) -> Vec<CellAddr> {
+        self.operations()
+            .into_iter()
+            .flat_map(|(opid, _, rels)| {
+                rels.defines
+                    .keys()
+                    .copied()
+                    .map(move |no| CellAddr::new(opid, no))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     pub fn witness_ids(&mut self) -> Vec<<P::Seal as RgbSeal>::WitnessId> {
         self.pile.session().witness_ids().collect()
     }
@@ -1123,11 +1136,44 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <P::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
-        let total_started_at = Instant::now();
         let known_opids = known_opids
             .into_iter()
             .map(|opid| *opid.borrow())
             .collect::<HashSet<_>>();
+        self.consign_with_known_boundaries(terminals, known_opids, HashSet::new(), writer)
+    }
+
+    pub fn consign_with_known_cells(
+        &mut self,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<()>
+    where
+        <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        let known_cells = known_cells
+            .into_iter()
+            .map(|cell| *cell.borrow())
+            .collect::<HashSet<_>>();
+        self.consign_with_known_boundaries(terminals, HashSet::new(), known_cells, writer)
+    }
+
+    fn consign_with_known_boundaries(
+        &mut self,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_opids: HashSet<Opid>,
+        known_cells: HashSet<CellAddr>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<()>
+    where
+        <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        let total_started_at = Instant::now();
         // Collect terminal opids
         let terminal_started_at = Instant::now();
         let terminal_opids: BTreeSet<Opid> = terminals
@@ -1153,10 +1199,16 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         macro_rules! include_op_with_dependencies {
             ($root:expr) => {{
                 let root = $root;
-                if root != genesis_opid && !known_opids.contains(&root) && !selected_opids.contains(&root) {
+                if root != genesis_opid
+                    && !known_opids.contains(&root)
+                    && !selected_opids.contains(&root)
+                {
                     let mut stack = vec![(root, false)];
                     while let Some((opid, expanded)) = stack.pop() {
-                        if opid == genesis_opid || known_opids.contains(&opid) || selected_opids.contains(&opid) {
+                        if opid == genesis_opid
+                            || known_opids.contains(&opid)
+                            || selected_opids.contains(&opid)
+                        {
                             continue;
                         }
                         if expanded {
@@ -1168,8 +1220,13 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
                         stack.push((opid, true));
                         let st = self.ledger.transition(opid);
-                        for prev in st.destroyed.into_keys().map(|addr| addr.opid) {
-                            if prev != genesis_opid && !known_opids.contains(&prev) && !selected_opids.contains(&prev) {
+                        for addr in st.destroyed.into_keys() {
+                            let prev = addr.opid;
+                            if prev != genesis_opid
+                                && !known_opids.contains(&prev)
+                                && !known_cells.contains(&addr)
+                                && !selected_opids.contains(&prev)
+                            {
                                 stack.push((prev, false));
                             }
                         }
@@ -1224,6 +1281,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 terminal_ops = terminal_opids.len(),
                 selected_ops = selected_opids.len(),
                 known_ops = known_opids.len(),
+                known_cells = known_cells.len(),
                 published_ops_added,
                 "Slow rgb-std stage"
             );
@@ -1242,6 +1300,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 selected_ops = ops.len(),
                 terminal_ops = terminal_opids.len(),
                 known_ops = known_opids.len(),
+                known_cells = known_cells.len(),
                 published_ops_added,
                 "Slow rgb-std stage"
             );
@@ -1268,6 +1327,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 ?contract_id,
                 selected_ops = count,
                 known_ops = known_opids.len(),
+                known_cells = known_cells.len(),
                 "Slow rgb-std stage"
             );
         }
@@ -1279,6 +1339,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 ?contract_id,
                 selected_ops = count,
                 known_ops = known_opids.len(),
+                known_cells = known_cells.len(),
                 "Slow rgb-std stage"
             );
         }
