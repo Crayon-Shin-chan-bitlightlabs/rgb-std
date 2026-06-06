@@ -309,6 +309,16 @@ where
         self.with_contract_mut(contract_id, |contract| contract.witness_ids())
     }
 
+    pub fn contract_trace_opids(&mut self, contract_id: ContractId) -> Vec<Opid> {
+        self.with_contract_mut(contract_id, |contract| {
+            contract
+                .trace_ops()
+                .into_iter()
+                .map(|(opid, _)| opid)
+                .collect()
+        })
+    }
+
     /// Get the contract state.
     ///
     /// The call does not recompute the contract state, but does a seal resolution,
