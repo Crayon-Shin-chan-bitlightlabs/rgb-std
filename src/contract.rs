@@ -256,6 +256,7 @@ pub struct Contract<S: Stock, P: Pile> {
     valid_cache: HashSet<Opid>,
     seal_def_cache: HashMap<CellAddr, <P::Seal as RgbSeal>::Definition>,
     duplicate_seal_def_cache: HashSet<CellAddr>,
+    duplicate_witness_cache: HashSet<(Opid, <P::Seal as RgbSeal>::WitnessId)>,
     op_aux_cache: HashMap<Opid, Vec<u8>>,
     op_aux_cache_bytes: usize,
 }
@@ -335,6 +336,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             valid_cache: HashSet::from([genesis_opid]),
             seal_def_cache: HashMap::new(),
             duplicate_seal_def_cache: HashSet::new(),
+            duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
             op_aux_cache_bytes: 0,
         };
@@ -403,6 +405,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             valid_cache: HashSet::from([genesis_opid]),
             seal_def_cache: HashMap::new(),
             duplicate_seal_def_cache: HashSet::new(),
+            duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
             op_aux_cache_bytes: 0,
         })
@@ -422,6 +425,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             valid_cache: HashSet::new(),
             seal_def_cache: HashMap::new(),
             duplicate_seal_def_cache: HashSet::new(),
+            duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
             op_aux_cache_bytes: 0,
         };
@@ -1519,11 +1523,17 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
 
     fn is_witness_known(&mut self, opid: Opid, witness: &SealWitness<P::Seal>) -> bool {
         let wid = witness.published.pub_id();
+        if self.duplicate_witness_cache.contains(&(opid, wid)) {
+            with_consume_stats(|stats| stats.duplicate_witness_updates += 1);
+            return true;
+        }
+
         let mut ps = self.pile.session();
         let known = ps.has_witness(wid)
             && ps.cli_witness(wid) == witness.client
             && ps.ops_by_witness_id(wid).any(|op| op == opid);
         if known {
+            self.duplicate_witness_cache.insert((opid, wid));
             with_consume_stats(|stats| stats.duplicate_witness_updates += 1);
         }
         known
@@ -1613,7 +1623,9 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
 
     fn apply_witness(&mut self, opid: Opid, witness: SealWitness<P::Seal>) {
         with_consume_stats(|stats| stats.witness_updates += 1);
-        self.include(opid, witness.client, &witness.published)
+        let wid = witness.published.pub_id();
+        self.include(opid, witness.client, &witness.published);
+        self.duplicate_witness_cache.insert((opid, wid));
     }
 }
 
