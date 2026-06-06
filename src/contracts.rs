@@ -927,6 +927,23 @@ where
         self.with_contract_mut(contract_id, |contract| contract.consign(terminals, writer))
     }
 
+    pub fn consign_with_known_opids(
+        &mut self,
+        contract_id: ContractId,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<()>
+    where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.consign_with_known_opids(terminals, known_opids, writer)
+        })
+    }
+
     pub fn consign_by_addrs(
         &mut self,
         contract_id: ContractId,

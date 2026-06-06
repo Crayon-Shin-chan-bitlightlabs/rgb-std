@@ -1109,7 +1109,25 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <P::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
+        self.consign_with_known_opids(terminals, std::iter::empty::<Opid>(), writer)
+    }
+
+    pub fn consign_with_known_opids(
+        &mut self,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<()>
+    where
+        <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
         let total_started_at = Instant::now();
+        let known_opids = known_opids
+            .into_iter()
+            .map(|opid| *opid.borrow())
+            .collect::<HashSet<_>>();
         // Collect terminal opids
         let terminal_started_at = Instant::now();
         let terminal_opids: BTreeSet<Opid> = terminals
@@ -1135,10 +1153,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         macro_rules! include_op_with_dependencies {
             ($root:expr) => {{
                 let root = $root;
-                if root != genesis_opid && !selected_opids.contains(&root) {
+                if root != genesis_opid && !known_opids.contains(&root) && !selected_opids.contains(&root) {
                     let mut stack = vec![(root, false)];
                     while let Some((opid, expanded)) = stack.pop() {
-                        if opid == genesis_opid || selected_opids.contains(&opid) {
+                        if opid == genesis_opid || known_opids.contains(&opid) || selected_opids.contains(&opid) {
                             continue;
                         }
                         if expanded {
@@ -1151,7 +1169,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                         stack.push((opid, true));
                         let st = self.ledger.transition(opid);
                         for prev in st.destroyed.into_keys().map(|addr| addr.opid) {
-                            if prev != genesis_opid && !selected_opids.contains(&prev) {
+                            if prev != genesis_opid && !known_opids.contains(&prev) && !selected_opids.contains(&prev) {
                                 stack.push((prev, false));
                             }
                         }
@@ -1205,6 +1223,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 contract_id = ?self.contract_id,
                 terminal_ops = terminal_opids.len(),
                 selected_ops = selected_opids.len(),
+                known_ops = known_opids.len(),
                 published_ops_added,
                 "Slow rgb-std stage"
             );
@@ -1222,6 +1241,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 contract_id = ?self.contract_id,
                 selected_ops = ops.len(),
                 terminal_ops = terminal_opids.len(),
+                known_ops = known_opids.len(),
                 published_ops_added,
                 "Slow rgb-std stage"
             );
@@ -1247,6 +1267,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 elapsed_ms,
                 ?contract_id,
                 selected_ops = count,
+                known_ops = known_opids.len(),
                 "Slow rgb-std stage"
             );
         }
@@ -1257,6 +1278,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 elapsed_ms,
                 ?contract_id,
                 selected_ops = count,
+                known_ops = known_opids.len(),
                 "Slow rgb-std stage"
             );
         }
@@ -1432,6 +1454,15 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
             with_consume_stats(|stats| stats.duplicate_witness_updates += 1);
         }
         known
+    }
+
+    fn known_seal(&mut self, addr: CellAddr) -> Option<P::Seal> {
+        let definition = self.pile.session().seal(addr)?;
+        if let Some(seal) = definition.to_src() {
+            return Some(seal);
+        }
+        let witness = self.retrieve(addr.opid)?;
+        Some(definition.resolve(witness.published.pub_id()))
     }
 
     fn apply_operation(&mut self, op: VerifiedOperation) {
