@@ -255,6 +255,7 @@ pub struct Contract<S: Stock, P: Pile> {
     /// In-memory cache of valid opids for `ContractApi::is_known(&self)` which requires &self.
     valid_cache: HashSet<Opid>,
     seal_def_cache: HashMap<CellAddr, <P::Seal as RgbSeal>::Definition>,
+    duplicate_seal_def_cache: HashSet<CellAddr>,
     op_aux_cache: HashMap<Opid, Vec<u8>>,
     op_aux_cache_bytes: usize,
 }
@@ -333,6 +334,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             contract_id,
             valid_cache: HashSet::from([genesis_opid]),
             seal_def_cache: HashMap::new(),
+            duplicate_seal_def_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
             op_aux_cache_bytes: 0,
         };
@@ -400,6 +402,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             contract_id,
             valid_cache: HashSet::from([genesis_opid]),
             seal_def_cache: HashMap::new(),
+            duplicate_seal_def_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
             op_aux_cache_bytes: 0,
         })
@@ -418,6 +421,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             contract_id,
             valid_cache: HashSet::new(),
             seal_def_cache: HashMap::new(),
+            duplicate_seal_def_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
             op_aux_cache_bytes: 0,
         };
@@ -1557,6 +1561,20 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
             return;
         }
         with_consume_stats(|stats| stats.seal_updates_non_empty += 1);
+
+        let cached_duplicate = seals.iter().all(|(no, seal)| {
+            let addr = CellAddr::new(opid, *no);
+            self.duplicate_seal_def_cache.contains(&addr)
+                && self
+                    .seal_def_cache
+                    .get(&addr)
+                    .is_some_and(|stored| stored == seal)
+        });
+        if cached_duplicate {
+            with_consume_stats(|stats| stats.duplicate_seal_updates += 1);
+            return;
+        }
+
         let duplicate = {
             let mut ps = self.pile.session();
             seals.iter().all(|(no, seal)| {
@@ -1579,12 +1597,15 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
             })
         };
         if duplicate {
+            self.duplicate_seal_def_cache
+                .extend(seals.keys().map(|no| CellAddr::new(opid, *no)));
             with_consume_stats(|stats| stats.duplicate_seal_updates += 1);
             return;
         }
         for (no, seal) in &seals {
-            self.seal_def_cache
-                .insert(CellAddr::new(opid, *no), seal.clone());
+            let addr = CellAddr::new(opid, *no);
+            self.seal_def_cache.insert(addr, seal.clone());
+            self.duplicate_seal_def_cache.insert(addr);
         }
         self.pile.session().add_seals(opid, seals);
         self.remove_op_aux_cache_entry(opid);
