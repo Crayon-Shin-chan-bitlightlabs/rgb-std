@@ -70,11 +70,7 @@ fn witness_status_is_mature(
     last_block_height: u64,
     min_conformations: u32,
 ) -> bool {
-    matches!(
-        status,
-        WitnessStatus::Mined(height)
-            if last_block_height.saturating_sub(height.get()) > min_conformations as u64
-    )
+    status.is_mature(last_block_height, min_conformations)
 }
 
 #[cfg(feature = "async")]
@@ -707,7 +703,10 @@ where
                         .collect::<Vec<_>>()
                 } else {
                     cache_misses += 1;
-                    contract.witness_statuses()
+                    contract.witness_statuses_requiring_update(
+                        last_block_height,
+                        min_conformations,
+                    )
                 }
             });
 

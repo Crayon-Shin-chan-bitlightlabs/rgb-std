@@ -581,6 +581,16 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         self.pile.session().witness_statuses()
     }
 
+    pub fn witness_statuses_requiring_update(
+        &mut self,
+        last_block_height: u64,
+        min_confirmations: u32,
+    ) -> Vec<(<P::Seal as RgbSeal>::WitnessId, WitnessStatus)> {
+        self.pile
+            .session()
+            .witness_statuses_requiring_update(last_block_height, min_confirmations)
+    }
+
     pub fn witnesses(&mut self) -> Vec<Witness<P::Seal>> {
         self.pile.session().witnesses().collect()
     }

@@ -50,6 +50,13 @@ impl WitnessStatus {
     pub fn is_offchain(&self) -> bool {
         matches!(self, Self::Offchain)
     }
+    pub fn is_mature(self, last_block_height: u64, min_confirmations: u32) -> bool {
+        matches!(
+            self,
+            Self::Mined(height)
+                if last_block_height.saturating_sub(height.get()) > min_confirmations as u64
+        )
+    }
 
     fn quasi_height(&self) -> u64 {
         match self {
@@ -161,6 +168,17 @@ pub trait PileSession {
                 let status = self.witness_status(wid);
                 (wid, status)
             })
+            .collect()
+    }
+
+    fn witness_statuses_requiring_update(
+        &mut self,
+        last_block_height: u64,
+        min_confirmations: u32,
+    ) -> Vec<(<Self::Seal as RgbSeal>::WitnessId, WitnessStatus)> {
+        self.witness_statuses()
+            .into_iter()
+            .filter(|(_, status)| !status.is_mature(last_block_height, min_confirmations))
             .collect()
     }
 
