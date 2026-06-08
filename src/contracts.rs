@@ -351,6 +351,18 @@ where
             .into()
     }
 
+    pub fn contract_owned_state_cell(
+        &mut self,
+        contract_id: ContractId,
+        addr: CellAddr,
+    ) -> Option<(StateName, StrictVal)> {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.full_state().main.owned.iter().find_map(|(name, cells)| {
+                cells.get(&addr).map(|value| (name.clone(), value.clone()))
+            })
+        })
+    }
+
     pub fn contract_resolved_owned_state_entries(
         &mut self,
         contract_id: ContractId,
