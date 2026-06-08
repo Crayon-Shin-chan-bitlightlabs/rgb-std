@@ -255,6 +255,7 @@ pub struct Contract<S: Stock, P: Pile> {
     /// In-memory cache of valid opids for `ContractApi::is_known(&self)` which requires &self.
     valid_cache: HashSet<Opid>,
     seal_def_cache: HashMap<CellAddr, <P::Seal as RgbSeal>::Definition>,
+    resolved_seal_cache: HashMap<CellAddr, P::Seal>,
     duplicate_seal_def_cache: HashSet<CellAddr>,
     duplicate_witness_cache: HashSet<(Opid, <P::Seal as RgbSeal>::WitnessId)>,
     op_aux_cache: HashMap<Opid, Vec<u8>>,
@@ -335,6 +336,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             contract_id,
             valid_cache: HashSet::from([genesis_opid]),
             seal_def_cache: HashMap::new(),
+            resolved_seal_cache: HashMap::new(),
             duplicate_seal_def_cache: HashSet::new(),
             duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
@@ -404,6 +406,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             contract_id,
             valid_cache: HashSet::from([genesis_opid]),
             seal_def_cache: HashMap::new(),
+            resolved_seal_cache: HashMap::new(),
             duplicate_seal_def_cache: HashSet::new(),
             duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
@@ -424,6 +427,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             contract_id,
             valid_cache: HashSet::new(),
             seal_def_cache: HashMap::new(),
+            resolved_seal_cache: HashMap::new(),
             duplicate_seal_def_cache: HashSet::new(),
             duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
@@ -1540,6 +1544,10 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
     }
 
     fn known_seal(&mut self, addr: CellAddr) -> Option<P::Seal> {
+        if let Some(seal) = self.resolved_seal_cache.get(&addr) {
+            return Some(seal.clone());
+        }
+
         let definition = if let Some(definition) = self.seal_def_cache.get(&addr) {
             definition.clone()
         } else {
@@ -1548,10 +1556,13 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
             definition
         };
         if let Some(seal) = definition.to_src() {
+            self.resolved_seal_cache.insert(addr, seal.clone());
             return Some(seal);
         }
         let witness = self.retrieve(addr.opid)?;
-        Some(definition.resolve(witness.published.pub_id()))
+        let seal = definition.resolve(witness.published.pub_id());
+        self.resolved_seal_cache.insert(addr, seal.clone());
+        Some(seal)
     }
 
     fn apply_operation(&mut self, op: VerifiedOperation) {
@@ -1615,6 +1626,7 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         for (no, seal) in &seals {
             let addr = CellAddr::new(opid, *no);
             self.seal_def_cache.insert(addr, seal.clone());
+            self.resolved_seal_cache.remove(&addr);
             self.duplicate_seal_def_cache.insert(addr);
         }
         self.pile.session().add_seals(opid, seals);
@@ -1626,6 +1638,7 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         let wid = witness.published.pub_id();
         self.include(opid, witness.client, &witness.published);
         self.duplicate_witness_cache.insert((opid, wid));
+        self.resolved_seal_cache.retain(|addr, _| addr.opid != opid);
     }
 }
 
