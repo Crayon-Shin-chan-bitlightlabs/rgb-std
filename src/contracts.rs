@@ -121,7 +121,9 @@ pub struct WalletState<Seal> {
 }
 
 impl<Seal> Default for WalletState<Seal> {
-    fn default() -> Self { Self { immutable: bmap! {}, owned: bmap! {}, aggregated: bmap! {} } }
+    fn default() -> Self {
+        Self { immutable: bmap! {}, owned: bmap! {}, aggregated: bmap! {} }
+    }
 }
 
 impl<Seal> WalletState<Seal> {
@@ -273,9 +275,13 @@ where
         self.persistence.codex_ids()
     }
 
-    pub fn issuers_count(&self) -> usize { self.persistence.issuers_count() }
+    pub fn issuers_count(&self) -> usize {
+        self.persistence.issuers_count()
+    }
 
-    pub fn has_issuer(&self, codex_id: CodexId) -> bool { self.persistence.has_issuer(codex_id) }
+    pub fn has_issuer(&self, codex_id: CodexId) -> bool {
+        self.persistence.has_issuer(codex_id)
+    }
 
     pub fn issuers(&self) -> impl Iterator<Item = (CodexId, Issuer)> + use<'_, Sp, S, C> {
         self.persistence
@@ -292,7 +298,9 @@ where
         Some(issuer)
     }
 
-    pub fn contracts_count(&self) -> usize { self.persistence.contracts_count() }
+    pub fn contracts_count(&self) -> usize {
+        self.persistence.contracts_count()
+    }
 
     pub fn has_contract(&self, contract_id: ContractId) -> bool {
         self.persistence.has_contract(contract_id)
@@ -357,9 +365,14 @@ where
         addr: CellAddr,
     ) -> Option<(StateName, StrictVal)> {
         self.with_contract_mut(contract_id, |contract| {
-            contract.full_state().main.owned.iter().find_map(|(name, cells)| {
-                cells.get(&addr).map(|value| (name.clone(), value.clone()))
-            })
+            contract
+                .full_state()
+                .main
+                .owned
+                .iter()
+                .find_map(|(name, cells)| {
+                    cells.get(&addr).map(|value| (name.clone(), value.clone()))
+                })
         })
     }
 
@@ -538,15 +551,8 @@ where
         let mut resolved_statuses = IndexMap::<_, WitnessStatus>::new();
         let contract_ids = self.persistence.contract_ids().collect::<IndexSet<_>>();
         for contract_id in contract_ids {
-            let witnesses = self.with_contract_mut(contract_id, |contract| {
-                let ids = contract.witness_ids();
-                ids.into_iter()
-                    .map(|wid| {
-                        let status = contract.witness_status(wid);
-                        (wid, status)
-                    })
-                    .collect::<Vec<_>>()
-            });
+            let witnesses =
+                self.with_contract_mut(contract_id, |contract| contract.witness_statuses());
 
             let mut changed_statuses = IndexMap::<_, WitnessStatus>::new();
             for (witness_id, old_status) in witnesses {
@@ -607,15 +613,8 @@ where
         };
 
         for contract_id in contract_ids {
-            let witnesses = self.with_contract_mut(contract_id, |contract| {
-                let ids = contract.witness_ids();
-                ids.into_iter()
-                    .map(|wid| {
-                        let status = contract.witness_status(wid);
-                        (wid, status)
-                    })
-                    .collect::<Vec<_>>()
-            });
+            let witnesses =
+                self.with_contract_mut(contract_id, |contract| contract.witness_statuses());
 
             let mut changed_statuses = IndexMap::<_, WitnessStatus>::new();
             for (witness_id, old_status) in witnesses {
@@ -699,18 +698,23 @@ where
             let candidates = self.with_contract_mut(contract_id, |contract| {
                 if let Some(candidates) = cached_candidates {
                     cache_hits += 1;
-                    candidates.into_iter().collect::<Vec<_>>()
+                    candidates
+                        .into_iter()
+                        .map(|wid| {
+                            let status = contract.witness_status(wid);
+                            (wid, status)
+                        })
+                        .collect::<Vec<_>>()
                 } else {
                     cache_misses += 1;
-                    contract.witness_ids()
+                    contract.witness_statuses()
                 }
             });
 
             self.with_contract_mut(contract_id, |contract| {
                 let mut pending_witnesses = Vec::with_capacity(candidates.len());
-                for witness_id in candidates {
+                for (witness_id, old_status) in candidates {
                     scanned_witnesses += 1;
-                    let old_status = contract.witness_status(witness_id);
                     if witness_status_is_mature(old_status, last_block_height, min_conformations) {
                         skipped_mature_mined += 1;
                         continue;

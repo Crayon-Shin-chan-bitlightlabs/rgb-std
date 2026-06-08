@@ -59,14 +59,18 @@ pub enum EitherSeal<Seal> {
 
 impl<Seal> EitherSeal<Seal> {
     pub fn auth_token(&self) -> AuthToken
-    where Seal: RgbSealDef {
+    where
+        Seal: RgbSealDef,
+    {
         match self {
             EitherSeal::Alt(seal) => seal.auth_token(),
             EitherSeal::Token(auth) => *auth,
         }
     }
     pub fn to_explicit(&self) -> Option<Seal>
-    where Seal: Clone {
+    where
+        Seal: Clone,
+    {
         match self {
             EitherSeal::Alt(seal) => Some(seal.clone()),
             EitherSeal::Token(_) => None,
@@ -85,7 +89,9 @@ pub struct Assignment<Seal> {
     pub data: StrictVal,
 }
 impl<Seal> Assignment<Seal> {
-    pub fn new(seal: Seal, data: impl Into<StrictVal>) -> Self { Self { seal, data: data.into() } }
+    pub fn new(seal: Seal, data: impl Into<StrictVal>) -> Self {
+        Self { seal, data: data.into() }
+    }
 }
 impl<Seal> Assignment<EitherSeal<Seal>> {
     pub fn new_external(auth: AuthToken, data: impl Into<StrictVal>) -> Self {
@@ -437,9 +443,15 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         Ok(contract)
     }
 
-    pub fn contract_id(&self) -> ContractId { self.contract_id }
-    pub fn articles(&self) -> &Articles { self.ledger.articles() }
-    pub fn full_state(&self) -> &EffectiveState { self.ledger.state() }
+    pub fn contract_id(&self) -> ContractId {
+        self.contract_id
+    }
+    pub fn articles(&self) -> &Articles {
+        self.ledger.articles()
+    }
+    pub fn full_state(&self) -> &EffectiveState {
+        self.ledger.state()
+    }
 
     fn best_op_status(&mut self, opid: Opid) -> WitnessStatus {
         let wids: Vec<_> = self.pile.session().op_witness_ids(opid).collect();
@@ -544,7 +556,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             .collect()
     }
 
-    pub fn trace_ops(&mut self) -> Vec<(Opid, Transition)> { self.ledger.trace_iter().collect() }
+    pub fn trace_ops(&mut self) -> Vec<(Opid, Transition)> {
+        self.ledger.trace_iter().collect()
+    }
 
     pub fn known_seal_cells(&mut self) -> Vec<CellAddr> {
         self.operations()
@@ -561,6 +575,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
     pub fn witness_ids(&mut self) -> Vec<<P::Seal as RgbSeal>::WitnessId> {
         self.pile.session().witness_ids().collect()
+    }
+
+    pub fn witness_statuses(&mut self) -> Vec<(<P::Seal as RgbSeal>::WitnessId, WitnessStatus)> {
+        self.pile.session().witness_statuses()
     }
 
     pub fn witnesses(&mut self) -> Vec<Witness<P::Seal>> {
@@ -585,7 +603,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     }
 
     pub fn owned_state_entries(&mut self, name: &StateName) -> Vec<(CellAddr, P::Seal, StrictVal)>
-    where P::Seal: Clone {
+    where
+        P::Seal: Clone,
+    {
         let Some(states) = self.ledger.state().main.owned.get(name) else {
             return vec![];
         };
@@ -604,7 +624,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     }
 
     pub fn resolved_owned_state_entries(&mut self, name: &StateName) -> Vec<OwnedState<P::Seal>>
-    where P::Seal: Clone {
+    where
+        P::Seal: Clone,
+    {
         self.state().owned.remove(name).unwrap_or_default()
     }
 
@@ -1031,7 +1053,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         self.remove_op_aux_cache_entry(opid);
     }
 
-    pub(crate) fn commit_pile_transaction(&mut self) { self.pile.session().commit_transaction(); }
+    pub(crate) fn commit_pile_transaction(&mut self) {
+        self.pile.session().commit_transaction();
+    }
 
     fn aux<W: WriteRaw>(
         &mut self,
@@ -1509,10 +1533,18 @@ impl<'r, Seal: RgbSeal, R: ReadRaw, F: FnMut(&Operation) -> BTreeMap<u16, Seal::
 }
 
 impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
-    fn contract_id(&self) -> ContractId { self.ledger.contract_id() }
-    fn codex(&self) -> &Codex { self.ledger.articles().codex() }
-    fn repo(&self) -> &impl LibRepo { self.ledger.articles() }
-    fn memory(&self) -> &impl Memory { &self.ledger.state().raw }
+    fn contract_id(&self) -> ContractId {
+        self.ledger.contract_id()
+    }
+    fn codex(&self) -> &Codex {
+        self.ledger.articles().codex()
+    }
+    fn repo(&self) -> &impl LibRepo {
+        self.ledger.articles()
+    }
+    fn memory(&self) -> &impl Memory {
+        &self.ledger.state().raw
+    }
     fn is_known(&self, opid: Opid) -> bool {
         let known = self.valid_cache.contains(&opid);
         with_consume_stats(|stats| {
