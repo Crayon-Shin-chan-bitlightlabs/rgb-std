@@ -599,6 +599,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         self.pile.session().witness_status(wid)
     }
 
+    pub fn has_witness(&mut self, wid: <P::Seal as RgbSeal>::WitnessId) -> bool {
+        self.pile.session().has_witness(wid)
+    }
+
     pub fn ops_by_witness_id(&mut self, wid: <P::Seal as RgbSeal>::WitnessId) -> Vec<Opid> {
         self.pile.session().ops_by_witness_id(wid).collect()
     }

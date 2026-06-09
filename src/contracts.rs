@@ -26,6 +26,8 @@ use alloc::collections::BTreeMap;
 use core::borrow::Borrow;
 use core::cell::RefCell;
 #[cfg(feature = "async")]
+use core::convert::Infallible;
+#[cfg(feature = "async")]
 use core::future::Future;
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -216,6 +218,68 @@ where
         self.witness_update_candidates
             .borrow_mut()
             .insert((contract_id, min_conformations), candidates.into_iter().collect());
+    }
+
+    #[cfg(feature = "async")]
+    pub fn sync_contract_witness_statuses(
+        &mut self,
+        contract_id: ContractId,
+        statuses: impl IntoIterator<
+            Item = (
+                <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId,
+                WitnessStatus,
+            ),
+        >,
+        last_block_height: u64,
+    ) -> Result<usize, MultiError<SyncError<Infallible>, <Sp::Stock as Stock>::Error>> {
+        if !self.has_contract(contract_id) {
+            return Err(MultiError::A(SyncError::ContractNotFound(contract_id)));
+        }
+
+        let mut known_statuses = IndexMap::new();
+        self.with_contract_mut(
+            contract_id,
+            |contract| -> Result<
+                (),
+                MultiError<SyncError<Infallible>, <Sp::Stock as Stock>::Error>,
+            > {
+                let mut changed_statuses = IndexMap::<_, WitnessStatus>::new();
+                for (witness_id, status) in statuses {
+                    if !contract.has_witness(witness_id) {
+                        continue;
+                    }
+                    known_statuses.insert(witness_id, status);
+                    if contract.witness_status(witness_id) != status {
+                        changed_statuses.insert(witness_id, status);
+                    }
+                }
+                if !changed_statuses.is_empty() {
+                    contract
+                        .sync(changed_statuses.iter().map(|(id, status)| (*id, *status)))
+                        .map_err(MultiError::from_other_a)?;
+                }
+                Ok(())
+            },
+        )?;
+
+        if !known_statuses.is_empty() {
+            for ((cached_contract_id, min_conformations), candidates) in
+                self.witness_update_candidates.borrow_mut().iter_mut()
+            {
+                if *cached_contract_id != contract_id {
+                    continue;
+                }
+                for (witness_id, status) in &known_statuses {
+                    if witness_status_is_mature(*status, last_block_height, *min_conformations) {
+                        candidates.shift_remove(witness_id);
+                    } else {
+                        candidates.insert(*witness_id);
+                    }
+                }
+            }
+        }
+
+        Ok(known_statuses.len())
     }
 
     #[allow(dead_code)]
@@ -710,7 +774,7 @@ where
                 }
             });
 
-            self.with_contract_mut(contract_id, |contract| {
+            self.with_contract_mut(contract_id, |_contract| {
                 let mut pending_witnesses = Vec::with_capacity(candidates.len());
                 for (witness_id, old_status) in candidates {
                     scanned_witnesses += 1;
