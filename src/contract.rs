@@ -1223,7 +1223,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             .into_iter()
             .map(|opid| *opid.borrow())
             .collect::<HashSet<_>>();
-        self.consign_with_known_boundaries(terminals, known_opids, HashSet::new(), writer)
+        self.consign_with_known_boundaries(terminals, known_opids, HashSet::new(), false, writer)
     }
 
     pub fn consign_with_known_cells(
@@ -1241,7 +1241,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             .into_iter()
             .map(|cell| *cell.borrow())
             .collect::<HashSet<_>>();
-        self.consign_with_known_boundaries(terminals, HashSet::new(), known_cells, writer)
+        self.consign_with_known_boundaries(terminals, HashSet::new(), known_cells, false, writer)
     }
 
     pub fn consign_with_known_cells_and_opids(
@@ -1264,7 +1264,30 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             .into_iter()
             .map(|opid| *opid.borrow())
             .collect::<HashSet<_>>();
-        self.consign_with_known_boundaries(terminals, known_opids, known_cells, writer)
+        self.consign_with_known_boundaries(terminals, known_opids, known_cells, false, writer)
+    }
+
+    pub fn consign_with_trusted_known_cells_and_opids(
+        &mut self,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+        known_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<()>
+    where
+        <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        let known_cells = known_cells
+            .into_iter()
+            .map(|cell| *cell.borrow())
+            .collect::<HashSet<_>>();
+        let known_opids = known_opids
+            .into_iter()
+            .map(|opid| *opid.borrow())
+            .collect::<HashSet<_>>();
+        self.consign_with_known_boundaries(terminals, known_opids, known_cells, true, writer)
     }
 
     fn consign_with_known_boundaries(
@@ -1272,6 +1295,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
         known_opids: HashSet<Opid>,
         known_cells: HashSet<CellAddr>,
+        trust_known_opids: bool,
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
     where
@@ -1281,10 +1305,14 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     {
         let total_started_at = Instant::now();
         let raw_known_opids = known_opids.len();
-        let known_opids = known_opids
-            .into_iter()
-            .filter(|opid| self.op_definitions_known_by_cells(*opid, &known_cells))
-            .collect::<HashSet<_>>();
+        let known_opids = if trust_known_opids {
+            known_opids
+        } else {
+            known_opids
+                .into_iter()
+                .filter(|opid| self.op_definitions_known_by_cells(*opid, &known_cells))
+                .collect::<HashSet<_>>()
+        };
         // Collect terminal opids
         let terminal_started_at = Instant::now();
         let terminal_opids: BTreeSet<Opid> = terminals
@@ -1394,6 +1422,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 known_ops = known_opids.len(),
                 raw_known_ops = raw_known_opids,
                 known_cells = known_cells.len(),
+                trust_known_opids,
                 published_ops_added,
                 "Slow rgb-std stage"
             );
@@ -1414,6 +1443,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 known_ops = known_opids.len(),
                 raw_known_ops = raw_known_opids,
                 known_cells = known_cells.len(),
+                trust_known_opids,
                 published_ops_added,
                 "Slow rgb-std stage"
             );
@@ -1442,6 +1472,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 known_ops = known_opids.len(),
                 raw_known_ops = raw_known_opids,
                 known_cells = known_cells.len(),
+                trust_known_opids,
                 "Slow rgb-std stage"
             );
         }
@@ -1455,6 +1486,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 known_ops = known_opids.len(),
                 raw_known_ops = raw_known_opids,
                 known_cells = known_cells.len(),
+                trust_known_opids,
                 "Slow rgb-std stage"
             );
         }
