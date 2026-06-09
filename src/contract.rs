@@ -574,6 +574,30 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             .collect()
     }
 
+    pub fn boundary_opids_for_known_cells(
+        &mut self,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+    ) -> Vec<Opid> {
+        let known_cells = known_cells
+            .into_iter()
+            .map(|cell| *cell.borrow())
+            .collect::<HashSet<_>>();
+        self.operations()
+            .into_iter()
+            .filter_map(|(opid, op, rels)| {
+                let up_to = op.destructible_out.len_u16();
+                if (0..up_to).all(|no| {
+                    rels.defines.contains_key(&no)
+                        && known_cells.contains(&CellAddr::new(opid, no))
+                }) {
+                    Some(opid)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     pub fn witness_ids(&mut self) -> Vec<<P::Seal as RgbSeal>::WitnessId> {
         self.pile.session().witness_ids().collect()
     }
@@ -1220,6 +1244,29 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         self.consign_with_known_boundaries(terminals, HashSet::new(), known_cells, writer)
     }
 
+    pub fn consign_with_known_cells_and_opids(
+        &mut self,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+        known_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<()>
+    where
+        <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        let known_cells = known_cells
+            .into_iter()
+            .map(|cell| *cell.borrow())
+            .collect::<HashSet<_>>();
+        let known_opids = known_opids
+            .into_iter()
+            .map(|opid| *opid.borrow())
+            .collect::<HashSet<_>>();
+        self.consign_with_known_boundaries(terminals, known_opids, known_cells, writer)
+    }
+
     fn consign_with_known_boundaries(
         &mut self,
         terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
@@ -1233,6 +1280,11 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         <P::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
         let total_started_at = Instant::now();
+        let raw_known_opids = known_opids.len();
+        let known_opids = known_opids
+            .into_iter()
+            .filter(|opid| self.op_definitions_known_by_cells(*opid, &known_cells))
+            .collect::<HashSet<_>>();
         // Collect terminal opids
         let terminal_started_at = Instant::now();
         let terminal_opids: BTreeSet<Opid> = terminals
@@ -1340,6 +1392,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 terminal_ops = terminal_opids.len(),
                 selected_ops = selected_opids.len(),
                 known_ops = known_opids.len(),
+                raw_known_ops = raw_known_opids,
                 known_cells = known_cells.len(),
                 published_ops_added,
                 "Slow rgb-std stage"
@@ -1359,6 +1412,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 selected_ops = ops.len(),
                 terminal_ops = terminal_opids.len(),
                 known_ops = known_opids.len(),
+                raw_known_ops = raw_known_opids,
                 known_cells = known_cells.len(),
                 published_ops_added,
                 "Slow rgb-std stage"
@@ -1386,6 +1440,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 ?contract_id,
                 selected_ops = count,
                 known_ops = known_opids.len(),
+                raw_known_ops = raw_known_opids,
                 known_cells = known_cells.len(),
                 "Slow rgb-std stage"
             );
@@ -1398,11 +1453,25 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 ?contract_id,
                 selected_ops = count,
                 known_ops = known_opids.len(),
+                raw_known_ops = raw_known_opids,
                 known_cells = known_cells.len(),
                 "Slow rgb-std stage"
             );
         }
         Ok(())
+    }
+
+    fn op_definitions_known_by_cells(
+        &mut self,
+        opid: Opid,
+        known_cells: &HashSet<CellAddr>,
+    ) -> bool {
+        let op = self.ledger.operation(opid);
+        let up_to = op.destructible_out.len_u16();
+        let rels = self.pile.session().op_relations(opid, up_to);
+        (0..up_to).all(|no| {
+            rels.defines.contains_key(&no) && known_cells.contains(&CellAddr::new(opid, no))
+        })
     }
 
     pub fn consume<E>(

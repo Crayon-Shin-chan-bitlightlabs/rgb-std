@@ -391,6 +391,16 @@ where
         self.with_contract_mut(contract_id, |contract| contract.known_seal_cells())
     }
 
+    pub fn contract_boundary_opids_for_known_cells(
+        &mut self,
+        contract_id: ContractId,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+    ) -> Vec<Opid> {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.boundary_opids_for_known_cells(known_cells)
+        })
+    }
+
     /// Get the contract state.
     ///
     /// The call does not recompute the contract state, but does a seal resolution,
@@ -1051,6 +1061,24 @@ where
     {
         self.with_contract_mut(contract_id, |contract| {
             contract.consign_with_known_cells(terminals, known_cells, writer)
+        })
+    }
+
+    pub fn consign_with_known_cells_and_opids(
+        &mut self,
+        contract_id: ContractId,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+        known_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<()>
+    where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.consign_with_known_cells_and_opids(terminals, known_cells, known_opids, writer)
         })
     }
 
