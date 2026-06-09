@@ -794,13 +794,7 @@ where
             let candidates = self.with_contract_mut(contract_id, |contract| {
                 if let Some(candidates) = cached_candidates {
                     cache_hits += 1;
-                    candidates
-                        .into_iter()
-                        .map(|wid| {
-                            let status = contract.witness_status(wid);
-                            (wid, status)
-                        })
-                        .collect::<Vec<_>>()
+                    contract.witness_statuses_for(candidates)
                 } else {
                     cache_misses += 1;
                     contract.witness_statuses_requiring_update(last_block_height, min_conformations)

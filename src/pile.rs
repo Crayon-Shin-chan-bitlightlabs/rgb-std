@@ -163,6 +163,19 @@ pub trait PileSession {
 
     fn witness_status(&mut self, wid: <Self::Seal as RgbSeal>::WitnessId) -> WitnessStatus;
 
+    fn witness_statuses_for(
+        &mut self,
+        witness_ids: impl IntoIterator<Item = <Self::Seal as RgbSeal>::WitnessId>,
+    ) -> Vec<(<Self::Seal as RgbSeal>::WitnessId, WitnessStatus)> {
+        witness_ids
+            .into_iter()
+            .map(|wid| {
+                let status = self.witness_status(wid);
+                (wid, status)
+            })
+            .collect()
+    }
+
     fn witness_ids(&mut self) -> impl Iterator<Item = <Self::Seal as RgbSeal>::WitnessId>;
 
     fn witness_statuses(&mut self) -> Vec<(<Self::Seal as RgbSeal>::WitnessId, WitnessStatus)> {

@@ -748,6 +748,13 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         self.pile.session().witness_status(wid)
     }
 
+    pub fn witness_statuses_for(
+        &mut self,
+        witness_ids: impl IntoIterator<Item = <P::Seal as RgbSeal>::WitnessId>,
+    ) -> Vec<(<P::Seal as RgbSeal>::WitnessId, WitnessStatus)> {
+        self.pile.session().witness_statuses_for(witness_ids)
+    }
+
     pub fn has_witness(&mut self, wid: <P::Seal as RgbSeal>::WitnessId) -> bool {
         self.pile.session().has_witness(wid)
     }
