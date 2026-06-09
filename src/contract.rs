@@ -278,6 +278,7 @@ struct ConsumeStats {
     duplicate_seal_updates: usize,
     witness_updates: usize,
     duplicate_witness_updates: usize,
+    known_materialized_skips: usize,
 }
 
 thread_local! {
@@ -1472,6 +1473,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     duplicate_seal_updates = stats.duplicate_seal_updates,
                     witness_updates = stats.witness_updates,
                     duplicate_witness_updates = stats.duplicate_witness_updates,
+                    known_materialized_skips = stats.known_materialized_skips,
                     "Slow rgb-std stage"
                 );
             }
@@ -1609,6 +1611,62 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         let seal = definition.resolve(witness.published.pub_id());
         self.resolved_seal_cache.insert(addr, seal.clone());
         Some(seal)
+    }
+
+    fn are_seals_known(
+        &mut self,
+        opid: Opid,
+        seals: &SmallOrdMap<u16, <P::Seal as RgbSeal>::Definition>,
+    ) -> bool {
+        if seals.is_empty() {
+            with_consume_stats(|stats| stats.known_materialized_skips += 1);
+            return true;
+        }
+
+        let cached = seals.iter().all(|(no, seal)| {
+            let addr = CellAddr::new(opid, *no);
+            self.seal_def_cache
+                .get(&addr)
+                .is_some_and(|stored| stored == seal)
+        });
+        if cached {
+            with_consume_stats(|stats| {
+                stats.duplicate_seal_updates += 1;
+                stats.known_materialized_skips += 1;
+            });
+            return true;
+        }
+
+        let mut ps = self.pile.session();
+        let known = seals.iter().all(|(no, seal)| {
+            let addr = CellAddr::new(opid, *no);
+            if self
+                .seal_def_cache
+                .get(&addr)
+                .is_some_and(|stored| stored == seal)
+            {
+                return true;
+            }
+            let Some(stored) = ps.seal(addr) else {
+                return false;
+            };
+            if stored != *seal {
+                return false;
+            }
+            self.seal_def_cache.insert(addr, stored);
+            true
+        });
+        drop(ps);
+
+        if known {
+            self.duplicate_seal_def_cache
+                .extend(seals.keys().map(|no| CellAddr::new(opid, *no)));
+            with_consume_stats(|stats| {
+                stats.duplicate_seal_updates += 1;
+                stats.known_materialized_skips += 1;
+            });
+        }
+        known
     }
 
     fn apply_operation(&mut self, op: VerifiedOperation) {
