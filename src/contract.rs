@@ -41,6 +41,9 @@ use crate::{
 
 const RGB_STD_SLOW_STAGE_THRESHOLD: Duration = Duration::from_millis(500);
 const OP_AUX_CACHE_MAX_BYTES: usize = 3 * 1024 * 1024;
+const OWNED_STATE_STATUS_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+const OWNED_STATE_STATUS_CACHE_MAX_OPS: usize = 50_000;
+const OWNED_STATE_STATUS_CACHE_MAX_WITNESSES: usize = 50_000;
 
 fn slow_rgb_stage_elapsed(started_at: Instant) -> Option<u128> {
     let elapsed = started_at.elapsed();
@@ -117,6 +120,41 @@ pub struct OwnedState<Seal> {
 }
 
 type ResolvedOwnedEntry<Seal> = (CellAddr, Assignment<Seal>);
+
+#[derive(Clone, Debug)]
+struct OwnedStateStatusCache<Wid> {
+    genesis_opid: Option<Opid>,
+    parent_ops: BTreeMap<Opid, Vec<Opid>>,
+    op_witness_ids: BTreeMap<Opid, Vec<Wid>>,
+    witness_statuses: BTreeMap<Wid, WitnessStatus>,
+    best_statuses: BTreeMap<Opid, WitnessStatus>,
+    ancestor_statuses: BTreeMap<Opid, WitnessStatus>,
+    touched_at: Instant,
+}
+
+impl<Wid> Default for OwnedStateStatusCache<Wid> {
+    fn default() -> Self {
+        Self {
+            genesis_opid: None,
+            parent_ops: BTreeMap::new(),
+            op_witness_ids: BTreeMap::new(),
+            witness_statuses: BTreeMap::new(),
+            best_statuses: BTreeMap::new(),
+            ancestor_statuses: BTreeMap::new(),
+            touched_at: Instant::now(),
+        }
+    }
+}
+
+impl<Wid> OwnedStateStatusCache<Wid> {
+    fn is_warm(&self) -> bool {
+        self.genesis_opid.is_some()
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -268,6 +306,7 @@ pub struct Contract<S: Stock, P: Pile> {
     duplicate_witness_cache: HashSet<(Opid, <P::Seal as RgbSeal>::WitnessId)>,
     op_aux_cache: HashMap<Opid, Vec<u8>>,
     op_aux_cache_bytes: usize,
+    owned_state_status_cache: OwnedStateStatusCache<<P::Seal as RgbSeal>::WitnessId>,
 }
 
 #[derive(Debug, Default)]
@@ -320,6 +359,66 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         self.valid_cache = valid_cache;
     }
 
+    fn clear_owned_state_status_cache(&mut self) {
+        self.owned_state_status_cache.clear();
+    }
+
+    fn ensure_owned_state_status_cache(
+        &mut self,
+        cache: &mut OwnedStateStatusCache<<P::Seal as RgbSeal>::WitnessId>,
+    ) {
+        if cache.is_warm() && cache.touched_at.elapsed() < OWNED_STATE_STATUS_CACHE_TTL {
+            cache.touched_at = Instant::now();
+            return;
+        }
+        cache.clear();
+
+        let genesis_opid = self.ledger.articles().genesis_opid();
+        let parent_ops: BTreeMap<Opid, Vec<Opid>> = self
+            .ledger
+            .operations()
+            .map(|(opid, op)| {
+                let parents = op
+                    .immutable_in
+                    .iter()
+                    .map(|inp| inp.opid)
+                    .chain(op.destructible_in.iter().map(|inp| inp.addr.opid))
+                    .collect();
+                (opid, parents)
+            })
+            .collect();
+
+        if parent_ops.len() > OWNED_STATE_STATUS_CACHE_MAX_OPS {
+            return;
+        }
+
+        let mut op_witness_ids = BTreeMap::new();
+        let mut witness_statuses = BTreeMap::new();
+        {
+            let mut session = self.pile.session();
+            for opid in parent_ops.keys().copied().chain([genesis_opid]) {
+                let wids = session.op_witness_ids(opid).collect::<Vec<_>>();
+                for wid in &wids {
+                    witness_statuses
+                        .entry(*wid)
+                        .or_insert_with(|| session.witness_status(*wid));
+                    if witness_statuses.len() > OWNED_STATE_STATUS_CACHE_MAX_WITNESSES {
+                        return;
+                    }
+                }
+                op_witness_ids.insert(opid, wids);
+            }
+        }
+
+        cache.genesis_opid = Some(genesis_opid);
+        cache.parent_ops = parent_ops;
+        cache.op_witness_ids = op_witness_ids;
+        cache.witness_statuses = witness_statuses;
+        cache.best_statuses.clear();
+        cache.ancestor_statuses.clear();
+        cache.touched_at = Instant::now();
+    }
+
     pub fn with(
         articles: Articles,
         consignment: Consignment<P::Seal>,
@@ -351,6 +450,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
             op_aux_cache_bytes: 0,
+            owned_state_status_cache: OwnedStateStatusCache::default(),
         };
         contract
             .evaluate_commit(consignment.into_operations())
@@ -422,6 +522,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
             op_aux_cache_bytes: 0,
+            owned_state_status_cache: OwnedStateStatusCache::default(),
         })
     }
 
@@ -444,6 +545,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
             op_aux_cache_bytes: 0,
+            owned_state_status_cache: OwnedStateStatusCache::default(),
         };
         contract.refresh_valid_cache();
         Ok(contract)
@@ -610,8 +712,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             .filter_map(|(opid, op, rels)| {
                 let up_to = op.destructible_out.len_u16();
                 if (0..up_to).all(|no| {
-                    rels.defines.contains_key(&no)
-                        && known_cells.contains(&CellAddr::new(opid, no))
+                    rels.defines.contains_key(&no) && known_cells.contains(&CellAddr::new(opid, no))
                 }) {
                     Some(opid)
                 } else {
@@ -755,24 +856,32 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             return vec![];
         }
 
-        let genesis_opid = self.ledger.articles().genesis_opid();
-        let parent_ops: BTreeMap<Opid, Vec<Opid>> = self
-            .ledger
-            .operations()
-            .map(|(opid, op)| {
-                let parents = op
-                    .immutable_in
-                    .iter()
-                    .map(|inp| inp.opid)
-                    .chain(op.destructible_in.iter().map(|inp| inp.addr.opid))
-                    .collect();
-                (opid, parents)
-            })
-            .collect();
-        let mut op_witness_ids_cache = BTreeMap::new();
-        let mut witness_status_cache = BTreeMap::new();
-        let mut best_status_cache: BTreeMap<Opid, WitnessStatus> = BTreeMap::new();
-        let mut ancestor_cache: BTreeMap<Opid, WitnessStatus> = BTreeMap::new();
+        let mut status_cache = core::mem::take(&mut self.owned_state_status_cache);
+        self.ensure_owned_state_status_cache(&mut status_cache);
+        let fallback_parent_ops;
+        let (genesis_opid, parent_ops) = if let Some(genesis_opid) = status_cache.genesis_opid {
+            (genesis_opid, &status_cache.parent_ops)
+        } else {
+            let genesis_opid = self.ledger.articles().genesis_opid();
+            fallback_parent_ops = self
+                .ledger
+                .operations()
+                .map(|(opid, op)| {
+                    let parents = op
+                        .immutable_in
+                        .iter()
+                        .map(|inp| inp.opid)
+                        .chain(op.destructible_in.iter().map(|inp| inp.addr.opid))
+                        .collect();
+                    (opid, parents)
+                })
+                .collect();
+            (genesis_opid, &fallback_parent_ops)
+        };
+        let mut op_witness_ids_cache = core::mem::take(&mut status_cache.op_witness_ids);
+        let mut witness_status_cache = core::mem::take(&mut status_cache.witness_statuses);
+        let mut best_status_cache = core::mem::take(&mut status_cache.best_statuses);
+        let mut ancestor_cache = core::mem::take(&mut status_cache.ancestor_statuses);
 
         let mut result = selected
             .into_iter()
@@ -787,7 +896,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     .ancestor_status_cached(
                         addr.opid,
                         genesis_opid,
-                        &parent_ops,
+                        parent_ops,
                         &mut op_witness_ids_cache,
                         &mut witness_status_cache,
                         &mut best_status_cache,
@@ -811,7 +920,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     .ancestor_status_cached(
                         addr.opid,
                         genesis_opid,
-                        &parent_ops,
+                        parent_ops,
                         &mut op_witness_ids_cache,
                         &mut witness_status_cache,
                         &mut best_status_cache,
@@ -827,6 +936,15 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     break;
                 }
             }
+        }
+
+        if status_cache.genesis_opid.is_some() {
+            status_cache.op_witness_ids = op_witness_ids_cache;
+            status_cache.witness_statuses = witness_status_cache;
+            status_cache.best_statuses = best_status_cache;
+            status_cache.ancestor_statuses = ancestor_cache;
+            status_cache.touched_at = Instant::now();
+            self.owned_state_status_cache = status_cache;
         }
 
         result
@@ -1006,6 +1124,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             let old = affected_wids.insert(wid, status);
             debug_assert!(old.is_none() || old == Some(status));
         }
+        let status_changed = !affected_wids.is_empty();
 
         let mut affected_ops = IndexMap::new();
         // Collect opids first, then compute status separately to avoid borrow conflict
@@ -1057,6 +1176,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         self.pile.session().commit_transaction();
         self.ledger.forward(forward)?;
         self.pile.session().commit_transaction();
+        if status_changed {
+            self.clear_owned_state_status_cache();
+        }
         self.refresh_valid_cache();
         Ok(())
     }
@@ -1076,6 +1198,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         self.pile.session().add_seals(opid, seals);
         self.valid_cache.insert(opid);
         self.remove_op_aux_cache_entry(opid);
+        self.clear_owned_state_status_cache();
         debug_assert_eq!(operation.contract_id, self.contract_id());
         Ok(operation)
     }
@@ -1113,6 +1236,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             ps.include_commit_transaction();
         }
         self.remove_op_aux_cache_entry(opid);
+        self.clear_owned_state_status_cache();
     }
 
     pub(crate) fn commit_pile_transaction(&mut self) {
@@ -1806,6 +1930,7 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         self.ledger.apply(op).expect("unable to apply operation");
         self.valid_cache.insert(opid);
         self.remove_op_aux_cache_entry(opid);
+        self.clear_owned_state_status_cache();
     }
 
     fn apply_seals(
@@ -1867,6 +1992,7 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         }
         self.pile.session().add_seals(opid, seals);
         self.remove_op_aux_cache_entry(opid);
+        self.clear_owned_state_status_cache();
     }
 
     fn apply_witness(&mut self, opid: Opid, witness: SealWitness<P::Seal>) {
