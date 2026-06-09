@@ -67,7 +67,6 @@ fn slow_rgb_stage_elapsed(started_at: Instant) -> Option<u128> {
     (elapsed >= RGB_STD_SLOW_STAGE_THRESHOLD).then_some(elapsed.as_millis())
 }
 
-#[cfg(feature = "async")]
 fn witness_status_is_mature(
     status: WitnessStatus,
     last_block_height: u64,
@@ -226,10 +225,7 @@ where
         &mut self,
         contract_id: ContractId,
         statuses: impl IntoIterator<
-            Item = (
-                <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId,
-                WitnessStatus,
-            ),
+            Item = (<<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId, WitnessStatus),
         >,
         last_block_height: u64,
     ) -> Result<usize, MultiError<SyncError<Infallible>, <Sp::Stock as Stock>::Error>> {
@@ -610,7 +606,11 @@ where
                 |contract| -> Result<(), MultiError<SyncError<E>, <Sp::Stock as Stock>::Error>> {
                     for witness_id in contract.witness_ids() {
                         let old_status = contract.witness_status(witness_id);
-                        if matches!(old_status, WitnessStatus::Mined(height) if last_block_height - height.get() > min_conformations as u64) {
+                        if witness_status_is_mature(
+                            old_status,
+                            last_block_height,
+                            min_conformations,
+                        ) {
                             continue;
                         }
                         let new_status = match changed_statuses.get(&witness_id) {
@@ -654,8 +654,7 @@ where
 
             let mut changed_statuses = IndexMap::<_, WitnessStatus>::new();
             for (witness_id, old_status) in witnesses {
-                if matches!(old_status, WitnessStatus::Mined(height) if last_block_height - height.get() > min_conformations as u64)
-                {
+                if witness_status_is_mature(old_status, last_block_height, min_conformations) {
                     continue;
                 }
                 let new_status = match resolved_statuses.get(&witness_id) {
@@ -716,8 +715,7 @@ where
 
             let mut changed_statuses = IndexMap::<_, WitnessStatus>::new();
             for (witness_id, old_status) in witnesses {
-                if matches!(old_status, WitnessStatus::Mined(height) if last_block_height - height.get() > min_conformations as u64)
-                {
+                if witness_status_is_mature(old_status, last_block_height, min_conformations) {
                     continue;
                 }
                 let new_status = match resolved_statuses.get(&witness_id) {
@@ -805,10 +803,7 @@ where
                         .collect::<Vec<_>>()
                 } else {
                     cache_misses += 1;
-                    contract.witness_statuses_requiring_update(
-                        last_block_height,
-                        min_conformations,
-                    )
+                    contract.witness_statuses_requiring_update(last_block_height, min_conformations)
                 }
             });
 

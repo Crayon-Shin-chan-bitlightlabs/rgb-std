@@ -51,11 +51,16 @@ impl WitnessStatus {
         matches!(self, Self::Offchain)
     }
     pub fn is_mature(self, last_block_height: u64, min_confirmations: u32) -> bool {
-        matches!(
-            self,
-            Self::Mined(height)
-                if last_block_height.saturating_sub(height.get()) > min_confirmations as u64
-        )
+        let Self::Mined(height) = self else {
+            return false;
+        };
+        let Some(confirmations) = last_block_height
+            .checked_sub(height.get())
+            .and_then(|depth| depth.checked_add(1))
+        else {
+            return false;
+        };
+        confirmations >= min_confirmations as u64
     }
 
     fn quasi_height(&self) -> u64 {
@@ -291,5 +296,18 @@ mod tests {
         assert!(WitnessStatus::Tentative.is_worse(WitnessStatus::Offchain));
         assert!(WitnessStatus::Offchain.is_better(WitnessStatus::Archived));
         assert!(WitnessStatus::Archived.is_worse(WitnessStatus::Genesis));
+    }
+
+    #[test]
+    fn mined_witness_maturity_counts_confirmations() {
+        let mined_at_100 = WitnessStatus::Mined(NonZeroU64::new(100).unwrap());
+
+        assert!(mined_at_100.is_mature(100, 0));
+        assert!(mined_at_100.is_mature(100, 1));
+        assert!(mined_at_100.is_mature(101, 2));
+        assert!(!mined_at_100.is_mature(100, 2));
+        assert!(!mined_at_100.is_mature(99, 0));
+        assert!(!WitnessStatus::Tentative.is_mature(100, 0));
+        assert!(!WitnessStatus::Offchain.is_mature(100, 0));
     }
 }
