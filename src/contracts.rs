@@ -31,6 +31,7 @@ use core::convert::Infallible;
 use core::future::Future;
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::sync::Arc;
 #[cfg(feature = "async")]
 use std::time::{Duration, Instant};
 
@@ -405,6 +406,16 @@ where
     ) {
         self.with_contract_mut(contract_id, |contract| {
             contract.extend_external_resolved_seals(seals);
+        });
+    }
+
+    pub fn set_contract_external_resolved_seals(
+        &mut self,
+        contract_id: ContractId,
+        seals: Arc<HashMap<CellAddr, <Sp::Pile as Pile>::Seal>>,
+    ) {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.set_external_resolved_seals(seals);
         });
     }
 

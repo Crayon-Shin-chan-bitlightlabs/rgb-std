@@ -9,6 +9,7 @@ use core::error::Error;
 use core::marker::PhantomData;
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use amplify::confinement::SmallOrdMap;
@@ -262,7 +263,7 @@ pub struct Contract<S: Stock, P: Pile> {
     valid_cache: HashSet<Opid>,
     seal_def_cache: HashMap<CellAddr, <P::Seal as RgbSeal>::Definition>,
     resolved_seal_cache: HashMap<CellAddr, P::Seal>,
-    external_resolved_seal_cache: HashMap<CellAddr, P::Seal>,
+    external_resolved_seal_cache: Arc<HashMap<CellAddr, P::Seal>>,
     duplicate_seal_def_cache: HashSet<CellAddr>,
     duplicate_witness_cache: HashSet<(Opid, <P::Seal as RgbSeal>::WitnessId)>,
     op_aux_cache: HashMap<Opid, Vec<u8>>,
@@ -345,7 +346,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             valid_cache: HashSet::from([genesis_opid]),
             seal_def_cache: HashMap::new(),
             resolved_seal_cache: HashMap::new(),
-            external_resolved_seal_cache: HashMap::new(),
+            external_resolved_seal_cache: Arc::new(HashMap::new()),
             duplicate_seal_def_cache: HashSet::new(),
             duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
@@ -416,7 +417,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             valid_cache: HashSet::from([genesis_opid]),
             seal_def_cache: HashMap::new(),
             resolved_seal_cache: HashMap::new(),
-            external_resolved_seal_cache: HashMap::new(),
+            external_resolved_seal_cache: Arc::new(HashMap::new()),
             duplicate_seal_def_cache: HashSet::new(),
             duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
@@ -438,7 +439,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             valid_cache: HashSet::new(),
             seal_def_cache: HashMap::new(),
             resolved_seal_cache: HashMap::new(),
-            external_resolved_seal_cache: HashMap::new(),
+            external_resolved_seal_cache: Arc::new(HashMap::new()),
             duplicate_seal_def_cache: HashSet::new(),
             duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
@@ -589,7 +590,11 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         &mut self,
         seals: impl IntoIterator<Item = (CellAddr, P::Seal)>,
     ) {
-        self.external_resolved_seal_cache.extend(seals);
+        Arc::make_mut(&mut self.external_resolved_seal_cache).extend(seals);
+    }
+
+    pub fn set_external_resolved_seals(&mut self, seals: Arc<HashMap<CellAddr, P::Seal>>) {
+        self.external_resolved_seal_cache = seals;
     }
 
     pub fn boundary_opids_for_known_cells(
