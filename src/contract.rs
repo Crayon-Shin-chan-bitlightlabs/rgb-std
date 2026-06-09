@@ -262,6 +262,7 @@ pub struct Contract<S: Stock, P: Pile> {
     valid_cache: HashSet<Opid>,
     seal_def_cache: HashMap<CellAddr, <P::Seal as RgbSeal>::Definition>,
     resolved_seal_cache: HashMap<CellAddr, P::Seal>,
+    external_resolved_seal_cache: HashMap<CellAddr, P::Seal>,
     duplicate_seal_def_cache: HashSet<CellAddr>,
     duplicate_witness_cache: HashSet<(Opid, <P::Seal as RgbSeal>::WitnessId)>,
     op_aux_cache: HashMap<Opid, Vec<u8>>,
@@ -344,6 +345,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             valid_cache: HashSet::from([genesis_opid]),
             seal_def_cache: HashMap::new(),
             resolved_seal_cache: HashMap::new(),
+            external_resolved_seal_cache: HashMap::new(),
             duplicate_seal_def_cache: HashSet::new(),
             duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
@@ -414,6 +416,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             valid_cache: HashSet::from([genesis_opid]),
             seal_def_cache: HashMap::new(),
             resolved_seal_cache: HashMap::new(),
+            external_resolved_seal_cache: HashMap::new(),
             duplicate_seal_def_cache: HashSet::new(),
             duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
@@ -435,6 +438,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             valid_cache: HashSet::new(),
             seal_def_cache: HashMap::new(),
             resolved_seal_cache: HashMap::new(),
+            external_resolved_seal_cache: HashMap::new(),
             duplicate_seal_def_cache: HashSet::new(),
             duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
@@ -572,6 +576,20 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     .collect::<Vec<_>>()
             })
             .collect()
+    }
+
+    pub fn known_resolved_seals(&mut self) -> Vec<(CellAddr, P::Seal)> {
+        self.known_seal_cells()
+            .into_iter()
+            .filter_map(|addr| self.known_seal(addr).map(|seal| (addr, seal)))
+            .collect()
+    }
+
+    pub fn extend_external_resolved_seals(
+        &mut self,
+        seals: impl IntoIterator<Item = (CellAddr, P::Seal)>,
+    ) {
+        self.external_resolved_seal_cache.extend(seals);
     }
 
     pub fn boundary_opids_for_known_cells(
@@ -1700,15 +1718,23 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         let definition = if let Some(definition) = self.seal_def_cache.get(&addr) {
             definition.clone()
         } else {
-            let definition = self.pile.session().seal(addr)?;
-            self.seal_def_cache.insert(addr, definition.clone());
-            definition
+            match self.pile.session().seal(addr) {
+                Some(definition) => {
+                    self.seal_def_cache.insert(addr, definition.clone());
+                    definition
+                }
+                None => {
+                    return self.external_resolved_seal_cache.get(&addr).cloned();
+                }
+            }
         };
         if let Some(seal) = definition.to_src() {
             self.resolved_seal_cache.insert(addr, seal.clone());
             return Some(seal);
         }
-        let witness = self.retrieve(addr.opid)?;
+        let Some(witness) = self.retrieve(addr.opid) else {
+            return self.external_resolved_seal_cache.get(&addr).cloned();
+        };
         let seal = definition.resolve(witness.published.pub_id());
         self.resolved_seal_cache.insert(addr, seal.clone());
         Some(seal)

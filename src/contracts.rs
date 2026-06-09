@@ -391,6 +391,23 @@ where
         self.with_contract_mut(contract_id, |contract| contract.known_seal_cells())
     }
 
+    pub fn contract_known_resolved_seals(
+        &mut self,
+        contract_id: ContractId,
+    ) -> Vec<(CellAddr, <Sp::Pile as Pile>::Seal)> {
+        self.with_contract_mut(contract_id, |contract| contract.known_resolved_seals())
+    }
+
+    pub fn extend_contract_external_resolved_seals(
+        &mut self,
+        contract_id: ContractId,
+        seals: impl IntoIterator<Item = (CellAddr, <Sp::Pile as Pile>::Seal)>,
+    ) {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.extend_external_resolved_seals(seals);
+        });
+    }
+
     pub fn contract_boundary_opids_for_known_cells(
         &mut self,
         contract_id: ContractId,
