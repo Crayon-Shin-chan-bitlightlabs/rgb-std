@@ -683,17 +683,29 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             .into_iter()
             .map(|cell| *cell.borrow())
             .collect::<HashSet<_>>();
-        self.operations()
-            .into_iter()
-            .filter_map(|(opid, op, rels)| {
-                let up_to = op.destructible_out.len_u16();
-                if (0..up_to).all(|no| {
-                    rels.defines.contains_key(&no) && known_cells.contains(&CellAddr::new(opid, no))
-                }) {
-                    Some(opid)
-                } else {
-                    None
-                }
+        if known_cells.is_empty() {
+            return vec![];
+        }
+
+        let mut pile_session = self.pile.session();
+        let known_seal_cells = pile_session
+            .known_seal_cells()
+            .filter(|cell| known_cells.contains(cell));
+        let mut known_positions_by_opid = HashMap::<Opid, HashSet<u16>>::new();
+        for cell in known_seal_cells {
+            known_positions_by_opid
+                .entry(cell.opid)
+                .or_default()
+                .insert(cell.pos);
+        }
+
+        self.ledger
+            .operation_output_counts()
+            .filter_map(|(opid, count)| {
+                let known_positions = known_positions_by_opid.get(&opid)?;
+                (known_positions.len() == count as usize
+                    && (0..count).all(|pos| known_positions.contains(&pos)))
+                    .then_some(opid)
             })
             .collect()
     }
