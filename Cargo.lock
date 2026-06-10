@@ -647,7 +647,7 @@ dependencies = [
 [[package]]
 name = "hypersonic"
 version = "0.12.0"
-source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=feat%2Fsession-ledger#30656c1f5c801adb26525d762313c0563cc5d5a0"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=feat%2Fsession-ledger#12c7bf1dc149df03e5eef461226978ac679c5285"
 dependencies = [
  "aluvm",
  "amplify",
@@ -1179,7 +1179,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "sonic-api"
 version = "0.12.0"
-source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=feat%2Fsession-ledger#30656c1f5c801adb26525d762313c0563cc5d5a0"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=feat%2Fsession-ledger#12c7bf1dc149df03e5eef461226978ac679c5285"
 dependencies = [
  "aluvm",
  "amplify",
@@ -1202,7 +1202,7 @@ dependencies = [
 [[package]]
 name = "sonic-callreq"
 version = "0.12.0"
-source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=feat%2Fsession-ledger#30656c1f5c801adb26525d762313c0563cc5d5a0"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=feat%2Fsession-ledger#12c7bf1dc149df03e5eef461226978ac679c5285"
 dependencies = [
  "amplify",
  "baid64",
@@ -1222,7 +1222,7 @@ dependencies = [
 [[package]]
 name = "sonic-persist-fs"
 version = "0.12.0"
-source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=feat%2Fsession-ledger#30656c1f5c801adb26525d762313c0563cc5d5a0"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=feat%2Fsession-ledger#12c7bf1dc149df03e5eef461226978ac679c5285"
 dependencies = [
  "amplify",
  "aora",

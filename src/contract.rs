@@ -344,14 +344,8 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 if session.is_valid(genesis_opid) {
                     valid.insert(genesis_opid);
                 }
-                let opids = session
-                    .operations()
-                    .map(|(opid, _)| opid)
-                    .collect::<Vec<_>>();
-                for opid in opids {
-                    if session.is_valid(opid) {
-                        valid.insert(opid);
-                    }
+                for opid in session.valid_opids() {
+                    valid.insert(opid);
                 }
                 Ok::<_, core::convert::Infallible>(valid)
             })
