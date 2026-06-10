@@ -376,16 +376,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let genesis_opid = self.ledger.articles().genesis_opid();
         let parent_ops: BTreeMap<Opid, Vec<Opid>> = self
             .ledger
-            .operations()
-            .map(|(opid, op)| {
-                let parents = op
-                    .immutable_in
-                    .iter()
-                    .map(|inp| inp.opid)
-                    .chain(op.destructible_in.iter().map(|inp| inp.addr.opid))
-                    .collect();
-                (opid, parents)
-            })
+            .operation_parent_ops()
             .collect();
 
         if parent_ops.len() > OWNED_STATE_STATUS_CACHE_MAX_OPS {
@@ -872,16 +863,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             let genesis_opid = self.ledger.articles().genesis_opid();
             fallback_parent_ops = self
                 .ledger
-                .operations()
-                .map(|(opid, op)| {
-                    let parents = op
-                        .immutable_in
-                        .iter()
-                        .map(|inp| inp.opid)
-                        .chain(op.destructible_in.iter().map(|inp| inp.addr.opid))
-                        .collect();
-                    (opid, parents)
-                })
+                .operation_parent_ops()
                 .collect();
             (genesis_opid, &fallback_parent_ops)
         };
