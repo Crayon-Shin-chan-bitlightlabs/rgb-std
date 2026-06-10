@@ -212,6 +212,8 @@ pub trait PileSession {
         wid: <Self::Seal as RgbSeal>::WitnessId,
     ) -> impl ExactSizeIterator<Item = Opid>;
 
+    fn known_seal_cells(&mut self) -> impl Iterator<Item = CellAddr>;
+
     fn seal(&mut self, addr: CellAddr) -> Option<<Self::Seal as RgbSeal>::Definition>;
 
     fn seals(

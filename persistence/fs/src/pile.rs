@@ -58,6 +58,9 @@ where
     fn ops_by_witness_id(&mut self, wid: Seal::WitnessId) -> impl ExactSizeIterator<Item = Opid> {
         self.stand.get(wid)
     }
+    fn known_seal_cells(&mut self) -> impl Iterator<Item = CellAddr> {
+        self.keep.iter().map(|(addr, _)| addr)
+    }
     fn seal(&mut self, addr: CellAddr) -> Option<Seal::Definition> { self.keep.get(addr) }
     fn seals(&mut self, opid: Opid, up_to: u16) -> SmallOrdMap<u16, Seal::Definition> {
         let mut seals = SmallOrdMap::new();

@@ -654,16 +654,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     }
 
     pub fn known_seal_cells(&mut self) -> Vec<CellAddr> {
-        self.operations()
-            .into_iter()
-            .flat_map(|(opid, _, rels)| {
-                rels.defines
-                    .keys()
-                    .copied()
-                    .map(move |no| CellAddr::new(opid, no))
-                    .collect::<Vec<_>>()
-            })
-            .collect()
+        self.pile.session().known_seal_cells().collect()
     }
 
     pub fn known_resolved_seals(&mut self) -> Vec<(CellAddr, P::Seal)> {
