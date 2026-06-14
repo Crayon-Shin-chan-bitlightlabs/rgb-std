@@ -1666,9 +1666,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                     if prev != genesis_opid
                                         && !known_opids.contains(&prev)
                                         && !selected_opids.contains(&prev)
-                                        && pending_opids.insert(prev)
                                     {
-                                        ensure_selection_budget!();
+                                        if pending_opids.insert(prev) {
+                                            ensure_selection_budget!();
+                                        }
                                         stack.push((prev, false));
                                     }
                                 }
@@ -1677,9 +1678,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                     if prev != genesis_opid
                                         && !known_opids.contains(&prev)
                                         && !selected_opids.contains(&prev)
-                                        && pending_opids.insert(prev)
                                     {
-                                        ensure_selection_budget!();
+                                        if pending_opids.insert(prev) {
+                                            ensure_selection_budget!();
+                                        }
                                         stack.push((prev, false));
                                     }
                                 }
@@ -1689,9 +1691,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                     if prev != genesis_opid
                                         && !known_opids.contains(&prev)
                                         && !selected_opids.contains(&prev)
-                                        && pending_opids.insert(prev)
                                     {
-                                        ensure_selection_budget!();
+                                        if pending_opids.insert(prev) {
+                                            ensure_selection_budget!();
+                                        }
                                         stack.push((prev, false));
                                     }
                                 }
