@@ -1673,11 +1673,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                     }
                                 }
                                 for input in &op.destructible_in {
-                                    let addr = input.addr;
-                                    let prev = addr.opid;
+                                    let prev = input.addr.opid;
                                     if prev != genesis_opid
                                         && !known_opids.contains(&prev)
-                                        && !known_cells.contains(&addr)
                                         && !selected_opids.contains(&prev)
                                         && pending_opids.insert(prev)
                                     {
@@ -1690,7 +1688,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                     let prev = addr.opid;
                                     if prev != genesis_opid
                                         && !known_opids.contains(&prev)
-                                        && !known_cells.contains(&addr)
                                         && !selected_opids.contains(&prev)
                                         && pending_opids.insert(prev)
                                     {
