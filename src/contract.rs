@@ -1660,6 +1660,31 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                 }
 
                                 stack.push((opid, true));
+                                let op = session.operation(opid);
+                                for input in &op.immutable_in {
+                                    let prev = input.opid;
+                                    if prev != genesis_opid
+                                        && !known_opids.contains(&prev)
+                                        && !selected_opids.contains(&prev)
+                                        && pending_opids.insert(prev)
+                                    {
+                                        ensure_selection_budget!();
+                                        stack.push((prev, false));
+                                    }
+                                }
+                                for input in &op.destructible_in {
+                                    let addr = input.addr;
+                                    let prev = addr.opid;
+                                    if prev != genesis_opid
+                                        && !known_opids.contains(&prev)
+                                        && !known_cells.contains(&addr)
+                                        && !selected_opids.contains(&prev)
+                                        && pending_opids.insert(prev)
+                                    {
+                                        ensure_selection_budget!();
+                                        stack.push((prev, false));
+                                    }
+                                }
                                 let st = session.transition(opid);
                                 for addr in st.destroyed.into_keys() {
                                     let prev = addr.opid;
