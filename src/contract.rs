@@ -10,7 +10,7 @@ use core::marker::PhantomData;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use amplify::confinement::SmallOrdMap;
@@ -41,7 +41,8 @@ use crate::{
 };
 
 const RGB_STD_SLOW_STAGE_THRESHOLD: Duration = Duration::from_millis(500);
-const OP_AUX_CACHE_MAX_BYTES: usize = 3 * 1024 * 1024;
+const OP_AUX_CACHE_DEFAULT_MAX_BYTES: usize = 3 * 1024 * 1024;
+const OP_AUX_CACHE_HARD_MAX_BYTES: usize = 64 * 1024 * 1024;
 const OWNED_STATE_STATUS_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const OWNED_STATE_STATUS_CACHE_MAX_OPS: usize = 50_000;
 const OWNED_STATE_STATUS_CACHE_MAX_WITNESSES: usize = 50_000;
@@ -56,6 +57,18 @@ fn max_selected_consign_ops() -> Option<usize> {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
+}
+
+fn op_aux_cache_max_bytes() -> usize {
+    static MAX_BYTES: OnceLock<usize> = OnceLock::new();
+    *MAX_BYTES.get_or_init(|| {
+        env::var("RGB_STD_OP_AUX_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .map(|value| value.min(OP_AUX_CACHE_HARD_MAX_BYTES))
+            .unwrap_or(OP_AUX_CACHE_DEFAULT_MAX_BYTES)
+    })
 }
 #[derive(Copy, Clone, PartialEq, Eq, Debug, From)]
 #[cfg_attr(
@@ -1267,8 +1280,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     }
 
     fn insert_op_aux_cache_entry(&mut self, opid: Opid, bytes: Vec<u8>) {
+        let max_bytes = op_aux_cache_max_bytes();
         let bytes_len = bytes.len();
-        if bytes_len > OP_AUX_CACHE_MAX_BYTES {
+        if bytes_len > max_bytes {
             return;
         }
 
@@ -1277,7 +1291,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         }
         self.op_aux_cache_order.retain(|cached| *cached != opid);
 
-        while self.op_aux_cache_bytes.saturating_add(bytes_len) > OP_AUX_CACHE_MAX_BYTES {
+        while self.op_aux_cache_bytes.saturating_add(bytes_len) > max_bytes {
             let Some(oldest) = self.op_aux_cache_order.pop_front() else {
                 break;
             };
