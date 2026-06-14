@@ -458,16 +458,20 @@ where
         contract_id: ContractId,
         addr: CellAddr,
     ) -> Option<(StateName, StrictVal)> {
-        self.with_contract_mut(contract_id, |contract| {
-            contract
-                .full_state()
-                .main
-                .owned
-                .iter()
-                .find_map(|(name, cells)| {
-                    cells.get(&addr).map(|value| (name.clone(), value.clone()))
-                })
-        })
+        self.with_contract(
+            contract_id,
+            |contract| {
+                contract
+                    .full_state()
+                    .main
+                    .owned
+                    .iter()
+                    .find_map(|(name, cells)| {
+                        cells.get(&addr).map(|value| (name.clone(), value.clone()))
+                    })
+            },
+            Some(None),
+        )
     }
 
     pub fn contract_resolved_owned_state_entries(
