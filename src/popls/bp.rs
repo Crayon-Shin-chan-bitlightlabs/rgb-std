@@ -994,10 +994,24 @@ where
         prevouts: &[Outpoint],
     ) -> Result<(), IncludeError> {
         let mut touched_contracts = IndexSet::new();
+        let mut first_missing_contract = None;
 
         for prefab in bundle {
-            touched_contracts.insert(prefab.operation.contract_id);
-            let protocol_id = ProtocolId::from(prefab.operation.contract_id.to_byte_array());
+            let contract_id = prefab.operation.contract_id;
+            if !self.contracts.has_contract(contract_id) {
+                tracing::warn!(
+                    operation = "rgb_std",
+                    stage = "include_skip_missing_contract",
+                    %contract_id,
+                    opid = %prefab.operation.opid(),
+                    "Skipping prefab include for missing contract"
+                );
+                first_missing_contract.get_or_insert(contract_id);
+                continue;
+            }
+
+            touched_contracts.insert(contract_id);
+            let protocol_id = ProtocolId::from(contract_id.to_byte_array());
             let opid = prefab.operation.opid();
             let mut map = bmap! {};
             for prevout in &prefab.closes {
@@ -1015,9 +1029,14 @@ where
                 fallback_proof: default!(),
             };
             self.contracts
-                .include_uncommitted(prefab.operation.contract_id, opid, witness, anchor);
+                .include_uncommitted(contract_id, opid, witness, anchor);
         }
 
+        if touched_contracts.is_empty() {
+            if let Some(contract_id) = first_missing_contract {
+                return Err(IncludeError::ContractNotFound(contract_id));
+            }
+        }
         for contract_id in touched_contracts {
             self.contracts.commit_contract_pile(contract_id);
         }
@@ -1211,6 +1230,9 @@ pub enum FulfillError {
 #[derive(Clone, Eq, PartialEq, Debug, Display, Error, From)]
 #[display(doc_comments)]
 pub enum IncludeError {
+    /// prefab bundle references unknown contract {0}.
+    ContractNotFound(ContractId),
+
     /// prefab bundle references unknown previous output {0}.
     MissingPrevout(Outpoint),
 
