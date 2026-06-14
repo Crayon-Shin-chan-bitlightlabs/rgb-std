@@ -2380,36 +2380,67 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
             return;
         }
 
-        let duplicate = {
-            let mut ps = self.pile.session();
-            seals.iter().all(|(no, seal)| {
+        let missing = seals
+            .iter()
+            .filter_map(|(no, seal)| {
                 let addr = CellAddr::new(opid, *no);
                 if self
                     .seal_def_cache
                     .get(&addr)
                     .is_some_and(|stored| stored == seal)
                 {
-                    return true;
+                    return None;
                 }
                 if let Some(stored) = self.external_seal_def_cache.get(&addr) {
                     if stored == seal {
                         self.seal_def_cache.insert(addr, stored.clone());
-                        return true;
+                        return None;
                     }
                 }
-                let Some(stored) = ps.seal(addr) else {
-                    return false;
-                };
-                if stored != *seal {
-                    return false;
-                }
-                self.seal_def_cache.insert(addr, stored);
-                true
+                Some((*no, seal.clone()))
             })
+            .collect::<Vec<_>>();
+
+        let duplicate = if missing.is_empty() {
+            true
+        } else {
+            let mut ps = self.pile.session();
+            if let Some(up_to) = seals
+                .keys()
+                .next_back()
+                .and_then(|no| no.checked_add(1))
+                .filter(|up_to| *up_to <= SEALS_KNOWN_BATCH_UP_TO_MAX)
+            {
+                let stored = ps.seals(opid, up_to);
+                missing.into_iter().all(|(no, seal)| {
+                    let Some(stored_seal) = stored.get(&no) else {
+                        return false;
+                    };
+                    if *stored_seal != seal {
+                        return false;
+                    }
+                    self.seal_def_cache
+                        .insert(CellAddr::new(opid, no), stored_seal.clone());
+                    true
+                })
+            } else {
+                missing.into_iter().all(|(no, seal)| {
+                    let addr = CellAddr::new(opid, no);
+                    let Some(stored) = ps.seal(addr) else {
+                        return false;
+                    };
+                    if stored != seal {
+                        return false;
+                    }
+                    self.seal_def_cache.insert(addr, stored);
+                    true
+                })
+            }
         };
         if duplicate {
             self.duplicate_seal_def_cache
                 .extend(seals.keys().map(|no| CellAddr::new(opid, *no)));
+            self.prune_contract_caches();
             with_consume_stats(|stats| stats.duplicate_seal_updates += 1);
             return;
         }
