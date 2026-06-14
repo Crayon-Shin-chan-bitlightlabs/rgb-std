@@ -8,6 +8,7 @@ use core::cell::RefCell;
 use core::error::Error;
 use core::marker::PhantomData;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::env;
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -48,6 +49,13 @@ const OWNED_STATE_STATUS_CACHE_MAX_WITNESSES: usize = 50_000;
 fn slow_rgb_stage_elapsed(started_at: Instant) -> Option<u128> {
     let elapsed = started_at.elapsed();
     (elapsed >= RGB_STD_SLOW_STAGE_THRESHOLD).then_some(elapsed.as_millis())
+}
+
+fn max_selected_consign_ops() -> Option<usize> {
+    env::var("RGB_STD_CONSIGN_MAX_SELECTED_OPS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
 }
 #[derive(Copy, Clone, PartialEq, Eq, Debug, From)]
 #[cfg_attr(
@@ -1684,6 +1692,26 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             .expect("infallible consignment operation selection");
         let count = ops.len() as u32;
         let contract_id = self.contract_id;
+        if let Some(max_selected_ops) = max_selected_consign_ops() {
+            if ops.len() > max_selected_ops {
+                tracing::warn!(
+                    operation = "rgb_std",
+                    stage = "consign_selected_ops_too_large",
+                    ?contract_id,
+                    selected_ops = ops.len(),
+                    max_selected_ops,
+                    known_ops = known_opids.len(),
+                    raw_known_ops = raw_known_opids,
+                    known_cells = known_cells.len(),
+                    trust_known_opids,
+                    "Rejecting rgb-std consignment with too many selected operations"
+                );
+                return Err(io::Error::other(format!(
+                    "rgb-std consignment selected operations too large: selected_ops={} max_selected_ops={}",
+                    ops.len(), max_selected_ops
+                )));
+            }
+        }
         let prewarmed_ops = self.prewarm_op_aux_cache(&ops, contract_id)?;
         let mut writer = writer;
         let write_started_at = Instant::now();
