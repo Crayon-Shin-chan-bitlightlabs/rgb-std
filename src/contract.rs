@@ -1597,19 +1597,51 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             published_ops_added,
             "Starting rgb-std consignment operation selection"
         );
+        let max_selected_ops = max_selected_consign_ops();
         let (_, ops) = self
             .ledger
-            .with_session(|session| {
+            .with_session(|session| -> io::Result<_> {
                 let select_ops_started_at = Instant::now();
                 let mut selected_opids = HashSet::new();
+                let mut pending_opids = HashSet::new();
                 let mut ordered_opids = Vec::new();
+                macro_rules! ensure_selection_budget {
+                    () => {{
+                        if let Some(max_selected_ops) = max_selected_ops {
+                            let projected_ops =
+                                selected_opids.len().saturating_add(pending_opids.len());
+                            if projected_ops > max_selected_ops {
+                                tracing::warn!(
+                                    operation = "rgb_std",
+                                    stage = "consign_selected_ops_too_large",
+                                    contract_id = ?self.contract_id,
+                                    selected_ops = projected_ops,
+                                    selected_committed_ops = selected_opids.len(),
+                                    selected_pending_ops = pending_opids.len(),
+                                    max_selected_ops,
+                                    known_ops = known_opids.len(),
+                                    raw_known_ops = raw_known_opids,
+                                    known_cells = known_cells.len(),
+                                    trust_known_opids,
+                                    "Rejecting rgb-std consignment during operation selection"
+                                );
+                                return Err(io::Error::other(format!(
+                                    "rgb-std consignment selected operations too large: selected_ops={} max_selected_ops={}",
+                                    projected_ops, max_selected_ops
+                                )));
+                            }
+                        }
+                    }};
+                }
                 macro_rules! include_op_with_dependencies {
                     ($root:expr) => {{
                         let root = $root;
                         if root != genesis_opid
                             && !known_opids.contains(&root)
                             && !selected_opids.contains(&root)
+                            && pending_opids.insert(root)
                         {
+                            ensure_selection_budget!();
                             let mut stack = vec![(root, false)];
                             while let Some((opid, expanded)) = stack.pop() {
                                 if opid == genesis_opid
@@ -1619,8 +1651,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                     continue;
                                 }
                                 if expanded {
+                                    pending_opids.remove(&opid);
                                     if selected_opids.insert(opid) {
                                         ordered_opids.push(opid);
+                                        ensure_selection_budget!();
                                     }
                                     continue;
                                 }
@@ -1633,7 +1667,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                         && !known_opids.contains(&prev)
                                         && !known_cells.contains(&addr)
                                         && !selected_opids.contains(&prev)
+                                        && pending_opids.insert(prev)
                                     {
+                                        ensure_selection_budget!();
                                         stack.push((prev, false));
                                     }
                                 }
@@ -1687,12 +1723,12 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     );
                 }
 
-                Ok::<_, core::convert::Infallible>((selected_opids.len(), ops))
+                Ok((selected_opids.len(), ops))
             })
-            .expect("infallible consignment operation selection");
+            .map_err(|err| io::Error::other(err.to_string()))?;
         let count = ops.len() as u32;
         let contract_id = self.contract_id;
-        if let Some(max_selected_ops) = max_selected_consign_ops() {
+        if let Some(max_selected_ops) = max_selected_ops {
             if ops.len() > max_selected_ops {
                 tracing::warn!(
                     operation = "rgb_std",
