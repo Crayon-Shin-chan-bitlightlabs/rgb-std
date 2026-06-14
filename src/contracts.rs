@@ -412,6 +412,28 @@ where
         });
     }
 
+    pub fn extend_contract_external_seal_definitions(
+        &mut self,
+        contract_id: ContractId,
+        seals: impl IntoIterator<
+            Item = (CellAddr, <<Sp::Pile as Pile>::Seal as RgbSeal>::Definition),
+        >,
+    ) {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.extend_external_seal_definitions(seals);
+        });
+    }
+
+    pub fn set_contract_external_seal_definitions(
+        &mut self,
+        contract_id: ContractId,
+        seals: Arc<HashMap<CellAddr, <<Sp::Pile as Pile>::Seal as RgbSeal>::Definition>>,
+    ) {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.set_external_seal_definitions(seals);
+        });
+    }
+
     pub fn contract_boundary_opids_for_known_cells(
         &mut self,
         contract_id: ContractId,

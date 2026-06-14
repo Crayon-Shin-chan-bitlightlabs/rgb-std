@@ -365,6 +365,7 @@ pub struct Contract<S: Stock, P: Pile> {
     valid_cache: HashSet<Opid>,
     seal_def_cache: HashMap<CellAddr, <P::Seal as RgbSeal>::Definition>,
     resolved_seal_cache: HashMap<CellAddr, P::Seal>,
+    external_seal_def_cache: Arc<HashMap<CellAddr, <P::Seal as RgbSeal>::Definition>>,
     external_resolved_seal_cache: Arc<HashMap<CellAddr, P::Seal>>,
     duplicate_seal_def_cache: HashSet<CellAddr>,
     duplicate_witness_cache: HashSet<(Opid, <P::Seal as RgbSeal>::WitnessId)>,
@@ -387,6 +388,7 @@ struct ConsumeStats {
     known_seal_db_checks: usize,
     known_seal_db_elapsed_ms: u128,
     seals_known_cache_hits: usize,
+    seals_known_external_hits: usize,
     seals_known_db_checks: usize,
     seals_known_db_elapsed_ms: u128,
     seal_updates_empty: usize,
@@ -510,6 +512,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             valid_cache: HashSet::from([genesis_opid]),
             seal_def_cache: HashMap::new(),
             resolved_seal_cache: HashMap::new(),
+            external_seal_def_cache: Arc::new(HashMap::new()),
             external_resolved_seal_cache: Arc::new(HashMap::new()),
             duplicate_seal_def_cache: HashSet::new(),
             duplicate_witness_cache: HashSet::new(),
@@ -583,6 +586,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             valid_cache: HashSet::from([genesis_opid]),
             seal_def_cache: HashMap::new(),
             resolved_seal_cache: HashMap::new(),
+            external_seal_def_cache: Arc::new(HashMap::new()),
             external_resolved_seal_cache: Arc::new(HashMap::new()),
             duplicate_seal_def_cache: HashSet::new(),
             duplicate_witness_cache: HashSet::new(),
@@ -607,6 +611,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             valid_cache: HashSet::new(),
             seal_def_cache: HashMap::new(),
             resolved_seal_cache: HashMap::new(),
+            external_seal_def_cache: Arc::new(HashMap::new()),
             external_resolved_seal_cache: Arc::new(HashMap::new()),
             duplicate_seal_def_cache: HashSet::new(),
             duplicate_witness_cache: HashSet::new(),
@@ -756,6 +761,33 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
     pub fn set_external_resolved_seals(&mut self, seals: Arc<HashMap<CellAddr, P::Seal>>) {
         self.external_resolved_seal_cache = seals;
+    }
+
+    pub fn extend_external_seal_definitions(
+        &mut self,
+        seals: impl IntoIterator<Item = (CellAddr, <P::Seal as RgbSeal>::Definition)>,
+    ) {
+        let cache = Arc::make_mut(&mut self.external_seal_def_cache);
+        cache.extend(seals);
+        prune_hashmap_to(cache, contract_cache_max_entries());
+    }
+
+    pub fn set_external_seal_definitions(
+        &mut self,
+        seals: Arc<HashMap<CellAddr, <P::Seal as RgbSeal>::Definition>>,
+    ) {
+        let max_entries = contract_cache_max_entries();
+        self.external_seal_def_cache = if seals.len() <= max_entries {
+            seals
+        } else {
+            Arc::new(
+                seals
+                    .iter()
+                    .take(max_entries)
+                    .map(|(addr, seal)| (*addr, seal.clone()))
+                    .collect(),
+            )
+        };
     }
 
     pub fn boundary_opids_for_known_cells(
@@ -1988,6 +2020,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     known_seal_db_checks = stats.known_seal_db_checks,
                     known_seal_db_elapsed_ms = stats.known_seal_db_elapsed_ms,
                     seals_known_cache_hits = stats.seals_known_cache_hits,
+                    seals_known_external_hits = stats.seals_known_external_hits,
                     seals_known_db_checks = stats.seals_known_db_checks,
                     seals_known_db_elapsed_ms = stats.seals_known_db_elapsed_ms,
                     seal_updates_empty = stats.seal_updates_empty,
@@ -2137,6 +2170,14 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
 
         let definition = if let Some(definition) = self.seal_def_cache.get(&addr) {
             definition.clone()
+        } else if let Some(definition) = self.external_seal_def_cache.get(&addr) {
+            let definition = definition.clone();
+            self.seal_def_cache.insert(addr, definition.clone());
+            self.prune_contract_caches();
+            with_consume_stats(|stats| {
+                stats.seals_known_external_hits += 1;
+            });
+            definition
         } else {
             let db_started_at = Instant::now();
             let seal = self.pile.session().seal(addr);
@@ -2203,6 +2244,35 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
             return true;
         }
 
+        let external_cached = seals.iter().all(|(no, seal)| {
+            let addr = CellAddr::new(opid, *no);
+            self.seal_def_cache
+                .get(&addr)
+                .or_else(|| self.external_seal_def_cache.get(&addr))
+                .is_some_and(|stored| stored == seal)
+        });
+        if external_cached {
+            self.seal_def_cache.extend(seals.iter().map(|(no, seal)| {
+                let addr = CellAddr::new(opid, *no);
+                let seal = self
+                    .external_seal_def_cache
+                    .get(&addr)
+                    .cloned()
+                    .unwrap_or_else(|| seal.clone());
+                (addr, seal)
+            }));
+            self.prune_contract_caches();
+            self.duplicate_seal_def_cache
+                .extend(seals.keys().map(|no| CellAddr::new(opid, *no)));
+            self.prune_contract_caches();
+            with_consume_stats(|stats| {
+                stats.seals_known_external_hits += 1;
+                stats.duplicate_seal_updates += 1;
+                stats.known_materialized_skips += 1;
+            });
+            return true;
+        }
+
         let db_started_at = Instant::now();
         let mut ps = self.pile.session();
         let known = seals.iter().all(|(no, seal)| {
@@ -2213,6 +2283,12 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
                 .is_some_and(|stored| stored == seal)
             {
                 return true;
+            }
+            if let Some(stored) = self.external_seal_def_cache.get(&addr) {
+                if stored == seal {
+                    self.seal_def_cache.insert(addr, stored.clone());
+                    return true;
+                }
             }
             let Some(stored) = ps.seal(addr) else {
                 return false;
@@ -2285,6 +2361,12 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
                     .is_some_and(|stored| stored == seal)
                 {
                     return true;
+                }
+                if let Some(stored) = self.external_seal_def_cache.get(&addr) {
+                    if stored == seal {
+                        self.seal_def_cache.insert(addr, stored.clone());
+                        return true;
+                    }
                 }
                 let Some(stored) = ps.seal(addr) else {
                     return false;
