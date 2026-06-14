@@ -1464,53 +1464,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         }
         // Match Ledger::export_aux semantics: follow destroyed cells backwards from
         // terminals and include published global-state definitions required by validation.
-        let select_ops_started_at = Instant::now();
         let genesis_opid = self.ledger.articles().genesis_opid();
-        let mut selected_opids = HashSet::new();
-        let mut ordered_opids = Vec::new();
-        macro_rules! include_op_with_dependencies {
-            ($root:expr) => {{
-                let root = $root;
-                if root != genesis_opid
-                    && !known_opids.contains(&root)
-                    && !selected_opids.contains(&root)
-                {
-                    let mut stack = vec![(root, false)];
-                    while let Some((opid, expanded)) = stack.pop() {
-                        if opid == genesis_opid
-                            || known_opids.contains(&opid)
-                            || selected_opids.contains(&opid)
-                        {
-                            continue;
-                        }
-                        if expanded {
-                            if selected_opids.insert(opid) {
-                                ordered_opids.push(opid);
-                            }
-                            continue;
-                        }
-
-                        stack.push((opid, true));
-                        let st = self.ledger.transition(opid);
-                        for addr in st.destroyed.into_keys() {
-                            let prev = addr.opid;
-                            if prev != genesis_opid
-                                && !known_opids.contains(&prev)
-                                && !known_cells.contains(&addr)
-                                && !selected_opids.contains(&prev)
-                            {
-                                stack.push((prev, false));
-                            }
-                        }
-                    }
-                }
-            }};
-        }
-
-        for opid in terminal_opids.iter().copied() {
-            include_op_with_dependencies!(opid);
-        }
-
         let mut published_roots = BTreeSet::new();
         {
             let articles = self.ledger.articles();
@@ -1540,47 +1494,99 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             }
         }
         let published_ops_added = published_roots.len();
-        for opid in published_roots {
-            include_op_with_dependencies!(opid);
-        }
+        let (_, ops) = self
+            .ledger
+            .with_session(|session| {
+            let select_ops_started_at = Instant::now();
+            let mut selected_opids = HashSet::new();
+            let mut ordered_opids = Vec::new();
+            macro_rules! include_op_with_dependencies {
+                ($root:expr) => {{
+                    let root = $root;
+                    if root != genesis_opid
+                        && !known_opids.contains(&root)
+                        && !selected_opids.contains(&root)
+                    {
+                        let mut stack = vec![(root, false)];
+                        while let Some((opid, expanded)) = stack.pop() {
+                            if opid == genesis_opid
+                                || known_opids.contains(&opid)
+                                || selected_opids.contains(&opid)
+                            {
+                                continue;
+                            }
+                            if expanded {
+                                if selected_opids.insert(opid) {
+                                    ordered_opids.push(opid);
+                                }
+                                continue;
+                            }
 
-        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(select_ops_started_at) {
-            tracing::warn!(
-                operation = "rgb_std",
-                stage = "consign_select_operations",
-                elapsed_ms,
-                contract_id = ?self.contract_id,
-                terminal_ops = terminal_opids.len(),
-                selected_ops = selected_opids.len(),
-                known_ops = known_opids.len(),
-                raw_known_ops = raw_known_opids,
-                known_cells = known_cells.len(),
-                trust_known_opids,
-                published_ops_added,
-                "Slow rgb-std stage"
-            );
-        }
-        let filter_ops_started_at = Instant::now();
-        let ops = ordered_opids
-            .into_iter()
-            .map(|opid| (opid, self.ledger.operation(opid)))
-            .collect::<Vec<_>>();
-        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(filter_ops_started_at) {
-            tracing::warn!(
-                operation = "rgb_std",
-                stage = "consign_filter_operations",
-                elapsed_ms,
-                contract_id = ?self.contract_id,
-                selected_ops = ops.len(),
-                terminal_ops = terminal_opids.len(),
-                known_ops = known_opids.len(),
-                raw_known_ops = raw_known_opids,
-                known_cells = known_cells.len(),
-                trust_known_opids,
-                published_ops_added,
-                "Slow rgb-std stage"
-            );
-        }
+                            stack.push((opid, true));
+                            let st = session.transition(opid);
+                            for addr in st.destroyed.into_keys() {
+                                let prev = addr.opid;
+                                if prev != genesis_opid
+                                    && !known_opids.contains(&prev)
+                                    && !known_cells.contains(&addr)
+                                    && !selected_opids.contains(&prev)
+                                {
+                                    stack.push((prev, false));
+                                }
+                            }
+                        }
+                    }
+                }};
+            }
+
+            for opid in terminal_opids.iter().copied() {
+                include_op_with_dependencies!(opid);
+            }
+            for opid in published_roots {
+                include_op_with_dependencies!(opid);
+            }
+
+            if let Some(elapsed_ms) = slow_rgb_stage_elapsed(select_ops_started_at) {
+                tracing::warn!(
+                    operation = "rgb_std",
+                    stage = "consign_select_operations",
+                    elapsed_ms,
+                    contract_id = ?self.contract_id,
+                    terminal_ops = terminal_opids.len(),
+                    selected_ops = selected_opids.len(),
+                    known_ops = known_opids.len(),
+                    raw_known_ops = raw_known_opids,
+                    known_cells = known_cells.len(),
+                    trust_known_opids,
+                    published_ops_added,
+                    "Slow rgb-std stage"
+                );
+            }
+            let filter_ops_started_at = Instant::now();
+            let ops = ordered_opids
+                .into_iter()
+                .map(|opid| (opid, session.operation(opid)))
+                .collect::<Vec<_>>();
+            if let Some(elapsed_ms) = slow_rgb_stage_elapsed(filter_ops_started_at) {
+                tracing::warn!(
+                    operation = "rgb_std",
+                    stage = "consign_filter_operations",
+                    elapsed_ms,
+                    contract_id = ?self.contract_id,
+                    selected_ops = ops.len(),
+                    terminal_ops = terminal_opids.len(),
+                    known_ops = known_opids.len(),
+                    raw_known_ops = raw_known_opids,
+                    known_cells = known_cells.len(),
+                    trust_known_opids,
+                    published_ops_added,
+                    "Slow rgb-std stage"
+                );
+            }
+
+                Ok::<_, core::convert::Infallible>((selected_opids.len(), ops))
+            })
+            .expect("infallible consignment operation selection");
         let count = ops.len() as u32;
         let contract_id = self.contract_id;
         let mut writer = writer;
