@@ -6,6 +6,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use core::borrow::Borrow;
 use core::cell::RefCell;
 use core::error::Error;
+use core::hash::Hash;
 use core::marker::PhantomData;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
@@ -43,6 +44,8 @@ use crate::{
 const RGB_STD_SLOW_STAGE_THRESHOLD: Duration = Duration::from_millis(500);
 const OP_AUX_CACHE_DEFAULT_MAX_BYTES: usize = 3 * 1024 * 1024;
 const OP_AUX_CACHE_HARD_MAX_BYTES: usize = 64 * 1024 * 1024;
+const CONTRACT_CACHE_DEFAULT_MAX_ENTRIES: usize = 50_000;
+const CONTRACT_CACHE_HARD_MAX_ENTRIES: usize = 250_000;
 const OWNED_STATE_STATUS_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const OWNED_STATE_STATUS_CACHE_MAX_OPS: usize = 50_000;
 const OWNED_STATE_STATUS_CACHE_MAX_WITNESSES: usize = 50_000;
@@ -69,6 +72,46 @@ fn op_aux_cache_max_bytes() -> usize {
             .map(|value| value.min(OP_AUX_CACHE_HARD_MAX_BYTES))
             .unwrap_or(OP_AUX_CACHE_DEFAULT_MAX_BYTES)
     })
+}
+
+fn contract_cache_max_entries() -> usize {
+    static MAX_ENTRIES: OnceLock<usize> = OnceLock::new();
+    *MAX_ENTRIES.get_or_init(|| {
+        env::var("RGB_STD_CONTRACT_CACHE_MAX_ENTRIES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .map(|value| value.min(CONTRACT_CACHE_HARD_MAX_ENTRIES))
+            .unwrap_or(CONTRACT_CACHE_DEFAULT_MAX_ENTRIES)
+    })
+}
+
+fn prune_hashset_to<K>(cache: &mut HashSet<K>, max_entries: usize)
+where
+    K: Copy + Eq + Hash,
+{
+    if cache.len() <= max_entries {
+        return;
+    }
+    let remove_count = cache.len().saturating_sub(max_entries);
+    let keys = cache.iter().take(remove_count).copied().collect::<Vec<_>>();
+    for key in keys {
+        cache.remove(&key);
+    }
+}
+
+fn prune_hashmap_to<K, V>(cache: &mut HashMap<K, V>, max_entries: usize)
+where
+    K: Copy + Eq + Hash,
+{
+    if cache.len() <= max_entries {
+        return;
+    }
+    let remove_count = cache.len().saturating_sub(max_entries);
+    let keys = cache.keys().take(remove_count).copied().collect::<Vec<_>>();
+    for key in keys {
+        cache.remove(&key);
+    }
 }
 #[derive(Copy, Clone, PartialEq, Eq, Debug, From)]
 #[cfg_attr(
@@ -336,6 +379,16 @@ struct ConsumeStats {
     decoded_ops: usize,
     known_ops: usize,
     new_ops: usize,
+    witness_known_cache_hits: usize,
+    witness_known_db_checks: usize,
+    witness_known_db_elapsed_ms: u128,
+    known_seal_cache_hits: usize,
+    known_seal_external_hits: usize,
+    known_seal_db_checks: usize,
+    known_seal_db_elapsed_ms: u128,
+    seals_known_cache_hits: usize,
+    seals_known_db_checks: usize,
+    seals_known_db_elapsed_ms: u128,
     seal_updates_empty: usize,
     seal_updates_non_empty: usize,
     duplicate_seal_updates: usize,
@@ -357,6 +410,14 @@ fn with_consume_stats(update: impl FnOnce(&mut ConsumeStats)) {
 }
 
 impl<S: Stock, P: Pile> Contract<S, P> {
+    fn prune_contract_caches(&mut self) {
+        let max_entries = contract_cache_max_entries();
+        prune_hashmap_to(&mut self.seal_def_cache, max_entries);
+        prune_hashmap_to(&mut self.resolved_seal_cache, max_entries);
+        prune_hashset_to(&mut self.duplicate_seal_def_cache, max_entries);
+        prune_hashset_to(&mut self.duplicate_witness_cache, max_entries);
+    }
+
     fn refresh_valid_cache(&mut self) {
         let genesis_opid = self.ledger.articles().genesis_opid();
         let valid_cache = self
@@ -1919,12 +1980,27 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     decoded_ops = stats.decoded_ops,
                     known_ops = stats.known_ops,
                     new_ops = stats.new_ops,
+                    witness_known_cache_hits = stats.witness_known_cache_hits,
+                    witness_known_db_checks = stats.witness_known_db_checks,
+                    witness_known_db_elapsed_ms = stats.witness_known_db_elapsed_ms,
+                    known_seal_cache_hits = stats.known_seal_cache_hits,
+                    known_seal_external_hits = stats.known_seal_external_hits,
+                    known_seal_db_checks = stats.known_seal_db_checks,
+                    known_seal_db_elapsed_ms = stats.known_seal_db_elapsed_ms,
+                    seals_known_cache_hits = stats.seals_known_cache_hits,
+                    seals_known_db_checks = stats.seals_known_db_checks,
+                    seals_known_db_elapsed_ms = stats.seals_known_db_elapsed_ms,
                     seal_updates_empty = stats.seal_updates_empty,
                     seal_updates_non_empty = stats.seal_updates_non_empty,
                     duplicate_seal_updates = stats.duplicate_seal_updates,
                     witness_updates = stats.witness_updates,
                     duplicate_witness_updates = stats.duplicate_witness_updates,
                     known_materialized_skips = stats.known_materialized_skips,
+                    seal_def_cache_entries = self.seal_def_cache.len(),
+                    resolved_seal_cache_entries = self.resolved_seal_cache.len(),
+                    duplicate_seal_def_cache_entries = self.duplicate_seal_def_cache.len(),
+                    duplicate_witness_cache_entries = self.duplicate_witness_cache.len(),
+                    contract_cache_max_entries = contract_cache_max_entries(),
                     "Slow rgb-std stage"
                 );
             }
@@ -2027,16 +2103,27 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
     fn is_witness_known(&mut self, opid: Opid, witness: &SealWitness<P::Seal>) -> bool {
         let wid = witness.published.pub_id();
         if self.duplicate_witness_cache.contains(&(opid, wid)) {
-            with_consume_stats(|stats| stats.duplicate_witness_updates += 1);
+            with_consume_stats(|stats| {
+                stats.witness_known_cache_hits += 1;
+                stats.duplicate_witness_updates += 1;
+            });
             return true;
         }
 
+        let db_started_at = Instant::now();
         let mut ps = self.pile.session();
         let known = ps.has_witness(wid)
             && ps.cli_witness(wid) == witness.client
             && ps.ops_by_witness_id(wid).any(|op| op == opid);
+        let db_elapsed_ms = db_started_at.elapsed().as_millis();
+        drop(ps);
+        with_consume_stats(|stats| {
+            stats.witness_known_db_checks += 1;
+            stats.witness_known_db_elapsed_ms += db_elapsed_ms;
+        });
         if known {
             self.duplicate_witness_cache.insert((opid, wid));
+            self.prune_contract_caches();
             with_consume_stats(|stats| stats.duplicate_witness_updates += 1);
         }
         known
@@ -2044,31 +2131,50 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
 
     fn known_seal(&mut self, addr: CellAddr) -> Option<P::Seal> {
         if let Some(seal) = self.resolved_seal_cache.get(&addr) {
+            with_consume_stats(|stats| stats.known_seal_cache_hits += 1);
             return Some(seal.clone());
         }
 
         let definition = if let Some(definition) = self.seal_def_cache.get(&addr) {
             definition.clone()
         } else {
-            match self.pile.session().seal(addr) {
+            let db_started_at = Instant::now();
+            let seal = self.pile.session().seal(addr);
+            let db_elapsed_ms = db_started_at.elapsed().as_millis();
+            with_consume_stats(|stats| {
+                stats.known_seal_db_checks += 1;
+                stats.known_seal_db_elapsed_ms += db_elapsed_ms;
+            });
+            match seal {
                 Some(definition) => {
                     self.seal_def_cache.insert(addr, definition.clone());
+                    self.prune_contract_caches();
                     definition
                 }
                 None => {
-                    return self.external_resolved_seal_cache.get(&addr).cloned();
+                    let seal = self.external_resolved_seal_cache.get(&addr).cloned();
+                    if seal.is_some() {
+                        with_consume_stats(|stats| stats.known_seal_external_hits += 1);
+                    }
+                    return seal;
                 }
             }
         };
         if let Some(seal) = definition.to_src() {
             self.resolved_seal_cache.insert(addr, seal.clone());
+            self.prune_contract_caches();
             return Some(seal);
         }
         let Some(witness) = self.retrieve(addr.opid) else {
-            return self.external_resolved_seal_cache.get(&addr).cloned();
+            let seal = self.external_resolved_seal_cache.get(&addr).cloned();
+            if seal.is_some() {
+                with_consume_stats(|stats| stats.known_seal_external_hits += 1);
+            }
+            return seal;
         };
         let seal = definition.resolve(witness.published.pub_id());
         self.resolved_seal_cache.insert(addr, seal.clone());
+        self.prune_contract_caches();
         Some(seal)
     }
 
@@ -2090,12 +2196,14 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         });
         if cached {
             with_consume_stats(|stats| {
+                stats.seals_known_cache_hits += 1;
                 stats.duplicate_seal_updates += 1;
                 stats.known_materialized_skips += 1;
             });
             return true;
         }
 
+        let db_started_at = Instant::now();
         let mut ps = self.pile.session();
         let known = seals.iter().all(|(no, seal)| {
             let addr = CellAddr::new(opid, *no);
@@ -2116,10 +2224,17 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
             true
         });
         drop(ps);
+        let db_elapsed_ms = db_started_at.elapsed().as_millis();
+        with_consume_stats(|stats| {
+            stats.seals_known_db_checks += 1;
+            stats.seals_known_db_elapsed_ms += db_elapsed_ms;
+        });
+        self.prune_contract_caches();
 
         if known {
             self.duplicate_seal_def_cache
                 .extend(seals.keys().map(|no| CellAddr::new(opid, *no)));
+            self.prune_contract_caches();
             with_consume_stats(|stats| {
                 stats.duplicate_seal_updates += 1;
                 stats.known_materialized_skips += 1;
@@ -2193,6 +2308,7 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
             self.resolved_seal_cache.remove(&addr);
             self.duplicate_seal_def_cache.insert(addr);
         }
+        self.prune_contract_caches();
         self.pile.session().add_seals(opid, seals);
         self.remove_op_aux_cache_entry(opid);
         self.clear_owned_state_status_cache();
