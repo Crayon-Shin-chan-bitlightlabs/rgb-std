@@ -1798,6 +1798,17 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         opid: Opid,
         known_cells: &HashSet<CellAddr>,
     ) -> bool {
+        if !self.ledger.has_operation(opid) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "known_boundary_missing_operation",
+                contract_id = ?self.contract_id,
+                ?opid,
+                known_cells = known_cells.len(),
+                "Ignoring known opid boundary because operation is missing from stock session"
+            );
+            return false;
+        }
         let op = self.ledger.operation(opid);
         let up_to = op.destructible_out.len_u16();
         let rels = self.pile.session().op_relations(opid, up_to);
