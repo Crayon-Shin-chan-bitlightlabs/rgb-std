@@ -1325,7 +1325,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 continue;
             }
             if ops.len() <= 64 || idx % 100 == 0 {
-                tracing::info!(
+                tracing::warn!(
                     operation = "rgb_std",
                     stage = "consign_prewarm_operation_start",
                     ?contract_id,
@@ -1577,7 +1577,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             }
         }
         let published_ops_added = published_roots.len();
-        tracing::info!(
+        tracing::warn!(
             operation = "rgb_std",
             stage = "consign_select_start",
             contract_id = ?self.contract_id,
