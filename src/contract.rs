@@ -2376,6 +2376,7 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
                     .is_some_and(|stored| stored == seal)
         });
         if cached_duplicate {
+            self.remove_op_aux_cache_entry(opid);
             with_consume_stats(|stats| stats.duplicate_seal_updates += 1);
             return;
         }
@@ -2441,6 +2442,7 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
             self.duplicate_seal_def_cache
                 .extend(seals.keys().map(|no| CellAddr::new(opid, *no)));
             self.prune_contract_caches();
+            self.remove_op_aux_cache_entry(opid);
             with_consume_stats(|stats| stats.duplicate_seal_updates += 1);
             return;
         }
