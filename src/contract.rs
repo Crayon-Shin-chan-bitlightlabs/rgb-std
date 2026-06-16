@@ -711,8 +711,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         })
     }
 
-    fn retrieve(&mut self, opid: Opid) -> Option<SealWitness<P::Seal>> {
-        let mut ps = self.pile.session();
+    fn retrieve_with_session<PS>(ps: &mut PS, opid: Opid) -> Option<SealWitness<P::Seal>>
+    where
+        PS: PileSession<Seal = P::Seal>,
+    {
         let wids: Vec<_> = ps.op_witness_ids(opid).collect();
         let (status, wid) = wids
             .into_iter()
@@ -724,6 +726,11 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let client = ps.cli_witness(wid);
         let published = ps.pub_witness(wid);
         Some(SealWitness::new(published, client))
+    }
+
+    fn retrieve(&mut self, opid: Opid) -> Option<SealWitness<P::Seal>> {
+        let mut ps = self.pile.session();
+        Self::retrieve_with_session(&mut ps, opid)
     }
 
     /// Operations with their pile relations — returns collected Vec to avoid borrow conflicts.
@@ -1342,18 +1349,18 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         self.pile.session().commit_transaction();
     }
 
-    fn aux<W: WriteRaw>(
-        &mut self,
+    fn aux_with_session<W: WriteRaw, PS>(
+        ps: &mut PS,
         opid: Opid,
         op: &Operation,
         mut writer: StrictWriter<W>,
-    ) -> io::Result<StrictWriter<W>> {
-        let seals = self
-            .pile
-            .session()
-            .seals(opid, op.destructible_out.len_u16());
+    ) -> io::Result<StrictWriter<W>>
+    where
+        PS: PileSession<Seal = P::Seal>,
+    {
+        let seals = ps.seals(opid, op.destructible_out.len_u16());
         writer = seals.strict_encode(writer)?;
-        let witness = self.retrieve(opid);
+        let witness = Self::retrieve_with_session(ps, opid);
         writer = witness.is_some().strict_encode(writer)?;
         if let Some(w) = witness {
             writer = w.strict_encode(writer)?;
@@ -1400,9 +1407,23 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     }
 
     fn build_op_aux_cache_entry(&mut self, opid: Opid, op: &Operation) -> io::Result<Vec<u8>> {
+        let mut ps = self.pile.session();
+        Self::build_op_aux_cache_entry_with_session(&mut ps, opid, op)
+    }
+
+    fn build_op_aux_cache_entry_with_session<PS>(
+        ps: &mut PS,
+        opid: Opid,
+        op: &Operation,
+    ) -> io::Result<Vec<u8>>
+    where
+        PS: PileSession<Seal = P::Seal>,
+    {
         let mem_writer = StrictWriter::with(StreamWriter::in_memory::<{ usize::MAX }>());
         let mem_writer = op.strict_encode(mem_writer)?;
-        Ok(self.aux(opid, op, mem_writer)?.unbox().unconfine())
+        Ok(Self::aux_with_session(ps, opid, op, mem_writer)?
+            .unbox()
+            .unconfine())
     }
 
     fn op_aux_cached<W: WriteRaw>(
@@ -1435,6 +1456,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     ) -> io::Result<usize> {
         let prewarm_started_at = Instant::now();
         let mut encoded = 0usize;
+        let mut pending = Vec::new();
         for (idx, (opid, op)) in ops.iter().enumerate() {
             if self.op_aux_cache.contains_key(opid) {
                 self.touch_op_aux_cache_entry(*opid);
@@ -1453,18 +1475,31 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     "Prewarming rgb-std operation aux cache"
                 );
             }
-            let op_started_at = Instant::now();
-            let bytes = self.build_op_aux_cache_entry(*opid, op)?;
+            pending.push((idx, *opid, op));
+        }
+
+        let mut warmed = Vec::with_capacity(pending.len());
+        {
+            let mut ps = self.pile.session();
+            for (idx, opid, op) in pending {
+                let op_started_at = Instant::now();
+                let bytes = Self::build_op_aux_cache_entry_with_session(&mut ps, opid, op)?;
+                let elapsed_ms = slow_rgb_stage_elapsed(op_started_at);
+                warmed.push((idx, opid, bytes, elapsed_ms));
+            }
+        }
+
+        for (idx, opid, bytes, elapsed_ms) in warmed {
             let bytes_len = bytes.len();
-            self.insert_op_aux_cache_entry(*opid, bytes);
+            self.insert_op_aux_cache_entry(opid, bytes);
             encoded += 1;
-            if let Some(elapsed_ms) = slow_rgb_stage_elapsed(op_started_at) {
+            if let Some(elapsed_ms) = elapsed_ms {
                 tracing::warn!(
                     operation = "rgb_std",
                     stage = "consign_prewarm_operation",
                     elapsed_ms,
                     ?contract_id,
-                    ?opid,
+                    opid = ?opid,
                     idx,
                     total_ops = ops.len(),
                     bytes = bytes_len,
@@ -1498,7 +1533,8 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         op: &Operation,
         writer: StrictWriter<W>,
     ) -> io::Result<StrictWriter<W>> {
-        self.aux(opid, op, writer)
+        let mut ps = self.pile.session();
+        Self::aux_with_session(&mut ps, opid, op, writer)
     }
 
     pub fn export(&mut self, writer: StrictWriter<impl WriteRaw>) -> io::Result<()>
