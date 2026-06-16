@@ -222,6 +222,10 @@ pub trait PileSession {
         up_to: u16,
     ) -> SmallOrdMap<u16, <Self::Seal as RgbSeal>::Definition>;
 
+    fn preload_aux_reads(&mut self, ops: impl IntoIterator<Item = (Opid, u16)>) {
+        let _ = ops;
+    }
+
     fn op_relations(&mut self, opid: Opid, up_to: u16) -> OpRels<Self::Seal>;
 
     // ── write ─────────────────────────────────────────────────────────────

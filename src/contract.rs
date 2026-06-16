@@ -1481,6 +1481,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let mut warmed = Vec::with_capacity(pending.len());
         {
             let mut ps = self.pile.session();
+            let preload_ops = pending
+                .iter()
+                .map(|(_, opid, op)| (*opid, op.destructible_out.len_u16()));
+            ps.preload_aux_reads(preload_ops);
             for (idx, opid, op) in pending {
                 let op_started_at = Instant::now();
                 let bytes = Self::build_op_aux_cache_entry_with_session(&mut ps, opid, op)?;
