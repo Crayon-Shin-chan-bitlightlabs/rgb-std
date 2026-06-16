@@ -1985,9 +1985,11 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let op = self.ledger.operation(opid);
         let up_to = op.destructible_out.len_u16();
         let rels = self.pile.session().op_relations(opid, up_to);
-        (0..up_to).all(|no| {
-            rels.defines.contains_key(&no) && known_cells.contains(&CellAddr::new(opid, no))
-        })
+        !rels.defines.is_empty()
+            && rels
+                .defines
+                .keys()
+                .all(|no| known_cells.contains(&CellAddr::new(opid, *no)))
     }
 
     pub fn consume<E>(
