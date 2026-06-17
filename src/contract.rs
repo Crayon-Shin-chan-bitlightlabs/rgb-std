@@ -1980,13 +1980,15 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             published_ops_added,
             "Starting rgb-std consignment operation selection"
         );
-        let (_, ops) = self
+        let (_, ops, known_cell_edges_skipped) = self
             .ledger
             .with_session(|session| -> io::Result<_> {
                 let select_ops_started_at = Instant::now();
                 let mut selected_opids = HashSet::new();
                 let mut pending_opids = HashSet::new();
                 let mut ordered_opids = Vec::new();
+                let mut known_cell_edges_skipped = 0usize;
+
                 macro_rules! include_op_with_dependencies {
                     ($root:expr) => {{
                         let root = $root;
@@ -2024,6 +2026,12 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                     }
                                 }
                                 for input in &op.destructible_in {
+                                    if known_cells.contains(&input.addr) {
+                                        known_cell_edges_skipped =
+                                            known_cell_edges_skipped.saturating_add(1);
+                                        continue;
+                                    }
+
                                     let prev = input.addr.opid;
                                     if prev != genesis_opid
                                         && !known_opids.contains(&prev)
@@ -2035,6 +2043,12 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                 }
                                 let st = session.transition(opid);
                                 for addr in st.destroyed.into_keys() {
+                                    if known_cells.contains(&addr) {
+                                        known_cell_edges_skipped =
+                                            known_cell_edges_skipped.saturating_add(1);
+                                        continue;
+                                    }
+
                                     let prev = addr.opid;
                                     if prev != genesis_opid
                                         && !known_opids.contains(&prev)
@@ -2067,6 +2081,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                         known_ops = known_opids.len(),
                         raw_known_ops = raw_known_opids,
                         known_cells = known_cells.len(),
+                        known_cell_edges_skipped,
                         trust_known_opids,
                         published_ops_added,
                         "Slow rgb-std stage"
@@ -2088,13 +2103,14 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                         known_ops = known_opids.len(),
                         raw_known_ops = raw_known_opids,
                         known_cells = known_cells.len(),
+                        known_cell_edges_skipped,
                         trust_known_opids,
                         published_ops_added,
                         "Slow rgb-std stage"
                     );
                 }
 
-                Ok((selected_opids.len(), ops))
+                Ok((selected_opids.len(), ops, known_cell_edges_skipped))
             })
             .map_err(|err| io::Error::other(err.to_string()))?;
         let count = ops.len() as u32;
@@ -2141,6 +2157,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 known_ops = known_opids.len(),
                 raw_known_ops = raw_known_opids,
                 known_cells = known_cells.len(),
+                known_cell_edges_skipped,
                 trust_known_opids,
                 prewarmed_ops,
                 "Slow rgb-std stage"
@@ -2156,6 +2173,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 known_ops = known_opids.len(),
                 raw_known_ops = raw_known_opids,
                 known_cells = known_cells.len(),
+                known_cell_edges_skipped,
                 trust_known_opids,
                 "Slow rgb-std stage"
             );
