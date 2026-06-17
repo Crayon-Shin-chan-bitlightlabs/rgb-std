@@ -1454,19 +1454,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 self.touch_op_aux_cache_entry(*opid);
                 continue;
             }
-            if ops.len() <= 64 || idx % 100 == 0 {
-                tracing::warn!(
-                    operation = "rgb_std",
-                    stage = "consign_prewarm_operation_start",
-                    ?contract_id,
-                    ?opid,
-                    idx,
-                    total_ops = ops.len(),
-                    cache_bytes = self.op_aux_cache_bytes,
-                    cache_entries = self.op_aux_cache.len(),
-                    "Prewarming rgb-std operation aux cache"
-                );
-            }
             pending.push((idx, *opid, op));
         }
 
