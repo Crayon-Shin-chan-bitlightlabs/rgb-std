@@ -488,9 +488,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     continue;
                 }
 
-                let witness_matches = session.has_witness(wid)
-                    && session.cli_witness(wid) == witness.client
-                    && session.ops_by_witness_id(wid).any(|stored| stored == opid);
+                let witness_matches = session.op_witness_ids(opid).any(|stored| stored == wid)
+                    && session.has_witness(wid)
+                    && session.cli_witness(wid) == witness.client;
                 if witness_matches {
                     self.duplicate_witness_cache.insert((opid, wid));
                 }
@@ -2225,9 +2225,9 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
 
         let db_started_at = Instant::now();
         let mut ps = self.pile.session();
-        let known = ps.has_witness(wid)
-            && ps.cli_witness(wid) == witness.client
-            && ps.ops_by_witness_id(wid).any(|op| op == opid);
+        let known = ps.op_witness_ids(opid).any(|stored| stored == wid)
+            && ps.has_witness(wid)
+            && ps.cli_witness(wid) == witness.client;
         let db_elapsed_ms = db_started_at.elapsed().as_millis();
         drop(ps);
         with_consume_stats(|stats| {
