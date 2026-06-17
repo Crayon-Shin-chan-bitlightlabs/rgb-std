@@ -176,11 +176,10 @@ pub trait PileSession {
             .collect()
     }
 
-    fn witness_ids(&mut self) -> impl Iterator<Item = <Self::Seal as RgbSeal>::WitnessId>;
+    fn witness_ids(&mut self) -> Vec<<Self::Seal as RgbSeal>::WitnessId>;
 
     fn witness_statuses(&mut self) -> Vec<(<Self::Seal as RgbSeal>::WitnessId, WitnessStatus)> {
-        let witness_ids = self.witness_ids().collect::<Vec<_>>();
-        witness_ids
+        self.witness_ids()
             .into_iter()
             .map(|wid| {
                 let status = self.witness_status(wid);
@@ -200,19 +199,13 @@ pub trait PileSession {
             .collect()
     }
 
-    fn witnesses(&mut self) -> impl Iterator<Item = Witness<Self::Seal>>;
+    fn witnesses(&mut self) -> Vec<Witness<Self::Seal>>;
 
-    fn op_witness_ids(
-        &mut self,
-        opid: Opid,
-    ) -> impl ExactSizeIterator<Item = <Self::Seal as RgbSeal>::WitnessId>;
+    fn op_witness_ids(&mut self, opid: Opid) -> Vec<<Self::Seal as RgbSeal>::WitnessId>;
 
-    fn ops_by_witness_id(
-        &mut self,
-        wid: <Self::Seal as RgbSeal>::WitnessId,
-    ) -> impl ExactSizeIterator<Item = Opid>;
+    fn ops_by_witness_id(&mut self, wid: <Self::Seal as RgbSeal>::WitnessId) -> Vec<Opid>;
 
-    fn known_seal_cells(&mut self) -> impl Iterator<Item = CellAddr>;
+    fn known_seal_cells(&mut self) -> Vec<CellAddr>;
 
     fn seal(&mut self, addr: CellAddr) -> Option<<Self::Seal as RgbSeal>::Definition>;
 

@@ -464,7 +464,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 {
                     let stored = session.seals(opid, up_to);
                     op.defined_seals.iter().all(|(no, seal)| {
-                        stored.get(no).is_some_and(|stored_seal| stored_seal == seal)
+                        stored
+                            .get(no)
+                            .is_some_and(|stored_seal| stored_seal == seal)
                     })
                 } else {
                     op.defined_seals.iter().all(|(no, seal)| {
@@ -488,7 +490,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     continue;
                 }
 
-                let witness_matches = session.op_witness_ids(opid).any(|stored| stored == wid)
+                let witness_matches = session.op_witness_ids(opid).contains(&wid)
                     && session.has_witness(wid)
                     && session.cli_witness(wid) == witness.client;
                 if witness_matches {
@@ -516,7 +518,8 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         cache.clear();
 
         let genesis_opid = self.ledger.articles().genesis_opid();
-        let parent_ops: BTreeMap<Opid, Vec<Opid>> = self.ledger.operation_parent_ops().collect();
+        let parent_ops: BTreeMap<Opid, Vec<Opid>> =
+            self.ledger.operation_parent_ops().into_iter().collect();
 
         if parent_ops.len() > OWNED_STATE_STATUS_CACHE_MAX_OPS {
             return;
@@ -527,7 +530,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         {
             let mut session = self.pile.session();
             for opid in parent_ops.keys().copied().chain([genesis_opid]) {
-                let wids = session.op_witness_ids(opid).collect::<Vec<_>>();
+                let wids = session.op_witness_ids(opid);
                 for wid in &wids {
                     witness_statuses
                         .entry(*wid)
@@ -698,7 +701,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     }
 
     fn best_op_status(&mut self, opid: Opid) -> WitnessStatus {
-        let wids: Vec<_> = self.pile.session().op_witness_ids(opid).collect();
+        let wids = self.pile.session().op_witness_ids(opid);
         wids.into_iter()
             .map(|wid| self.pile.session().witness_status(wid))
             .reduce(|best, other| best.best(other))
@@ -718,7 +721,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         *best_status_cache.entry(opid).or_insert_with(|| {
             let wids = op_witness_ids_cache
                 .entry(opid)
-                .or_insert_with(|| self.pile.session().op_witness_ids(opid).collect::<Vec<_>>());
+                .or_insert_with(|| self.pile.session().op_witness_ids(opid));
             wids.iter()
                 .copied()
                 .map(|wid| {
@@ -777,7 +780,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     where
         PS: PileSession<Seal = P::Seal>,
     {
-        let wids: Vec<_> = ps.op_witness_ids(opid).collect();
+        let wids = ps.op_witness_ids(opid);
         let (status, wid) = wids
             .into_iter()
             .map(|wid| (ps.witness_status(wid), wid))
@@ -812,7 +815,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     }
 
     pub fn known_seal_cells(&mut self) -> Vec<CellAddr> {
-        self.pile.session().known_seal_cells().collect()
+        self.pile.session().known_seal_cells()
     }
 
     pub fn known_resolved_seals(&mut self) -> Vec<(CellAddr, P::Seal)> {
@@ -875,6 +878,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let mut pile_session = self.pile.session();
         let known_seal_cells = pile_session
             .known_seal_cells()
+            .into_iter()
             .filter(|cell| known_cells.contains(cell));
         let mut known_positions_by_opid = HashMap::<Opid, HashSet<u16>>::new();
         for cell in known_seal_cells {
@@ -886,6 +890,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
         self.ledger
             .operation_output_counts()
+            .into_iter()
             .filter_map(|(opid, count)| {
                 let known_positions = known_positions_by_opid.get(&opid)?;
                 (known_positions.len() == count as usize
@@ -896,7 +901,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     }
 
     pub fn witness_ids(&mut self) -> Vec<<P::Seal as RgbSeal>::WitnessId> {
-        self.pile.session().witness_ids().collect()
+        self.pile.session().witness_ids()
     }
 
     pub fn witness_statuses(&mut self) -> Vec<(<P::Seal as RgbSeal>::WitnessId, WitnessStatus)> {
@@ -914,7 +919,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     }
 
     pub fn witnesses(&mut self) -> Vec<Witness<P::Seal>> {
-        self.pile.session().witnesses().collect()
+        self.pile.session().witnesses()
     }
 
     pub fn witness_status(&mut self, wid: <P::Seal as RgbSeal>::WitnessId) -> WitnessStatus {
@@ -933,7 +938,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     }
 
     pub fn ops_by_witness_id(&mut self, wid: <P::Seal as RgbSeal>::WitnessId) -> Vec<Opid> {
-        self.pile.session().ops_by_witness_id(wid).collect()
+        self.pile.session().ops_by_witness_id(wid)
     }
 
     pub fn op_seals(&mut self, opid: Opid, up_to: u16) -> OpRels<P::Seal> {
@@ -1026,7 +1031,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                         }
                     }
                 } else {
-                    let wids = session.op_witness_ids(addr.opid).collect::<Vec<_>>();
+                    let wids = session.op_witness_ids(addr.opid);
                     unresolved.push((*addr, seal, data.clone(), wids));
                 }
             }
@@ -1043,7 +1048,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             (genesis_opid, &status_cache.parent_ops)
         } else {
             let genesis_opid = self.ledger.articles().genesis_opid();
-            fallback_parent_ops = self.ledger.operation_parent_ops().collect();
+            fallback_parent_ops = self.ledger.operation_parent_ops().into_iter().collect();
             (genesis_opid, &fallback_parent_ops)
         };
         let mut op_witness_ids_cache = core::mem::take(&mut status_cache.op_witness_ids);
@@ -1127,7 +1132,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             let mut op_witness_ids = BTreeMap::new();
             let mut statuses = BTreeMap::new();
             for opid in all_ops.keys().copied().chain([genesis_opid]) {
-                let wids: Vec<_> = session.op_witness_ids(opid).collect();
+                let wids = session.op_witness_ids(opid);
                 for wid in &wids {
                     statuses
                         .entry(*wid)
@@ -1299,12 +1304,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let opids_per_wid: Vec<Vec<Opid>> = affected_wids
             .keys()
             .copied()
-            .map(|wid| {
-                self.pile
-                    .session()
-                    .ops_by_witness_id(wid)
-                    .collect::<Vec<_>>()
-            })
+            .map(|wid| self.pile.session().ops_by_witness_id(wid))
             .collect();
         for opids in opids_per_wid {
             for opid in opids {
@@ -1380,13 +1380,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let wid = published.pub_id();
         let anchor = if self.pile.session().has_witness(wid) {
             let mut prev = self.pile.session().cli_witness(wid);
-            if prev == anchor
-                && self
-                    .pile
-                    .session()
-                    .ops_by_witness_id(wid)
-                    .any(|op| op == opid)
-            {
+            if prev == anchor && self.pile.session().ops_by_witness_id(wid).contains(&opid) {
                 with_consume_stats(|stats| stats.duplicate_witness_updates += 1);
                 return;
             }
@@ -1969,6 +1963,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let output_counts = self
             .ledger
             .operation_output_counts()
+            .into_iter()
             .collect::<HashMap<_, _>>();
         let output_count_entries = output_counts.len();
         let mut operation_decode_fallbacks = 0usize;
@@ -2225,7 +2220,7 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
 
         let db_started_at = Instant::now();
         let mut ps = self.pile.session();
-        let known = ps.op_witness_ids(opid).any(|stored| stored == wid)
+        let known = ps.op_witness_ids(opid).contains(&wid)
             && ps.has_witness(wid)
             && ps.cli_witness(wid) == witness.client;
         let db_elapsed_ms = db_started_at.elapsed().as_millis();
