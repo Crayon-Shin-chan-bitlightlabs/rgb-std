@@ -226,6 +226,25 @@ pub trait PileSession {
         let _ = ops;
     }
 
+    fn known_boundary_opids_by_cells(
+        &mut self,
+        candidates: impl IntoIterator<Item = (Opid, u16)>,
+        known_cells: &HashSet<CellAddr>,
+    ) -> HashSet<Opid> {
+        candidates
+            .into_iter()
+            .filter_map(|(opid, up_to)| {
+                let rels = self.op_relations(opid, up_to);
+                (!rels.defines.is_empty()
+                    && rels
+                        .defines
+                        .keys()
+                        .all(|no| known_cells.contains(&CellAddr::new(opid, *no))))
+                .then_some(opid)
+            })
+            .collect()
+    }
+
     fn op_relations(&mut self, opid: Opid, up_to: u16) -> OpRels<Self::Seal>;
 
     // ── write ─────────────────────────────────────────────────────────────

@@ -55,13 +55,6 @@ fn slow_rgb_stage_elapsed(started_at: Instant) -> Option<u128> {
     (elapsed >= RGB_STD_SLOW_STAGE_THRESHOLD).then_some(elapsed.as_millis())
 }
 
-fn max_selected_consign_ops() -> Option<usize> {
-    env::var("RGB_STD_CONSIGN_MAX_SELECTED_OPS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-}
-
 fn op_aux_cache_max_bytes() -> usize {
     static MAX_BYTES: OnceLock<usize> = OnceLock::new();
     *MAX_BYTES.get_or_init(|| {
@@ -1679,10 +1672,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let known_opids = if trust_known_opids {
             known_opids
         } else {
-            known_opids
-                .into_iter()
-                .filter(|opid| self.op_definitions_known_by_cells(*opid, &known_cells))
-                .collect::<HashSet<_>>()
+            self.known_boundary_opids_by_cells(known_opids, &known_cells)
         };
         // Collect terminal opids
         let terminal_started_at = Instant::now();
@@ -1744,7 +1734,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             published_ops_added,
             "Starting rgb-std consignment operation selection"
         );
-        let max_selected_ops = max_selected_consign_ops();
         let (_, ops) = self
             .ledger
             .with_session(|session| -> io::Result<_> {
@@ -1752,34 +1741,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 let mut selected_opids = HashSet::new();
                 let mut pending_opids = HashSet::new();
                 let mut ordered_opids = Vec::new();
-                macro_rules! ensure_selection_budget {
-                    () => {{
-                        if let Some(max_selected_ops) = max_selected_ops {
-                            let projected_ops =
-                                selected_opids.len().saturating_add(pending_opids.len());
-                            if projected_ops > max_selected_ops {
-                                tracing::warn!(
-                                    operation = "rgb_std",
-                                    stage = "consign_selected_ops_too_large",
-                                    contract_id = ?self.contract_id,
-                                    selected_ops = projected_ops,
-                                    selected_committed_ops = selected_opids.len(),
-                                    selected_pending_ops = pending_opids.len(),
-                                    max_selected_ops,
-                                    known_ops = known_opids.len(),
-                                    raw_known_ops = raw_known_opids,
-                                    known_cells = known_cells.len(),
-                                    trust_known_opids,
-                                    "Rejecting rgb-std consignment during operation selection"
-                                );
-                                return Err(io::Error::other(format!(
-                                    "rgb-std consignment selected operations too large: selected_ops={} max_selected_ops={}",
-                                    projected_ops, max_selected_ops
-                                )));
-                            }
-                        }
-                    }};
-                }
                 macro_rules! include_op_with_dependencies {
                     ($root:expr) => {{
                         let root = $root;
@@ -1788,7 +1749,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                             && !selected_opids.contains(&root)
                             && pending_opids.insert(root)
                         {
-                            ensure_selection_budget!();
                             let mut stack = vec![(root, false)];
                             while let Some((opid, expanded)) = stack.pop() {
                                 if opid == genesis_opid
@@ -1801,7 +1761,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                     pending_opids.remove(&opid);
                                     if selected_opids.insert(opid) {
                                         ordered_opids.push(opid);
-                                        ensure_selection_budget!();
                                     }
                                     continue;
                                 }
@@ -1814,9 +1773,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                         && !known_opids.contains(&prev)
                                         && !selected_opids.contains(&prev)
                                     {
-                                        if pending_opids.insert(prev) {
-                                            ensure_selection_budget!();
-                                        }
+                                        pending_opids.insert(prev);
                                         stack.push((prev, false));
                                     }
                                 }
@@ -1826,9 +1783,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                         && !known_opids.contains(&prev)
                                         && !selected_opids.contains(&prev)
                                     {
-                                        if pending_opids.insert(prev) {
-                                            ensure_selection_budget!();
-                                        }
+                                        pending_opids.insert(prev);
                                         stack.push((prev, false));
                                     }
                                 }
@@ -1839,9 +1794,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                         && !known_opids.contains(&prev)
                                         && !selected_opids.contains(&prev)
                                     {
-                                        if pending_opids.insert(prev) {
-                                            ensure_selection_budget!();
-                                        }
+                                        pending_opids.insert(prev);
                                         stack.push((prev, false));
                                     }
                                 }
@@ -1900,26 +1853,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             .map_err(|err| io::Error::other(err.to_string()))?;
         let count = ops.len() as u32;
         let contract_id = self.contract_id;
-        if let Some(max_selected_ops) = max_selected_ops {
-            if ops.len() > max_selected_ops {
-                tracing::warn!(
-                    operation = "rgb_std",
-                    stage = "consign_selected_ops_too_large",
-                    ?contract_id,
-                    selected_ops = ops.len(),
-                    max_selected_ops,
-                    known_ops = known_opids.len(),
-                    raw_known_ops = raw_known_opids,
-                    known_cells = known_cells.len(),
-                    trust_known_opids,
-                    "Rejecting rgb-std consignment with too many selected operations"
-                );
-                return Err(io::Error::other(format!(
-                    "rgb-std consignment selected operations too large: selected_ops={} max_selected_ops={}",
-                    ops.len(), max_selected_ops
-                )));
-            }
-        }
         let prewarmed_ops = self.prewarm_op_aux_cache(&ops, contract_id)?;
         let mut writer = writer;
         let write_started_at = Instant::now();
@@ -1965,30 +1898,62 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         Ok(())
     }
 
-    fn op_definitions_known_by_cells(
+    fn known_boundary_opids_by_cells(
         &mut self,
-        opid: Opid,
+        known_opids: HashSet<Opid>,
         known_cells: &HashSet<CellAddr>,
-    ) -> bool {
-        if !self.ledger.has_operation(opid) {
+    ) -> HashSet<Opid> {
+        if known_opids.is_empty() || known_cells.is_empty() {
+            return HashSet::new();
+        }
+
+        let started_at = Instant::now();
+        let raw_known_opids = known_opids.len();
+        let mut missing_operations = 0usize;
+        let candidates = known_opids
+            .into_iter()
+            .filter_map(|opid| {
+                if !self.ledger.has_operation(opid) {
+                    missing_operations = missing_operations.saturating_add(1);
+                    return None;
+                }
+                let op = self.ledger.operation(opid);
+                Some((opid, op.destructible_out.len_u16()))
+            })
+            .collect::<Vec<_>>();
+
+        let known_opids = self
+            .pile
+            .session()
+            .known_boundary_opids_by_cells(candidates.iter().copied(), known_cells);
+
+        if missing_operations > 0 {
             tracing::warn!(
                 operation = "rgb_std",
-                stage = "known_boundary_missing_operation",
+                stage = "known_boundary_missing_operations",
                 contract_id = ?self.contract_id,
-                ?opid,
+                raw_known_ops = raw_known_opids,
+                missing_operations,
                 known_cells = known_cells.len(),
-                "Ignoring known opid boundary because operation is missing from stock session"
+                "Ignoring known opid boundaries missing from stock session"
             );
-            return false;
         }
-        let op = self.ledger.operation(opid);
-        let up_to = op.destructible_out.len_u16();
-        let rels = self.pile.session().op_relations(opid, up_to);
-        !rels.defines.is_empty()
-            && rels
-                .defines
-                .keys()
-                .all(|no| known_cells.contains(&CellAddr::new(opid, *no)))
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "known_boundary_filter_opids",
+                elapsed_ms,
+                contract_id = ?self.contract_id,
+                raw_known_ops = raw_known_opids,
+                candidate_ops = candidates.len(),
+                accepted_ops = known_opids.len(),
+                missing_operations,
+                known_cells = known_cells.len(),
+                "Slow rgb-std stage"
+            );
+        }
+
+        known_opids
     }
 
     pub fn consume<E>(
