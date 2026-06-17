@@ -444,7 +444,17 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         for op in known_ops {
             let opid = op.operation.opid();
 
-            if !op.defined_seals.is_empty() {
+            let seals_cached = !op.defined_seals.is_empty()
+                && op.defined_seals.iter().all(|(no, seal)| {
+                    let addr = CellAddr::new(opid, *no);
+                    self.duplicate_seal_def_cache.contains(&addr)
+                        && self
+                            .seal_def_cache
+                            .get(&addr)
+                            .is_some_and(|stored| stored == seal)
+                });
+
+            if !op.defined_seals.is_empty() && !seals_cached {
                 let seals_match = if let Some(up_to) = op
                     .defined_seals
                     .keys()
@@ -474,6 +484,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
             if let Some(witness) = &op.witness {
                 let wid = witness.published.pub_id();
+                if self.duplicate_witness_cache.contains(&(opid, wid)) {
+                    continue;
+                }
+
                 let witness_matches = session.has_witness(wid)
                     && session.cli_witness(wid) == witness.client
                     && session.ops_by_witness_id(wid).any(|stored| stored == opid);
