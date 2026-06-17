@@ -441,6 +441,11 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         }
 
         let mut session = self.pile.session();
+        let preload_ops = known_ops
+            .iter()
+            .map(|op| (op.operation.opid(), op.operation.destructible_out.len_u16()));
+        session.preload_aux_reads(preload_ops);
+
         for op in known_ops {
             let opid = op.operation.opid();
 
@@ -2073,24 +2078,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 tracing::warn!(
                     operation = "rgb_std",
                     stage = "consume_predecode_operations",
-                    elapsed_ms,
-                    contract_id = ?self.contract_id,
-                    operations = operations.len(),
-                    "Slow rgb-std stage"
-                );
-            }
-
-            let preload_started_at = Instant::now();
-            {
-                let preload_ops = operations
-                    .iter()
-                    .map(|op| (op.operation.opid(), op.operation.destructible_out.len_u16()));
-                self.pile.session().preload_aux_reads(preload_ops);
-            }
-            if let Some(elapsed_ms) = slow_rgb_stage_elapsed(preload_started_at) {
-                tracing::warn!(
-                    operation = "rgb_std",
-                    stage = "consume_prewarm_aux_reads",
                     elapsed_ms,
                     contract_id = ?self.contract_id,
                     operations = operations.len(),
