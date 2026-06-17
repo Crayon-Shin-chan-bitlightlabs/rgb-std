@@ -7,7 +7,6 @@ use core::borrow::Borrow;
 use core::cell::RefCell;
 use core::error::Error;
 use core::hash::Hash;
-use core::marker::PhantomData;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::io;
@@ -38,7 +37,7 @@ use strict_types::StrictVal;
 
 use crate::{
     parse_consignment, Consignment, ContractMeta, Identity, Issue, Issuer, IssuerError, IssuerSpec,
-    OpRels, Pile, PileSession, VerifiedOperation, Witness, WitnessStatus,
+    OpRels, Pile, PileSession, VerifiedOperation, Witness, WitnessStatus, MAX_CONSIGNMENT_OPS,
 };
 
 const RGB_STD_SLOW_STAGE_THRESHOLD: Duration = Duration::from_millis(500);
@@ -2036,12 +2035,38 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             let evaluate_started_at = Instant::now();
             let previous_stats =
                 CONSUME_STATS.with(|stats| stats.replace(Some(ConsumeStats::default())));
-            let op_reader = OpReader {
-                stream: reader,
-                seal_resolver,
-                count: u32::MAX,
-                _phantom: PhantomData,
-            };
+            let predecode_started_at = Instant::now();
+            let operations = decode_consignment_operations(reader, seal_resolver)?;
+            if let Some(elapsed_ms) = slow_rgb_stage_elapsed(predecode_started_at) {
+                tracing::warn!(
+                    operation = "rgb_std",
+                    stage = "consume_predecode_operations",
+                    elapsed_ms,
+                    contract_id = ?self.contract_id,
+                    operations = operations.len(),
+                    "Slow rgb-std stage"
+                );
+            }
+
+            let preload_started_at = Instant::now();
+            {
+                let preload_ops = operations
+                    .iter()
+                    .map(|op| (op.operation.opid(), op.operation.destructible_out.len_u16()));
+                self.pile.session().preload_aux_reads(preload_ops);
+            }
+            if let Some(elapsed_ms) = slow_rgb_stage_elapsed(preload_started_at) {
+                tracing::warn!(
+                    operation = "rgb_std",
+                    stage = "consume_prewarm_aux_reads",
+                    elapsed_ms,
+                    contract_id = ?self.contract_id,
+                    operations = operations.len(),
+                    "Slow rgb-std stage"
+                );
+            }
+
+            let op_reader = PredecodedOpReader(VecDeque::from(operations));
             let evaluate_result = self.evaluate_commit(op_reader);
             let stats = CONSUME_STATS
                 .with(|stats| stats.replace(previous_stats))
@@ -2108,46 +2133,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         }
         self.pile.session().commit_transaction();
         Ok(())
-    }
-}
-
-pub struct OpReader<
-    'r,
-    Seal: RgbSeal,
-    R: ReadRaw,
-    F: FnMut(&Operation) -> BTreeMap<u16, Seal::Definition>,
-> {
-    stream: &'r mut StrictReader<R>,
-    count: u32,
-    seal_resolver: F,
-    _phantom: PhantomData<Seal>,
-}
-
-impl<'r, Seal: RgbSeal, R: ReadRaw, F: FnMut(&Operation) -> BTreeMap<u16, Seal::Definition>>
-    ReadOperation for OpReader<'r, Seal, R, F>
-{
-    type Seal = Seal;
-    fn read_operation(
-        &mut self,
-    ) -> Result<Option<OperationSeals<Self::Seal>>, impl Error + 'static> {
-        if self.count == 0 {
-            return Result::<_, DecodeError>::Ok(None);
-        }
-        let operation = Operation::strict_decode(self.stream)?;
-        let mut defined_seals = SmallOrdMap::strict_decode(self.stream)?;
-        with_consume_stats(|stats| stats.decoded_ops += 1);
-        defined_seals
-            .extend((self.seal_resolver)(&operation))
-            .map_err(|_| {
-                DecodeError::DataIntegrityError(format!("too many seals for {}", operation.opid()))
-            })?;
-        let witness = Option::<SealWitness<Seal>>::strict_decode(self.stream)?;
-        if self.count == u32::MAX {
-            self.count = u32::strict_decode(self.stream)?;
-        } else {
-            self.count -= 1;
-        }
-        Ok(Some(OperationSeals { operation, defined_seals, witness }))
     }
 }
 
@@ -2506,6 +2491,53 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         self.include(opid, witness.client, &witness.published);
         self.duplicate_witness_cache.insert((opid, wid));
         self.resolved_seal_cache.retain(|addr, _| addr.opid != opid);
+    }
+}
+
+fn decode_consignment_operations<Seal: RgbSeal, R: ReadRaw>(
+    reader: &mut StrictReader<R>,
+    mut seal_resolver: impl FnMut(&Operation) -> BTreeMap<u16, Seal::Definition>,
+) -> Result<Vec<OperationSeals<Seal>>, DecodeError>
+where
+    Seal::Client: StrictDecode,
+    Seal::Published: StrictDecode,
+    Seal::WitnessId: StrictDecode,
+{
+    let mut operations = Vec::new();
+    let mut count = u32::MAX;
+    loop {
+        if count == 0 {
+            return Ok(operations);
+        }
+
+        let operation = Operation::strict_decode(reader)?;
+        let mut defined_seals = SmallOrdMap::strict_decode(reader)?;
+        with_consume_stats(|stats| stats.decoded_ops += 1);
+        defined_seals
+            .extend(seal_resolver(&operation))
+            .map_err(|_| {
+                DecodeError::DataIntegrityError(format!("too many seals for {}", operation.opid()))
+            })?;
+        let witness = Option::<SealWitness<Seal>>::strict_decode(reader)?;
+        if count == u32::MAX {
+            count = u32::strict_decode(reader)?;
+            operations.reserve(count.min(MAX_CONSIGNMENT_OPS) as usize);
+        } else {
+            count -= 1;
+        }
+        operations.push(OperationSeals { operation, defined_seals, witness });
+    }
+}
+
+struct PredecodedOpReader<Seal: RgbSeal>(VecDeque<OperationSeals<Seal>>);
+
+impl<Seal: RgbSeal> ReadOperation for PredecodedOpReader<Seal> {
+    type Seal = Seal;
+
+    fn read_operation(
+        &mut self,
+    ) -> Result<Option<OperationSeals<Self::Seal>>, impl Error + 'static> {
+        Result::<_, core::convert::Infallible>::Ok(self.0.pop_front())
     }
 }
 
