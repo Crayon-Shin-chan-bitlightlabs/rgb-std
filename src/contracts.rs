@@ -1456,6 +1456,10 @@ where
         &mut self,
         reader: &mut StrictReader<impl ReadRaw>,
         operations: Vec<OperationSeals<<Sp::Pile as Pile>::Seal>>,
+        seal_resolver: impl FnMut(
+            &Operation,
+        )
+            -> BTreeMap<u16, <<Sp::Pile as Pile>::Seal as RgbSeal>::Definition>,
         sig_validator: impl FnOnce(StrictHash, &Identity, &SigBlob) -> Result<(), E>,
     ) -> Result<
         (),
@@ -1481,7 +1485,12 @@ where
             contract.witness_ids().into_iter().collect::<IndexSet<_>>()
         });
         let result = self.with_contract_mut(contract_id, |contract| {
-            contract.consume_internal_predecoded_operations(reader, operations, sig_validator)
+            contract.consume_internal_predecoded_operations(
+                reader,
+                operations,
+                seal_resolver,
+                sig_validator,
+            )
         });
         if result.is_ok() {
             #[cfg(feature = "async")]

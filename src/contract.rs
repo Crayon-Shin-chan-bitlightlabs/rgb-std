@@ -2295,7 +2295,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     pub(crate) fn consume_internal_predecoded_operations<E>(
         &mut self,
         reader: &mut StrictReader<impl ReadRaw>,
-        operations: Vec<OperationSeals<P::Seal>>,
+        mut operations: Vec<OperationSeals<P::Seal>>,
+        mut seal_resolver: impl FnMut(
+            &Operation,
+        ) -> BTreeMap<u16, <P::Seal as RgbSeal>::Definition>,
         sig_validator: impl FnOnce(StrictHash, &Identity, &SigBlob) -> Result<(), E>,
     ) -> Result<(), MultiError<ConsumeError<<P::Seal as RgbSeal>::Definition>, S::Error>>
     where
@@ -2320,6 +2323,18 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 CONSUME_STATS.with(|stats| stats.replace(Some(ConsumeStats::default())));
             let operation_count = operations.len();
             with_consume_stats(|stats| stats.decoded_ops += operation_count);
+
+            for operation_seals in &mut operations {
+                operation_seals
+                    .defined_seals
+                    .extend(seal_resolver(&operation_seals.operation))
+                    .map_err(|_| {
+                        DecodeError::DataIntegrityError(format!(
+                            "too many seals for {}",
+                            operation_seals.operation.opid()
+                        ))
+                    })?;
+            }
 
             let duplicate_cache_started_at = Instant::now();
             self.prewarm_known_operation_duplicate_caches(&operations);
