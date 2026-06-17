@@ -431,6 +431,62 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         self.valid_cache = valid_cache;
     }
 
+    fn prewarm_known_operation_duplicate_caches(&mut self, operations: &[OperationSeals<P::Seal>]) {
+        let known_ops = operations
+            .iter()
+            .filter(|op| self.valid_cache.contains(&op.operation.opid()))
+            .collect::<Vec<_>>();
+        if known_ops.is_empty() {
+            return;
+        }
+
+        let mut session = self.pile.session();
+        for op in known_ops {
+            let opid = op.operation.opid();
+
+            if !op.defined_seals.is_empty() {
+                let seals_match = if let Some(up_to) = op
+                    .defined_seals
+                    .keys()
+                    .next_back()
+                    .and_then(|no| no.checked_add(1))
+                    .filter(|up_to| *up_to <= SEALS_KNOWN_BATCH_UP_TO_MAX)
+                {
+                    let stored = session.seals(opid, up_to);
+                    op.defined_seals.iter().all(|(no, seal)| {
+                        stored.get(no).is_some_and(|stored_seal| stored_seal == seal)
+                    })
+                } else {
+                    op.defined_seals.iter().all(|(no, seal)| {
+                        let addr = CellAddr::new(opid, *no);
+                        session.seal(addr).is_some_and(|stored| stored == *seal)
+                    })
+                };
+
+                if seals_match {
+                    for (no, seal) in &op.defined_seals {
+                        let addr = CellAddr::new(opid, *no);
+                        self.seal_def_cache.insert(addr, seal.clone());
+                        self.duplicate_seal_def_cache.insert(addr);
+                    }
+                }
+            }
+
+            if let Some(witness) = &op.witness {
+                let wid = witness.published.pub_id();
+                let witness_matches = session.has_witness(wid)
+                    && session.cli_witness(wid) == witness.client
+                    && session.ops_by_witness_id(wid).any(|stored| stored == opid);
+                if witness_matches {
+                    self.duplicate_witness_cache.insert((opid, wid));
+                }
+            }
+        }
+
+        drop(session);
+        self.prune_contract_caches();
+    }
+
     fn clear_owned_state_status_cache(&mut self) {
         self.owned_state_status_cache.clear();
     }
@@ -2014,6 +2070,21 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     elapsed_ms,
                     contract_id = ?self.contract_id,
                     operations = operations.len(),
+                    "Slow rgb-std stage"
+                );
+            }
+
+            let duplicate_cache_started_at = Instant::now();
+            self.prewarm_known_operation_duplicate_caches(&operations);
+            if let Some(elapsed_ms) = slow_rgb_stage_elapsed(duplicate_cache_started_at) {
+                tracing::warn!(
+                    operation = "rgb_std",
+                    stage = "consume_prewarm_duplicate_caches",
+                    elapsed_ms,
+                    contract_id = ?self.contract_id,
+                    operations = operations.len(),
+                    duplicate_seal_def_cache_entries = self.duplicate_seal_def_cache.len(),
+                    duplicate_witness_cache_entries = self.duplicate_witness_cache.len(),
                     "Slow rgb-std stage"
                 );
             }
