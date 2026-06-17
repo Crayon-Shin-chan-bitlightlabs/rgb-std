@@ -404,6 +404,8 @@ struct ConsumeStats {
     witness_updates: usize,
     duplicate_witness_updates: usize,
     known_materialized_skips: usize,
+    predecoded_resolver_calls: usize,
+    predecoded_resolver_skips: usize,
 }
 
 thread_local! {
@@ -2392,6 +2394,24 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             with_consume_stats(|stats| stats.decoded_ops += operation_count);
 
             for operation_seals in &mut operations {
+                let definitions_cover_outputs = operation_seals
+                    .operation
+                    .destructible_out
+                    .iter()
+                    .enumerate()
+                    .all(|(op_out, cell)| {
+                        u16::try_from(op_out)
+                            .ok()
+                            .and_then(|op_out| operation_seals.defined_seals.get(&op_out))
+                            .is_some_and(|seal| seal.auth_token() == cell.auth)
+                    });
+
+                if definitions_cover_outputs {
+                    with_consume_stats(|stats| stats.predecoded_resolver_skips += 1);
+                    continue;
+                }
+
+                with_consume_stats(|stats| stats.predecoded_resolver_calls += 1);
                 operation_seals
                     .defined_seals
                     .extend(seal_resolver(&operation_seals.operation))
@@ -2451,6 +2471,8 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     witness_updates = stats.witness_updates,
                     duplicate_witness_updates = stats.duplicate_witness_updates,
                     known_materialized_skips = stats.known_materialized_skips,
+                    predecoded_resolver_calls = stats.predecoded_resolver_calls,
+                    predecoded_resolver_skips = stats.predecoded_resolver_skips,
                     seal_def_cache_entries = self.seal_def_cache.len(),
                     resolved_seal_cache_entries = self.resolved_seal_cache.len(),
                     duplicate_seal_def_cache_entries = self.duplicate_seal_def_cache.len(),
