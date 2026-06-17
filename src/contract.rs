@@ -7,7 +7,6 @@ use core::borrow::Borrow;
 use core::cell::RefCell;
 use core::error::Error;
 use core::hash::Hash;
-use core::marker::PhantomData;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::io;
@@ -369,10 +368,18 @@ pub struct Contract<S: Stock, P: Pile> {
     owned_state_status_cache: OwnedStateStatusCache<<P::Seal as RgbSeal>::WitnessId>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct OpAuxCacheEntry<Seal: RgbSeal> {
     bytes: Vec<u8>,
-    _phantom: PhantomData<Seal>,
+    operation_seals: Arc<OperationSeals<Seal>>,
+}
+
+impl<Seal: RgbSeal> core::fmt::Debug for OpAuxCacheEntry<Seal> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OpAuxCacheEntry")
+            .field("bytes", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1536,11 +1543,41 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     {
         let mem_writer = StrictWriter::with(StreamWriter::in_memory::<{ usize::MAX }>());
         let mem_writer = op.strict_encode(mem_writer)?;
-        let mem_writer = Self::aux_with_session(ps, opid, op, mem_writer)?;
+        let (mem_writer, operation_seals) =
+            Self::aux_operation_seals_with_session(ps, opid, op, mem_writer)?;
         Ok(OpAuxCacheEntry {
             bytes: mem_writer.unbox().unconfine(),
-            _phantom: PhantomData,
+            operation_seals: Arc::new(operation_seals),
         })
+    }
+
+    fn op_aux_cached_operation_seals<W: WriteRaw>(
+        &mut self,
+        opid: Opid,
+        op: &Operation,
+        mut writer: StrictWriter<W>,
+    ) -> io::Result<(StrictWriter<W>, OperationSeals<P::Seal>)>
+    where
+        <P::Seal as RgbSeal>::Client: Clone,
+        <P::Seal as RgbSeal>::Published: Clone,
+    {
+        if let Some(entry) = self.op_aux_cache.get(&opid) {
+            let bytes = entry.bytes.clone();
+            let operation_seals = entry.operation_seals.as_ref().clone();
+            self.touch_op_aux_cache_entry(opid);
+            unsafe {
+                writer.raw_writer().write_raw::<{ usize::MAX }>(&bytes)?;
+            }
+            return Ok((writer, operation_seals));
+        }
+
+        let entry = self.build_op_aux_cache_entry(opid, op)?;
+        let operation_seals = entry.operation_seals.as_ref().clone();
+        unsafe {
+            writer.raw_writer().write_raw::<{ usize::MAX }>(&entry.bytes)?;
+        }
+        self.insert_op_aux_cache_entry(opid, entry);
+        Ok((writer, operation_seals))
     }
 
     fn op_aux_cached<W: WriteRaw>(
@@ -1677,7 +1714,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
     where
+        <P::Seal as RgbSeal>::Client: Clone,
         <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: Clone,
         <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <P::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1690,7 +1729,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<Vec<OperationSeals<P::Seal>>>
     where
+        <P::Seal as RgbSeal>::Client: Clone,
         <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: Clone,
         <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <P::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1712,7 +1753,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
     where
+        <P::Seal as RgbSeal>::Client: Clone,
         <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: Clone,
         <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <P::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1730,7 +1773,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
     where
+        <P::Seal as RgbSeal>::Client: Clone,
         <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: Clone,
         <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <P::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1749,7 +1794,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
     where
+        <P::Seal as RgbSeal>::Client: Clone,
         <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: Clone,
         <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <P::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1772,7 +1819,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<Vec<OperationSeals<P::Seal>>>
     where
+        <P::Seal as RgbSeal>::Client: Clone,
         <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: Clone,
         <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <P::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1803,7 +1852,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
     where
+        <P::Seal as RgbSeal>::Client: Clone,
         <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: Clone,
         <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <P::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1827,7 +1878,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
     where
+        <P::Seal as RgbSeal>::Client: Clone,
         <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: Clone,
         <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <P::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1852,7 +1905,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<Option<Vec<OperationSeals<P::Seal>>>>
     where
+        <P::Seal as RgbSeal>::Client: Clone,
         <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: Clone,
         <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <P::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -2065,11 +2120,13 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
         writer = count.strict_encode(writer)?;
         for (opid, op) in ops {
-            writer = self.op_aux_cached(opid, &op, writer)?;
-
             if let Some(operations) = captured_operations.as_mut() {
-                let mut ps = self.pile.session();
-                operations.push(Self::operation_seals_with_session(&mut ps, opid, &op));
+                let (next_writer, operation_seals) =
+                    self.op_aux_cached_operation_seals(opid, &op, writer)?;
+                writer = next_writer;
+                operations.push(operation_seals);
+            } else {
+                writer = self.op_aux_cached(opid, &op, writer)?;
             }
         }
         if let Some(elapsed_ms) = slow_rgb_stage_elapsed(write_started_at) {

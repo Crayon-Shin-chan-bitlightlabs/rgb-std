@@ -1030,7 +1030,9 @@ where
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
     where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1063,7 +1065,9 @@ where
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
     where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1077,7 +1081,9 @@ where
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<Vec<OperationSeals<<Sp::Pile as Pile>::Seal>>>
     where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1094,7 +1100,9 @@ where
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
     where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1111,7 +1119,9 @@ where
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
     where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1129,7 +1139,9 @@ where
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
     where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1173,7 +1185,9 @@ where
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<Vec<OperationSeals<<Sp::Pile as Pile>::Seal>>>
     where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1225,7 +1239,9 @@ where
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
     where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1272,7 +1288,9 @@ where
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
     where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
