@@ -1962,6 +1962,66 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             .ledger
             .with_session(|session| -> io::Result<_> {
                 let select_ops_started_at = Instant::now();
+
+                let preload_started_at = Instant::now();
+                let parent_ops = session
+                    .operation_parent_ops()
+                    .into_iter()
+                    .collect::<HashMap<_, _>>();
+                let parent_edge_count = parent_ops.values().map(Vec::len).sum::<usize>();
+                let mut preload_opids = HashSet::new();
+                let mut preload_stack = terminal_opids
+                    .iter()
+                    .chain(published_roots.iter())
+                    .copied()
+                    .collect::<Vec<_>>();
+
+                while let Some(opid) = preload_stack.pop() {
+                    if opid == genesis_opid
+                        || known_opids.contains(&opid)
+                        || !preload_opids.insert(opid)
+                    {
+                        continue;
+                    }
+
+                    let Some(parents) = parent_ops.get(&opid) else {
+                        continue;
+                    };
+
+                    for parent in parents {
+                        if *parent != genesis_opid
+                            && !known_opids.contains(parent)
+                            && !preload_opids.contains(parent)
+                        {
+                            preload_stack.push(*parent);
+                        }
+                    }
+                }
+
+                if !preload_opids.is_empty() {
+                    session.preload_operations(preload_opids.iter().copied());
+                    session.preload_transitions(preload_opids.iter().copied());
+                }
+
+                if let Some(elapsed_ms) = slow_rgb_stage_elapsed(preload_started_at) {
+                    tracing::warn!(
+                        operation = "rgb_std",
+                        stage = "consign_preload_selection_ops",
+                        elapsed_ms,
+                        contract_id = ?self.contract_id,
+                        terminal_ops = terminal_opids.len(),
+                        candidate_ops = preload_opids.len(),
+                        known_ops = known_opids.len(),
+                        raw_known_ops = raw_known_opids,
+                        known_cells = known_cells.len(),
+                        parent_ops = parent_ops.len(),
+                        parent_edges = parent_edge_count,
+                        trust_known_opids,
+                        published_ops_added,
+                        "Slow rgb-std stage"
+                    );
+                }
+
                 let mut selected_opids = HashSet::new();
                 let mut pending_opids = HashSet::new();
                 let mut ordered_opids = Vec::new();
@@ -2049,7 +2109,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 for opid in terminal_opids.iter().copied() {
                     include_op_with_dependencies!(opid);
                 }
-                for opid in published_roots {
+                for opid in published_roots.iter().copied() {
                     include_op_with_dependencies!(opid);
                 }
 
