@@ -1987,6 +1987,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 let mut selected_opids = HashSet::new();
                 let mut pending_opids = HashSet::new();
                 let mut ordered_opids = Vec::new();
+                let mut operation_cache = HashMap::new();
                 let mut known_cell_edges_skipped = 0usize;
 
                 macro_rules! include_op_with_dependencies {
@@ -2014,7 +2015,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                 }
 
                                 stack.push((opid, true));
-                                let op = session.operation(opid);
+                                let op = operation_cache
+                                    .entry(opid)
+                                    .or_insert_with(|| session.operation(opid));
                                 for input in &op.immutable_in {
                                     let prev = input.opid;
                                     if prev != genesis_opid
@@ -2025,6 +2028,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                         stack.push((prev, false));
                                     }
                                 }
+
                                 for input in &op.destructible_in {
                                     if known_cells.contains(&input.addr) {
                                         known_cell_edges_skipped =
@@ -2041,6 +2045,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                         stack.push((prev, false));
                                     }
                                 }
+
                                 let st = session.transition(opid);
                                 for addr in st.destroyed.into_keys() {
                                     if known_cells.contains(&addr) {
@@ -2090,7 +2095,12 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 let filter_ops_started_at = Instant::now();
                 let ops = ordered_opids
                     .into_iter()
-                    .map(|opid| (opid, session.operation(opid)))
+                    .map(|opid| {
+                        let op = operation_cache
+                            .remove(&opid)
+                            .unwrap_or_else(|| session.operation(opid));
+                        (opid, op)
+                    })
                     .collect::<Vec<_>>();
                 if let Some(elapsed_ms) = slow_rgb_stage_elapsed(filter_ops_started_at) {
                     tracing::warn!(
