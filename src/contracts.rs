@@ -1118,7 +1118,7 @@ where
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
         let started_at = Instant::now();
-        tracing::warn!(
+        tracing::debug!(
             operation = "rgb_std",
             stage = "contracts_consign_known_boundaries_start",
             ?contract_id,
@@ -1126,7 +1126,7 @@ where
             "Starting rgb-std contracts consignment wrapper"
         );
         let result = self.with_contract_mut(contract_id, |contract| {
-            tracing::warn!(
+            tracing::debug!(
                 operation = "rgb_std",
                 stage = "contracts_consign_known_boundaries_contract_ready",
                 ?contract_id,
@@ -1162,7 +1162,7 @@ where
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
         let started_at = Instant::now();
-        tracing::warn!(
+        tracing::debug!(
             operation = "rgb_std",
             stage = "contracts_consign_known_boundaries_start",
             ?contract_id,
@@ -1170,7 +1170,7 @@ where
             "Starting rgb-std contracts consignment wrapper"
         );
         let result = self.with_contract_mut(contract_id, |contract| {
-            tracing::warn!(
+            tracing::debug!(
                 operation = "rgb_std",
                 stage = "contracts_consign_known_boundaries_contract_ready",
                 ?contract_id,

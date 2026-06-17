@@ -1765,7 +1765,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             }
         }
         let published_ops_added = published_roots.len();
-        tracing::warn!(
+        tracing::debug!(
             operation = "rgb_std",
             stage = "consign_select_start",
             contract_id = ?self.contract_id,
