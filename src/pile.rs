@@ -12,8 +12,11 @@ use std::collections::HashSet;
 use amplify::confinement::SmallOrdMap;
 use hypersonic::Opid;
 use rgb::RgbSeal;
+use single_use_seals::{PublishedWitness, SealWitness};
 
 use crate::CellAddr;
+
+const SEALS_MATCH_BATCH_UP_TO_MAX: u16 = 2048;
 
 /// Witness transaction confirmation status.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Display, Default)]
@@ -214,6 +217,43 @@ pub trait PileSession {
         opid: Opid,
         up_to: u16,
     ) -> SmallOrdMap<u16, <Self::Seal as RgbSeal>::Definition>;
+
+    fn witness_matches(&mut self, opid: Opid, witness: &SealWitness<Self::Seal>) -> bool {
+        let wid = witness.published.pub_id();
+
+        self.op_witness_ids(opid).contains(&wid)
+            && self.has_witness(wid)
+            && self.cli_witness(wid) == witness.client
+    }
+
+    fn seal_definitions_match(
+        &mut self,
+        opid: Opid,
+        seals: &SmallOrdMap<u16, <Self::Seal as RgbSeal>::Definition>,
+    ) -> bool {
+        if seals.is_empty() {
+            return true;
+        }
+
+        if let Some(up_to) = seals
+            .keys()
+            .next_back()
+            .and_then(|no| no.checked_add(1))
+            .filter(|up_to| *up_to <= SEALS_MATCH_BATCH_UP_TO_MAX)
+        {
+            let stored = self.seals(opid, up_to);
+
+            return seals
+                .iter()
+                .all(|(no, seal)| stored.get(no).is_some_and(|stored| stored == seal));
+        }
+
+        seals.iter().all(|(no, seal)| {
+            let addr = CellAddr::new(opid, *no);
+
+            self.seal(addr).is_some_and(|stored| stored == *seal)
+        })
+    }
 
     fn preload_aux_reads(&mut self, ops: impl IntoIterator<Item = (Opid, u16)>) {
         let _ = ops;

@@ -45,7 +45,6 @@ const OP_AUX_CACHE_DEFAULT_MAX_BYTES: usize = 3 * 1024 * 1024;
 const OP_AUX_CACHE_HARD_MAX_BYTES: usize = 64 * 1024 * 1024;
 const CONTRACT_CACHE_DEFAULT_MAX_ENTRIES: usize = 50_000;
 const CONTRACT_CACHE_HARD_MAX_ENTRIES: usize = 250_000;
-const SEALS_KNOWN_BATCH_UP_TO_MAX: u16 = 2048;
 const OWNED_STATE_STATUS_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const OWNED_STATE_STATUS_CACHE_MAX_OPS: usize = 50_000;
 const OWNED_STATE_STATUS_CACHE_MAX_WITNESSES: usize = 50_000;
@@ -476,25 +475,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 });
 
             if !op.defined_seals.is_empty() && !seals_cached {
-                let seals_match = if let Some(up_to) = op
-                    .defined_seals
-                    .keys()
-                    .next_back()
-                    .and_then(|no| no.checked_add(1))
-                    .filter(|up_to| *up_to <= SEALS_KNOWN_BATCH_UP_TO_MAX)
-                {
-                    let stored = session.seals(opid, up_to);
-                    op.defined_seals.iter().all(|(no, seal)| {
-                        stored
-                            .get(no)
-                            .is_some_and(|stored_seal| stored_seal == seal)
-                    })
-                } else {
-                    op.defined_seals.iter().all(|(no, seal)| {
-                        let addr = CellAddr::new(opid, *no);
-                        session.seal(addr).is_some_and(|stored| stored == *seal)
-                    })
-                };
+                let seals_match = session.seal_definitions_match(opid, &op.defined_seals);
 
                 if seals_match {
                     for (no, seal) in &op.defined_seals {
@@ -511,9 +492,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     continue;
                 }
 
-                let witness_matches = session.op_witness_ids(opid).contains(&wid)
-                    && session.has_witness(wid)
-                    && session.cli_witness(wid) == witness.client;
+                let witness_matches = session.witness_matches(opid, witness);
                 if witness_matches {
                     self.duplicate_witness_cache.insert((opid, wid));
                 }
@@ -1467,11 +1446,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     {
         let defined_seals = ps.seals(opid, op.destructible_out.len_u16());
         let witness = Self::retrieve_with_session(ps, opid);
-        OperationSeals {
-            operation: op.clone(),
-            defined_seals,
-            witness,
-        }
+        OperationSeals { operation: op.clone(), defined_seals, witness }
     }
 
     fn genesis_operation_for_verification(&self) -> Operation {
@@ -1576,7 +1551,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let entry = self.build_op_aux_cache_entry(opid, op)?;
         let operation_seals = entry.operation_seals.as_ref().clone();
         unsafe {
-            writer.raw_writer().write_raw::<{ usize::MAX }>(&entry.bytes)?;
+            writer
+                .raw_writer()
+                .write_raw::<{ usize::MAX }>(&entry.bytes)?;
         }
         self.insert_op_aux_cache_entry(opid, entry);
         Ok((writer, operation_seals))
@@ -1599,7 +1576,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
         let entry = self.build_op_aux_cache_entry(opid, op)?;
         unsafe {
-            writer.raw_writer().write_raw::<{ usize::MAX }>(&entry.bytes)?;
+            writer
+                .raw_writer()
+                .write_raw::<{ usize::MAX }>(&entry.bytes)?;
         }
         self.insert_op_aux_cache_entry(opid, entry);
         Ok(writer)
@@ -2127,8 +2106,8 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let contract_id = self.contract_id;
         let prewarmed_ops = self.prewarm_op_aux_cache(&ops, contract_id)?;
         let mut writer = writer;
-        let mut captured_operations = capture_operations
-            .then(|| Vec::with_capacity(ops.len().saturating_add(1)));
+        let mut captured_operations =
+            capture_operations.then(|| Vec::with_capacity(ops.len().saturating_add(1)));
         let write_started_at = Instant::now();
         let genesis_op = self.genesis_operation_for_verification();
         writer = 0u8.strict_encode(writer)?; // DEEDS_VERSION = 0
@@ -2393,9 +2372,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         &mut self,
         reader: &mut StrictReader<impl ReadRaw>,
         mut operations: Vec<OperationSeals<P::Seal>>,
-        mut seal_resolver: impl FnMut(
-            &Operation,
-        ) -> BTreeMap<u16, <P::Seal as RgbSeal>::Definition>,
+        mut seal_resolver: impl FnMut(&Operation) -> BTreeMap<u16, <P::Seal as RgbSeal>::Definition>,
         sig_validator: impl FnOnce(StrictHash, &Identity, &SigBlob) -> Result<(), E>,
     ) -> Result<(), MultiError<ConsumeError<<P::Seal as RgbSeal>::Definition>, S::Error>>
     where
@@ -2705,60 +2682,9 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
             return true;
         }
 
-        let missing = seals
-            .iter()
-            .filter_map(|(no, seal)| {
-                let addr = CellAddr::new(opid, *no);
-                if self
-                    .seal_def_cache
-                    .get(&addr)
-                    .is_some_and(|stored| stored == seal)
-                {
-                    return None;
-                }
-                if let Some(stored) = self.external_seal_def_cache.get(&addr) {
-                    if stored == seal {
-                        self.seal_def_cache.insert(addr, stored.clone());
-                        return None;
-                    }
-                }
-                Some((*no, seal.clone()))
-            })
-            .collect::<Vec<_>>();
-
         let db_started_at = Instant::now();
         let mut ps = self.pile.session();
-        let known = if let Some(up_to) = seals
-            .keys()
-            .next_back()
-            .and_then(|no| no.checked_add(1))
-            .filter(|up_to| *up_to <= SEALS_KNOWN_BATCH_UP_TO_MAX)
-        {
-            let stored = ps.seals(opid, up_to);
-            missing.into_iter().all(|(no, seal)| {
-                let Some(stored_seal) = stored.get(&no) else {
-                    return false;
-                };
-                if *stored_seal != seal {
-                    return false;
-                }
-                self.seal_def_cache
-                    .insert(CellAddr::new(opid, no), stored_seal.clone());
-                true
-            })
-        } else {
-            missing.into_iter().all(|(no, seal)| {
-                let addr = CellAddr::new(opid, no);
-                let Some(stored) = ps.seal(addr) else {
-                    return false;
-                };
-                if stored != seal {
-                    return false;
-                }
-                self.seal_def_cache.insert(addr, stored);
-                true
-            })
-        };
+        let known = ps.seal_definitions_match(opid, seals);
         drop(ps);
         let db_elapsed_ms = db_started_at.elapsed().as_millis();
         with_consume_stats(|stats| {
@@ -2768,6 +2694,11 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         self.prune_contract_caches();
 
         if known {
+            self.seal_def_cache.extend(
+                seals
+                    .iter()
+                    .map(|(no, seal)| (CellAddr::new(opid, *no), seal.clone())),
+            );
             self.duplicate_seal_def_cache
                 .extend(seals.keys().map(|no| CellAddr::new(opid, *no)));
             self.prune_contract_caches();
@@ -2837,39 +2768,14 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
             true
         } else {
             let mut ps = self.pile.session();
-            if let Some(up_to) = seals
-                .keys()
-                .next_back()
-                .and_then(|no| no.checked_add(1))
-                .filter(|up_to| *up_to <= SEALS_KNOWN_BATCH_UP_TO_MAX)
-            {
-                let stored = ps.seals(opid, up_to);
-                missing.into_iter().all(|(no, seal)| {
-                    let Some(stored_seal) = stored.get(&no) else {
-                        return false;
-                    };
-                    if *stored_seal != seal {
-                        return false;
-                    }
-                    self.seal_def_cache
-                        .insert(CellAddr::new(opid, no), stored_seal.clone());
-                    true
-                })
-            } else {
-                missing.into_iter().all(|(no, seal)| {
-                    let addr = CellAddr::new(opid, no);
-                    let Some(stored) = ps.seal(addr) else {
-                        return false;
-                    };
-                    if stored != seal {
-                        return false;
-                    }
-                    self.seal_def_cache.insert(addr, stored);
-                    true
-                })
-            }
+            ps.seal_definitions_match(opid, &seals)
         };
         if duplicate {
+            self.seal_def_cache.extend(
+                seals
+                    .iter()
+                    .map(|(no, seal)| (CellAddr::new(opid, *no), seal.clone())),
+            );
             self.duplicate_seal_def_cache
                 .extend(seals.keys().map(|no| CellAddr::new(opid, *no)));
             self.prune_contract_caches();
