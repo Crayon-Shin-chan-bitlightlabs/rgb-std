@@ -1672,6 +1672,16 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         self.consign_with_known_opids(terminals, std::iter::empty::<Opid>(), writer)
     }
 
+    pub fn terminal_opids(
+        &self,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+    ) -> BTreeSet<Opid> {
+        terminals
+            .into_iter()
+            .map(|terminal| self.ledger.state().addr(*terminal.borrow()).opid)
+            .collect()
+    }
+
     pub fn consign_predecoded(
         &mut self,
         terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,

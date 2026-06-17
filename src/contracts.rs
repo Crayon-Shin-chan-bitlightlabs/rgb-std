@@ -22,7 +22,7 @@
 // or implied. See the License for the specific language governing permissions and limitations under
 // the License.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use core::borrow::Borrow;
 use core::cell::RefCell;
 #[cfg(feature = "async")]
@@ -1072,6 +1072,18 @@ where
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
         self.with_contract_mut(contract_id, |contract| contract.consign(terminals, writer))
+    }
+
+    pub fn terminal_opids(
+        &self,
+        contract_id: ContractId,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+    ) -> BTreeSet<Opid> {
+        self.with_contract(
+            contract_id,
+            |contract| contract.terminal_opids(terminals),
+            None,
+        )
     }
 
     pub fn consign_predecoded(
