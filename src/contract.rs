@@ -15,7 +15,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use amplify::confinement::SmallOrdMap;
-use amplify::{IoError, MultiError};
+use amplify::{ByteArray, IoError, MultiError};
 use chrono::{DateTime, Utc};
 use commit_verify::{ReservedBytes, StrictHash};
 use hypersonic::{
@@ -1465,6 +1465,16 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         }
     }
 
+    fn genesis_operation_for_verification(&self) -> Operation {
+        let codex_id = self.ledger.articles().codex_id();
+        let genesis_contract_id = ContractId::from_byte_array(codex_id.to_byte_array());
+
+        self.ledger
+            .articles()
+            .genesis()
+            .to_operation(genesis_contract_id)
+    }
+
     fn remove_op_aux_cache_entry(&mut self, opid: Opid) {
         if let Some(entry) = self.op_aux_cache.remove(&opid) {
             self.op_aux_cache_bytes = self.op_aux_cache_bytes.saturating_sub(entry.bytes.len());
@@ -1647,7 +1657,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let contract_id = self.contract_id;
         // Encode articles section before calling self.aux (which borrows self.pile)
         let genesis_opid = self.ledger.articles().genesis_opid();
-        let genesis_op = self.ledger.articles().genesis().to_operation(contract_id);
+        let genesis_op = self.genesis_operation_for_verification();
         let mut w = writer;
         w = 0u8.strict_encode(w)?; // DEEDS_VERSION = 0
         w = contract_id.strict_encode(w)?;
@@ -2037,7 +2047,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let mut captured_operations = capture_operations
             .then(|| Vec::with_capacity(ops.len().saturating_add(1)));
         let write_started_at = Instant::now();
-        let genesis_op = self.ledger.articles().genesis().to_operation(contract_id);
+        let genesis_op = self.genesis_operation_for_verification();
         writer = 0u8.strict_encode(writer)?; // DEEDS_VERSION = 0
         writer = contract_id.strict_encode(writer)?;
         writer = 0u8.strict_encode(writer)?;
