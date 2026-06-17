@@ -428,6 +428,26 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         prune_hashset_to(&mut self.duplicate_witness_cache, max_entries);
     }
 
+    fn known_operation_aux_is_cached(&self, operation_seals: &OperationSeals<P::Seal>) -> bool {
+        let opid = operation_seals.operation.opid();
+
+        let seals_cached = operation_seals.defined_seals.iter().all(|(no, seal)| {
+            let addr = CellAddr::new(opid, *no);
+
+            self.seal_def_cache
+                .get(&addr)
+                .is_some_and(|stored| stored == seal)
+        });
+
+        let witness_cached = operation_seals.witness.as_ref().is_none_or(|witness| {
+            let wid = witness.published.pub_id();
+
+            self.duplicate_witness_cache.contains(&(opid, wid))
+        });
+
+        seals_cached && witness_cached
+    }
+
     fn refresh_valid_cache(&mut self) {
         let genesis_opid = self.ledger.articles().genesis_opid();
         let valid_cache = self
@@ -450,6 +470,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let known_ops = operations
             .iter()
             .filter(|op| self.valid_cache.contains(&op.operation.opid()))
+            .filter(|op| !self.known_operation_aux_is_cached(op))
             .collect::<Vec<_>>();
         if known_ops.is_empty() {
             return;
@@ -2877,7 +2898,9 @@ mod fs {
             terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
         ) -> io::Result<()>
         where
+            <P::Seal as RgbSeal>::Client: Clone,
             <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+            <P::Seal as RgbSeal>::Published: Clone,
             <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
             <P::Seal as RgbSeal>::WitnessId: StrictEncode,
         {

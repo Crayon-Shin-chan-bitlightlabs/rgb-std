@@ -1637,7 +1637,9 @@ mod _fs {
             terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
         ) -> io::Result<()>
         where
+            <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
             <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+            <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
             <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
             <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
         {
