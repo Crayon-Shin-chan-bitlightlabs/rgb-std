@@ -1952,14 +1952,26 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
         let started_at = Instant::now();
         let raw_known_opids = known_opids.len();
+        let output_counts = self
+            .ledger
+            .operation_output_counts()
+            .collect::<HashMap<_, _>>();
+        let output_count_entries = output_counts.len();
+        let mut operation_decode_fallbacks = 0usize;
         let mut missing_operations = 0usize;
         let candidates = known_opids
             .into_iter()
             .filter_map(|opid| {
+                if let Some(count) = output_counts.get(&opid).copied() {
+                    return Some((opid, count));
+                }
+
                 if !self.ledger.has_operation(opid) {
                     missing_operations = missing_operations.saturating_add(1);
                     return None;
                 }
+
+                operation_decode_fallbacks = operation_decode_fallbacks.saturating_add(1);
                 let op = self.ledger.operation(opid);
                 Some((opid, op.destructible_out.len_u16()))
             })
@@ -1977,6 +1989,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 contract_id = ?self.contract_id,
                 raw_known_ops = raw_known_opids,
                 missing_operations,
+                operation_decode_fallbacks,
                 known_cells = known_cells.len(),
                 "Ignoring known opid boundaries missing from stock session"
             );
@@ -1991,6 +2004,8 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 candidate_ops = candidates.len(),
                 accepted_ops = known_opids.len(),
                 missing_operations,
+                operation_decode_fallbacks,
+                output_count_entries,
                 known_cells = known_cells.len(),
                 "Slow rgb-std stage"
             );
