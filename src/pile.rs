@@ -11,12 +11,27 @@ use std::collections::HashSet;
 
 use amplify::confinement::SmallOrdMap;
 use hypersonic::Opid;
-use rgb::RgbSeal;
+use rgb::{OperationSeals, RgbSeal};
 use single_use_seals::{PublishedWitness, SealWitness};
 
 use crate::CellAddr;
 
 const SEALS_MATCH_BATCH_UP_TO_MAX: u16 = 2048;
+
+#[derive(Clone, Debug)]
+pub struct KnownOperationAuxMatches<Seal: RgbSeal> {
+    pub seal_definitions: Vec<(CellAddr, Seal::Definition)>,
+    pub witnesses: Vec<(Opid, Seal::WitnessId)>,
+}
+
+impl<Seal: RgbSeal> Default for KnownOperationAuxMatches<Seal> {
+    fn default() -> Self {
+        Self {
+            seal_definitions: Vec::new(),
+            witnesses: Vec::new(),
+        }
+    }
+}
 
 /// Witness transaction confirmation status.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Display, Default)]
@@ -253,6 +268,36 @@ pub trait PileSession {
 
             self.seal(addr).is_some_and(|stored| stored == *seal)
         })
+    }
+
+    fn known_operation_aux_matches(
+        &mut self,
+        operations: &[&OperationSeals<Self::Seal>],
+    ) -> KnownOperationAuxMatches<Self::Seal> {
+        let mut matches = KnownOperationAuxMatches::default();
+
+        for operation_seals in operations {
+            let opid = operation_seals.operation.opid();
+
+            if !operation_seals.defined_seals.is_empty()
+                && self.seal_definitions_match(opid, &operation_seals.defined_seals)
+            {
+                matches.seal_definitions.extend(
+                    operation_seals
+                        .defined_seals
+                        .iter()
+                        .map(|(no, seal)| (CellAddr::new(opid, *no), seal.clone())),
+                );
+            }
+
+            if let Some(witness) = &operation_seals.witness {
+                if self.witness_matches(opid, witness) {
+                    matches.witnesses.push((opid, witness.published.pub_id()));
+                }
+            }
+        }
+
+        matches
     }
 
     fn preload_aux_reads(&mut self, ops: impl IntoIterator<Item = (Opid, u16)>) {

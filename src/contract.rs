@@ -456,50 +456,18 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         }
 
         let mut session = self.pile.session();
-        let preload_ops = known_ops
-            .iter()
-            .map(|op| (op.operation.opid(), op.operation.destructible_out.len_u16()));
-        session.preload_aux_reads(preload_ops);
+        let aux_matches = session.known_operation_aux_matches(&known_ops);
+        drop(session);
 
-        for op in known_ops {
-            let opid = op.operation.opid();
-
-            let seals_cached = !op.defined_seals.is_empty()
-                && op.defined_seals.iter().all(|(no, seal)| {
-                    let addr = CellAddr::new(opid, *no);
-                    self.duplicate_seal_def_cache.contains(&addr)
-                        && self
-                            .seal_def_cache
-                            .get(&addr)
-                            .is_some_and(|stored| stored == seal)
-                });
-
-            if !op.defined_seals.is_empty() && !seals_cached {
-                let seals_match = session.seal_definitions_match(opid, &op.defined_seals);
-
-                if seals_match {
-                    for (no, seal) in &op.defined_seals {
-                        let addr = CellAddr::new(opid, *no);
-                        self.seal_def_cache.insert(addr, seal.clone());
-                        self.duplicate_seal_def_cache.insert(addr);
-                    }
-                }
-            }
-
-            if let Some(witness) = &op.witness {
-                let wid = witness.published.pub_id();
-                if self.duplicate_witness_cache.contains(&(opid, wid)) {
-                    continue;
-                }
-
-                let witness_matches = session.witness_matches(opid, witness);
-                if witness_matches {
-                    self.duplicate_witness_cache.insert((opid, wid));
-                }
-            }
+        for (addr, seal) in aux_matches.seal_definitions {
+            self.seal_def_cache.insert(addr, seal);
+            self.duplicate_seal_def_cache.insert(addr);
         }
 
-        drop(session);
+        for (opid, wid) in aux_matches.witnesses {
+            self.duplicate_witness_cache.insert((opid, wid));
+        }
+
         self.prune_contract_caches();
     }
 
