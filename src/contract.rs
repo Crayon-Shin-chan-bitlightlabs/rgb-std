@@ -1983,7 +1983,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             .known_boundary_opids_by_cells(candidates.iter().copied(), known_cells);
 
         if missing_operations > 0 {
-            tracing::warn!(
+            tracing::debug!(
                 operation = "rgb_std",
                 stage = "known_boundary_missing_operations",
                 contract_id = ?self.contract_id,
