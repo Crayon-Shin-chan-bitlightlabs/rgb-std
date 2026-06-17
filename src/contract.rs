@@ -419,6 +419,72 @@ fn with_consume_stats(update: impl FnOnce(&mut ConsumeStats)) {
     });
 }
 
+struct SelectionPreloadPlan {
+    opids: HashSet<Opid>,
+    parent_ops: usize,
+    parent_edges: usize,
+}
+
+impl SelectionPreloadPlan {
+    fn from_parent_ops(
+        parent_ops: HashMap<Opid, Vec<Opid>>,
+        roots: impl IntoIterator<Item = Opid>,
+        known_opids: &HashSet<Opid>,
+        genesis_opid: Opid,
+    ) -> Self {
+        let parent_count = parent_ops.len();
+        let parent_edges = parent_ops.values().map(Vec::len).sum::<usize>();
+        let mut opids = HashSet::new();
+        let mut stack = roots.into_iter().collect::<Vec<_>>();
+
+        while let Some(opid) = stack.pop() {
+            if opid == genesis_opid || known_opids.contains(&opid) || !opids.insert(opid) {
+                continue;
+            }
+
+            let Some(parents) = parent_ops.get(&opid) else {
+                continue;
+            };
+
+            for parent in parents {
+                if *parent != genesis_opid
+                    && !known_opids.contains(parent)
+                    && !opids.contains(parent)
+                {
+                    stack.push(*parent);
+                }
+            }
+        }
+
+        Self {
+            opids,
+            parent_ops: parent_count,
+            parent_edges,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.opids.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.opids.is_empty()
+    }
+}
+
+trait SelectionPreloadSession: StockSession {
+    fn preload_selection_plan(&mut self, plan: &SelectionPreloadPlan) {
+        if plan.is_empty() {
+            return;
+        }
+
+        self.preload_operations(plan.opids.iter().copied());
+        self.preload_transitions(plan.opids.iter().copied());
+    }
+}
+
+impl<T: StockSession> SelectionPreloadSession for T {}
+
 impl<S: Stock, P: Pile> Contract<S, P> {
     fn prune_contract_caches(&mut self) {
         let max_entries = contract_cache_max_entries();
@@ -1964,44 +2030,20 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 let select_ops_started_at = Instant::now();
 
                 let preload_started_at = Instant::now();
-                let parent_ops = session
-                    .operation_parent_ops()
-                    .into_iter()
-                    .collect::<HashMap<_, _>>();
-                let parent_edge_count = parent_ops.values().map(Vec::len).sum::<usize>();
-                let mut preload_opids = HashSet::new();
-                let mut preload_stack = terminal_opids
+                let preload_roots = terminal_opids
                     .iter()
                     .chain(published_roots.iter())
-                    .copied()
-                    .collect::<Vec<_>>();
-
-                while let Some(opid) = preload_stack.pop() {
-                    if opid == genesis_opid
-                        || known_opids.contains(&opid)
-                        || !preload_opids.insert(opid)
-                    {
-                        continue;
-                    }
-
-                    let Some(parents) = parent_ops.get(&opid) else {
-                        continue;
-                    };
-
-                    for parent in parents {
-                        if *parent != genesis_opid
-                            && !known_opids.contains(parent)
-                            && !preload_opids.contains(parent)
-                        {
-                            preload_stack.push(*parent);
-                        }
-                    }
-                }
-
-                if !preload_opids.is_empty() {
-                    session.preload_operations(preload_opids.iter().copied());
-                    session.preload_transitions(preload_opids.iter().copied());
-                }
+                    .copied();
+                let preload_plan = SelectionPreloadPlan::from_parent_ops(
+                    session
+                        .operation_parent_ops()
+                        .into_iter()
+                        .collect::<HashMap<_, _>>(),
+                    preload_roots,
+                    &known_opids,
+                    genesis_opid,
+                );
+                session.preload_selection_plan(&preload_plan);
 
                 if let Some(elapsed_ms) = slow_rgb_stage_elapsed(preload_started_at) {
                     tracing::warn!(
@@ -2010,12 +2052,12 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                         elapsed_ms,
                         contract_id = ?self.contract_id,
                         terminal_ops = terminal_opids.len(),
-                        candidate_ops = preload_opids.len(),
+                        candidate_ops = preload_plan.len(),
                         known_ops = known_opids.len(),
                         raw_known_ops = raw_known_opids,
                         known_cells = known_cells.len(),
-                        parent_ops = parent_ops.len(),
-                        parent_edges = parent_edge_count,
+                        parent_ops = preload_plan.parent_ops,
+                        parent_edges = preload_plan.parent_edges,
                         trust_known_opids,
                         published_ops_added,
                         "Slow rgb-std stage"
