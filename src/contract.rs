@@ -485,6 +485,72 @@ trait SelectionPreloadSession: StockSession {
 
 impl<T: StockSession> SelectionPreloadSession for T {}
 
+struct ConsignmentSelectionBoundaries {
+    known_cells: HashSet<CellAddr>,
+    known_opids: HashSet<Opid>,
+    immutable_checkpoint_opids: HashSet<Opid>,
+    raw_known_opids: usize,
+    raw_immutable_checkpoint_opids: usize,
+    trust_known_opids: bool,
+}
+
+impl ConsignmentSelectionBoundaries {
+    fn new(
+        known_opids: HashSet<Opid>,
+        known_cells: HashSet<CellAddr>,
+        immutable_checkpoint_opids: HashSet<Opid>,
+        trust_known_opids: bool,
+    ) -> Self {
+        Self {
+            raw_known_opids: known_opids.len(),
+            raw_immutable_checkpoint_opids: immutable_checkpoint_opids.len(),
+            known_cells,
+            known_opids,
+            immutable_checkpoint_opids,
+            trust_known_opids,
+        }
+    }
+
+    fn filter_known_opids<S: Stock, P: Pile>(&mut self, contract: &mut Contract<S, P>)
+    where
+        <P::Seal as RgbSeal>::Client: Clone,
+        <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: Clone,
+        <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        if self.trust_known_opids {
+            return;
+        }
+
+        let known_opids = core::mem::take(&mut self.known_opids);
+        self.known_opids = contract.known_boundary_opids_by_cells(known_opids, &self.known_cells);
+    }
+
+    fn prune_checkpoint_opids(&mut self, genesis_opid: Opid) {
+        self.immutable_checkpoint_opids.remove(&genesis_opid);
+        for opid in &self.known_opids {
+            self.immutable_checkpoint_opids.remove(opid);
+        }
+    }
+
+    fn skips_operation(&self, opid: &Opid) -> bool {
+        self.known_opids.contains(opid)
+    }
+
+    fn skips_immutable_dependency(&self, opid: &Opid) -> bool {
+        self.known_opids.contains(opid) || self.immutable_checkpoint_opids.contains(opid)
+    }
+
+    fn skips_destructible_dependency(&self, opid: &Opid) -> bool {
+        self.known_opids.contains(opid)
+    }
+
+    fn has_known_cells(&self, addr: &CellAddr) -> bool {
+        self.known_cells.contains(addr)
+    }
+}
+
 impl<S: Stock, P: Pile> Contract<S, P> {
     fn prune_contract_caches(&mut self) {
         let max_entries = contract_cache_max_entries();
@@ -878,6 +944,11 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             .into_iter()
             .filter_map(|addr| self.known_seal(addr).map(|seal| (addr, seal)))
             .collect()
+    }
+
+    pub fn valid_opids(&mut self) -> Vec<Opid> {
+        self.refresh_valid_cache();
+        self.valid_cache.iter().copied().collect()
     }
 
     pub fn extend_external_resolved_seals(
@@ -1785,6 +1856,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             terminals,
             HashSet::new(),
             HashSet::new(),
+            HashSet::new(),
             false,
             true,
             writer,
@@ -1883,6 +1955,87 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             terminals,
             known_opids,
             known_cells,
+            HashSet::new(),
+            false,
+            true,
+            writer,
+        )
+        .map(Option::unwrap_or_default)
+    }
+
+    pub fn consign_with_known_cells_opids_and_immutable_checkpoints(
+        &mut self,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+        known_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        immutable_checkpoint_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<()>
+    where
+        <P::Seal as RgbSeal>::Client: Clone,
+        <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: Clone,
+        <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        let known_cells = known_cells
+            .into_iter()
+            .map(|cell| *cell.borrow())
+            .collect::<HashSet<_>>();
+        let known_opids = known_opids
+            .into_iter()
+            .map(|opid| *opid.borrow())
+            .collect::<HashSet<_>>();
+        let immutable_checkpoint_opids = immutable_checkpoint_opids
+            .into_iter()
+            .map(|opid| *opid.borrow())
+            .collect::<HashSet<_>>();
+
+        self.consign_with_known_boundaries_impl(
+            terminals,
+            known_opids,
+            known_cells,
+            immutable_checkpoint_opids,
+            false,
+            false,
+            writer,
+        )
+        .map(drop)
+    }
+
+    pub fn consign_with_known_cells_opids_and_immutable_checkpoints_predecoded(
+        &mut self,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+        known_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        immutable_checkpoint_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<Vec<OperationSeals<P::Seal>>>
+    where
+        <P::Seal as RgbSeal>::Client: Clone,
+        <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: Clone,
+        <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        let known_cells = known_cells
+            .into_iter()
+            .map(|cell| *cell.borrow())
+            .collect::<HashSet<_>>();
+        let known_opids = known_opids
+            .into_iter()
+            .map(|opid| *opid.borrow())
+            .collect::<HashSet<_>>();
+        let immutable_checkpoint_opids = immutable_checkpoint_opids
+            .into_iter()
+            .map(|opid| *opid.borrow())
+            .collect::<HashSet<_>>();
+
+        self.consign_with_known_boundaries_impl(
+            terminals,
+            known_opids,
+            known_cells,
+            immutable_checkpoint_opids,
             false,
             true,
             writer,
@@ -1934,6 +2087,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             terminals,
             known_opids,
             known_cells,
+            HashSet::new(),
             trust_known_opids,
             false,
             writer,
@@ -1946,6 +2100,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
         known_opids: HashSet<Opid>,
         known_cells: HashSet<CellAddr>,
+        immutable_checkpoint_opids: HashSet<Opid>,
         trust_known_opids: bool,
         capture_operations: bool,
         writer: StrictWriter<impl WriteRaw>,
@@ -1958,12 +2113,14 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         <P::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
         let total_started_at = Instant::now();
-        let raw_known_opids = known_opids.len();
-        let known_opids = if trust_known_opids {
-            known_opids
-        } else {
-            self.known_boundary_opids_by_cells(known_opids, &known_cells)
-        };
+        let mut boundaries = ConsignmentSelectionBoundaries::new(
+            known_opids,
+            known_cells,
+            immutable_checkpoint_opids,
+            trust_known_opids,
+        );
+        boundaries.filter_known_opids(self);
+
         // Collect terminal opids
         let terminal_started_at = Instant::now();
         let terminal_opids: BTreeSet<Opid> = terminals
@@ -1983,6 +2140,8 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         // Match Ledger::export_aux semantics: follow destroyed cells backwards from
         // terminals and include published global-state definitions required by validation.
         let genesis_opid = self.ledger.articles().genesis_opid();
+        boundaries.prune_checkpoint_opids(genesis_opid);
+
         let mut published_roots = BTreeSet::new();
         {
             let articles = self.ledger.articles();
@@ -2017,10 +2176,12 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             stage = "consign_select_start",
             contract_id = ?self.contract_id,
             terminal_ops = terminal_opids.len(),
-            known_ops = known_opids.len(),
-            raw_known_ops = raw_known_opids,
-            known_cells = known_cells.len(),
-            trust_known_opids,
+            known_ops = boundaries.known_opids.len(),
+            raw_known_ops = boundaries.raw_known_opids,
+            known_cells = boundaries.known_cells.len(),
+            immutable_checkpoint_ops = boundaries.immutable_checkpoint_opids.len(),
+            raw_immutable_checkpoint_ops = boundaries.raw_immutable_checkpoint_opids,
+            trust_known_opids = boundaries.trust_known_opids,
             published_ops_added,
             "Starting rgb-std consignment operation selection"
         );
@@ -2040,7 +2201,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                         .into_iter()
                         .collect::<HashMap<_, _>>(),
                     preload_roots,
-                    &known_opids,
+                    &boundaries.known_opids,
                     genesis_opid,
                 );
                 session.preload_selection_plan(&preload_plan);
@@ -2053,12 +2214,14 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                         contract_id = ?self.contract_id,
                         terminal_ops = terminal_opids.len(),
                         candidate_ops = preload_plan.len(),
-                        known_ops = known_opids.len(),
-                        raw_known_ops = raw_known_opids,
-                        known_cells = known_cells.len(),
+                        known_ops = boundaries.known_opids.len(),
+                        raw_known_ops = boundaries.raw_known_opids,
+                        known_cells = boundaries.known_cells.len(),
+                        immutable_checkpoint_ops = boundaries.immutable_checkpoint_opids.len(),
+                        raw_immutable_checkpoint_ops = boundaries.raw_immutable_checkpoint_opids,
                         parent_ops = preload_plan.parent_ops,
                         parent_edges = preload_plan.parent_edges,
-                        trust_known_opids,
+                        trust_known_opids = boundaries.trust_known_opids,
                         published_ops_added,
                         "Slow rgb-std stage"
                     );
@@ -2074,14 +2237,14 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     ($root:expr) => {{
                         let root = $root;
                         if root != genesis_opid
-                            && !known_opids.contains(&root)
+                            && !boundaries.skips_operation(&root)
                             && !selected_opids.contains(&root)
                             && pending_opids.insert(root)
                         {
                             let mut stack = vec![(root, false)];
                             while let Some((opid, expanded)) = stack.pop() {
                                 if opid == genesis_opid
-                                    || known_opids.contains(&opid)
+                                    || boundaries.skips_operation(&opid)
                                     || selected_opids.contains(&opid)
                                 {
                                     continue;
@@ -2101,7 +2264,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                 for input in &op.immutable_in {
                                     let prev = input.opid;
                                     if prev != genesis_opid
-                                        && !known_opids.contains(&prev)
+                                        && !boundaries.skips_immutable_dependency(&prev)
                                         && !selected_opids.contains(&prev)
                                     {
                                         pending_opids.insert(prev);
@@ -2110,7 +2273,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                 }
 
                                 for input in &op.destructible_in {
-                                    if known_cells.contains(&input.addr) {
+                                    if boundaries.has_known_cells(&input.addr) {
                                         known_cell_edges_skipped =
                                             known_cell_edges_skipped.saturating_add(1);
                                         continue;
@@ -2118,7 +2281,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
                                     let prev = input.addr.opid;
                                     if prev != genesis_opid
-                                        && !known_opids.contains(&prev)
+                                        && !boundaries.skips_destructible_dependency(&prev)
                                         && !selected_opids.contains(&prev)
                                     {
                                         pending_opids.insert(prev);
@@ -2128,7 +2291,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
                                 let st = session.transition(opid);
                                 for addr in st.destroyed.into_keys() {
-                                    if known_cells.contains(&addr) {
+                                    if boundaries.has_known_cells(&addr) {
                                         known_cell_edges_skipped =
                                             known_cell_edges_skipped.saturating_add(1);
                                         continue;
@@ -2136,7 +2299,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
                                     let prev = addr.opid;
                                     if prev != genesis_opid
-                                        && !known_opids.contains(&prev)
+                                        && !boundaries.skips_destructible_dependency(&prev)
                                         && !selected_opids.contains(&prev)
                                     {
                                         pending_opids.insert(prev);
@@ -2163,11 +2326,13 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                         contract_id = ?self.contract_id,
                         terminal_ops = terminal_opids.len(),
                         selected_ops = selected_opids.len(),
-                        known_ops = known_opids.len(),
-                        raw_known_ops = raw_known_opids,
-                        known_cells = known_cells.len(),
+                        known_ops = boundaries.known_opids.len(),
+                        raw_known_ops = boundaries.raw_known_opids,
+                        known_cells = boundaries.known_cells.len(),
+                        immutable_checkpoint_ops = boundaries.immutable_checkpoint_opids.len(),
+                        raw_immutable_checkpoint_ops = boundaries.raw_immutable_checkpoint_opids,
                         known_cell_edges_skipped,
-                        trust_known_opids,
+                        trust_known_opids = boundaries.trust_known_opids,
                         published_ops_added,
                         "Slow rgb-std stage"
                     );
@@ -2190,11 +2355,13 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                         contract_id = ?self.contract_id,
                         selected_ops = ops.len(),
                         terminal_ops = terminal_opids.len(),
-                        known_ops = known_opids.len(),
-                        raw_known_ops = raw_known_opids,
-                        known_cells = known_cells.len(),
+                        known_ops = boundaries.known_opids.len(),
+                        raw_known_ops = boundaries.raw_known_opids,
+                        known_cells = boundaries.known_cells.len(),
+                        immutable_checkpoint_ops = boundaries.immutable_checkpoint_opids.len(),
+                        raw_immutable_checkpoint_ops = boundaries.raw_immutable_checkpoint_opids,
                         known_cell_edges_skipped,
-                        trust_known_opids,
+                        trust_known_opids = boundaries.trust_known_opids,
                         published_ops_added,
                         "Slow rgb-std stage"
                     );
@@ -2244,11 +2411,13 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 elapsed_ms,
                 ?contract_id,
                 selected_ops = count,
-                known_ops = known_opids.len(),
-                raw_known_ops = raw_known_opids,
-                known_cells = known_cells.len(),
+                known_ops = boundaries.known_opids.len(),
+                raw_known_ops = boundaries.raw_known_opids,
+                known_cells = boundaries.known_cells.len(),
+                immutable_checkpoint_ops = boundaries.immutable_checkpoint_opids.len(),
+                raw_immutable_checkpoint_ops = boundaries.raw_immutable_checkpoint_opids,
                 known_cell_edges_skipped,
-                trust_known_opids,
+                trust_known_opids = boundaries.trust_known_opids,
                 prewarmed_ops,
                 "Slow rgb-std stage"
             );
@@ -2260,11 +2429,13 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 elapsed_ms,
                 ?contract_id,
                 selected_ops = count,
-                known_ops = known_opids.len(),
-                raw_known_ops = raw_known_opids,
-                known_cells = known_cells.len(),
+                known_ops = boundaries.known_opids.len(),
+                raw_known_ops = boundaries.raw_known_opids,
+                known_cells = boundaries.known_cells.len(),
+                immutable_checkpoint_ops = boundaries.immutable_checkpoint_opids.len(),
+                raw_immutable_checkpoint_ops = boundaries.raw_immutable_checkpoint_opids,
                 known_cell_edges_skipped,
-                trust_known_opids,
+                trust_known_opids = boundaries.trust_known_opids,
                 "Slow rgb-std stage"
             );
         }

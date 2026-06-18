@@ -385,6 +385,10 @@ where
         self.with_contract_mut(contract_id, |contract| contract.known_seal_cells())
     }
 
+    pub fn contract_valid_opids(&mut self, contract_id: ContractId) -> Vec<Opid> {
+        self.with_contract_mut(contract_id, |contract| contract.valid_opids())
+    }
+
     pub fn contract_known_resolved_seals(
         &mut self,
         contract_id: ContractId,
@@ -1235,6 +1239,121 @@ where
                 elapsed_ms,
                 ?contract_id,
                 trusted_known_opids = false,
+                predecoded_operations = true,
+                "Slow rgb-std stage"
+            );
+        }
+        result
+    }
+
+    pub fn consign_with_known_cells_opids_and_immutable_checkpoints(
+        &mut self,
+        contract_id: ContractId,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+        known_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        immutable_checkpoint_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<()>
+    where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        let started_at = Instant::now();
+        tracing::debug!(
+            operation = "rgb_std",
+            stage = "contracts_consign_known_boundaries_start",
+            ?contract_id,
+            trusted_known_opids = false,
+            immutable_checkpoints = true,
+            "Starting rgb-std contracts consignment wrapper"
+        );
+        let result = self.with_contract_mut(contract_id, |contract| {
+            tracing::debug!(
+                operation = "rgb_std",
+                stage = "contracts_consign_known_boundaries_contract_ready",
+                ?contract_id,
+                trusted_known_opids = false,
+                immutable_checkpoints = true,
+                "RGB contract ready for consignment"
+            );
+            contract.consign_with_known_cells_opids_and_immutable_checkpoints(
+                terminals,
+                known_cells,
+                known_opids,
+                immutable_checkpoint_opids,
+                writer,
+            )
+        });
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "contracts_consign_known_boundaries_total",
+                elapsed_ms,
+                ?contract_id,
+                trusted_known_opids = false,
+                immutable_checkpoints = true,
+                "Slow rgb-std stage"
+            );
+        }
+        result
+    }
+
+    pub fn consign_with_known_cells_opids_and_immutable_checkpoints_predecoded(
+        &mut self,
+        contract_id: ContractId,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+        known_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        immutable_checkpoint_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<Vec<OperationSeals<<Sp::Pile as Pile>::Seal>>>
+    where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        let started_at = Instant::now();
+        tracing::debug!(
+            operation = "rgb_std",
+            stage = "contracts_consign_known_boundaries_start",
+            ?contract_id,
+            trusted_known_opids = false,
+            immutable_checkpoints = true,
+            predecoded_operations = true,
+            "Starting rgb-std contracts consignment wrapper"
+        );
+        let result = self.with_contract_mut(contract_id, |contract| {
+            tracing::debug!(
+                operation = "rgb_std",
+                stage = "contracts_consign_known_boundaries_contract_ready",
+                ?contract_id,
+                trusted_known_opids = false,
+                immutable_checkpoints = true,
+                predecoded_operations = true,
+                "RGB contract ready for consignment"
+            );
+            contract.consign_with_known_cells_opids_and_immutable_checkpoints_predecoded(
+                terminals,
+                known_cells,
+                known_opids,
+                immutable_checkpoint_opids,
+                writer,
+            )
+        });
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "contracts_consign_known_boundaries_total",
+                elapsed_ms,
+                ?contract_id,
+                trusted_known_opids = false,
+                immutable_checkpoints = true,
                 predecoded_operations = true,
                 "Slow rgb-std stage"
             );
