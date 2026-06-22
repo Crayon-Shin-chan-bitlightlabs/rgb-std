@@ -19,9 +19,10 @@ use chrono::{DateTime, Utc};
 use commit_verify::{ReservedBytes, StrictHash};
 use hypersonic::{
     AcceptError, Api, Articles, AuthToken, CallParams, CellAddr, Codex, Consensus, ContractId,
-    CoreParams, DataCell, EffectiveState, IssueError, IssueParams, Ledger, LibRepo, Memory,
-    MethodName, NamedState, Operation, Opid, ProcessedState, SemanticError, Semantics, SigBlob,
-    StateAtom, StateName, Stock, StockSession, Transition,
+    CoreParams, DataCell, EffectiveState, Genesis, IssueError, IssueParams, Ledger, LibRepo, Memory,
+    MethodName, NamedState, Operation, Opid, ProcessedState, RawState, SemanticError, Semantics,
+    SigBlob, StateAtom, StateCell, StateData, StateName, StateValue, Stock, StockSession,
+    Transition,
 };
 use indexmap::{IndexMap, IndexSet};
 use rgb::{
@@ -348,11 +349,79 @@ impl<Seal: Clone> CreateParams<Seal> {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct GenesisVerificationMemory {
+    raw: RawState,
+}
+
+impl GenesisVerificationMemory {
+    fn clear(&mut self) {
+        self.raw = RawState::default();
+    }
+
+    fn replace_with_operation(&mut self, opid: Opid, operation: &Operation) {
+        self.clear();
+
+        for (no, cell) in operation.destructible_out.iter().cloned().enumerate() {
+            let addr = CellAddr::new(opid, no as u16);
+            self.raw
+                .auth
+                .insert(cell.auth, addr)
+                .expect("genesis state is too large");
+            self.raw
+                .owned
+                .insert(addr, cell)
+                .expect("genesis state is too large");
+        }
+
+        self.raw
+            .global
+            .extend(
+                operation
+                    .immutable_out
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(no, data)| (CellAddr::new(opid, no as u16), data)),
+            )
+            .expect("genesis state is too large");
+    }
+
+    fn destructible(&self, addr: CellAddr) -> Option<StateCell> {
+        self.raw.destructible(addr)
+    }
+
+    fn immutable(&self, addr: CellAddr) -> Option<StateValue> {
+        self.raw.immutable(addr)
+    }
+
+    fn immutable_data(&self, addr: CellAddr) -> Option<StateData> {
+        self.raw.global.get(&addr).cloned()
+    }
+}
+
+struct ConsignmentGenesisOperations {
+    verification: Operation,
+    contract: Operation,
+}
+
+impl ConsignmentGenesisOperations {
+    fn from_issue(issue: &Issue) -> Self {
+        let codex_contract_id = ContractId::from_byte_array(issue.codex_id().to_byte_array());
+
+        Self {
+            verification: issue.genesis.to_operation(codex_contract_id),
+            contract: issue.genesis.to_operation(issue.contract_id()),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Contract<S: Stock, P: Pile> {
     contract_id: ContractId,
     ledger: Ledger<S>,
     pile: P,
+    genesis_verification_memory: GenesisVerificationMemory,
     /// In-memory cache of valid opids for `ContractApi::is_known(&self)` which requires &self.
     valid_cache: HashSet<Opid>,
     seal_def_cache: HashMap<CellAddr, <P::Seal as RgbSeal>::Definition>,
@@ -696,6 +765,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             ledger,
             pile,
             contract_id,
+            genesis_verification_memory: GenesisVerificationMemory::default(),
             valid_cache: HashSet::from([genesis_opid]),
             seal_def_cache: HashMap::new(),
             resolved_seal_cache: HashMap::new(),
@@ -708,9 +778,12 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             op_aux_cache_bytes: 0,
             owned_state_status_cache: OwnedStateStatusCache::default(),
         };
-        contract
-            .evaluate_commit(consignment.into_operations())
-            .map_err(MultiError::from_a)?;
+        let genesis_operation = contract.contract_genesis_operation();
+        contract.stage_genesis_verification_memory(&genesis_operation);
+        let evaluate_result = contract.evaluate_commit(consignment.into_operations());
+        contract.clear_genesis_verification_memory();
+        evaluate_result.map_err(MultiError::from_a)?;
+
         Ok(contract)
     }
 
@@ -770,6 +843,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             ledger,
             pile,
             contract_id,
+            genesis_verification_memory: GenesisVerificationMemory::default(),
             valid_cache: HashSet::from([genesis_opid]),
             seal_def_cache: HashMap::new(),
             resolved_seal_cache: HashMap::new(),
@@ -795,6 +869,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             ledger,
             pile,
             contract_id,
+            genesis_verification_memory: GenesisVerificationMemory::default(),
             valid_cache: HashSet::new(),
             seal_def_cache: HashMap::new(),
             resolved_seal_cache: HashMap::new(),
@@ -1583,6 +1658,80 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             .articles()
             .genesis()
             .to_operation(genesis_contract_id)
+    }
+
+    fn contract_genesis_operation(&self) -> Operation {
+        self.ledger
+            .articles()
+            .genesis()
+            .to_operation(self.ledger.articles().contract_id())
+    }
+
+    fn stage_genesis_verification_memory(&mut self, operation: &Operation) {
+        let genesis_opid = self.ledger.articles().genesis_opid();
+        self.genesis_verification_memory
+            .replace_with_operation(genesis_opid, operation);
+    }
+
+    fn clear_genesis_verification_memory(&mut self) {
+        self.genesis_verification_memory.clear();
+    }
+
+    fn stage_missing_verification_inputs(&mut self, operation: &Operation) -> Result<(), S::Error> {
+        let missing_destructible = operation
+            .destructible_in
+            .iter()
+            .filter_map(|input| {
+                if self.ledger.state().raw.destructible(input.addr).is_some() {
+                    return None;
+                }
+
+                self.genesis_verification_memory
+                    .destructible(input.addr)
+                    .map(|cell| (input.addr, cell))
+            })
+            .collect::<Vec<_>>();
+
+        let missing_immutable = operation
+            .immutable_in
+            .iter()
+            .filter_map(|addr| {
+                if self.ledger.state().raw.immutable(*addr).is_some() {
+                    return None;
+                }
+
+                self.genesis_verification_memory
+                    .immutable_data(*addr)
+                    .map(|data| (*addr, data))
+            })
+            .collect::<Vec<_>>();
+
+        if missing_destructible.is_empty() && missing_immutable.is_empty() {
+            return Ok(());
+        }
+
+        self.ledger.with_session(|session| {
+            session.update_state(|state, _| {
+                for (addr, cell) in missing_destructible {
+                    state
+                        .raw
+                        .auth
+                        .insert(cell.auth, addr)
+                        .expect("verification state is too large");
+                    state
+                        .raw
+                        .owned
+                        .insert(addr, cell)
+                        .expect("verification state is too large");
+                }
+
+                state
+                    .raw
+                    .global
+                    .extend(missing_immutable)
+                    .expect("verification state is too large");
+            })
+        })
     }
 
     fn remove_op_aux_cache_entry(&mut self, opid: Opid) {
@@ -2557,11 +2706,19 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             let issue_version = ReservedBytes::<1>::strict_decode(reader)?;
             let meta = ContractMeta::strict_decode(reader)?;
             let codex = Codex::strict_decode(reader)?;
+            let genesis = Genesis::strict_decode(reader)?;
+            let issue = Issue { version: issue_version, meta, codex, genesis };
+            if issue.contract_id() != self.contract_id {
+                return Err(ConsumeError::UnknownContract(issue.contract_id()));
+            }
+            let genesis_operations = ConsignmentGenesisOperations::from_issue(&issue);
+
             let evaluate_started_at = Instant::now();
             let previous_stats =
                 CONSUME_STATS.with(|stats| stats.replace(Some(ConsumeStats::default())));
             let predecode_started_at = Instant::now();
-            let operations = decode_consignment_operations(reader, seal_resolver)?;
+            let operations =
+                decode_consignment_operations(reader, genesis_operations.verification, seal_resolver)?;
             if let Some(elapsed_ms) = slow_rgb_stage_elapsed(predecode_started_at) {
                 tracing::warn!(
                     operation = "rgb_std",
@@ -2589,7 +2746,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             }
 
             let op_reader = PredecodedOpReader(VecDeque::from(operations));
+            self.stage_genesis_verification_memory(&genesis_operations.contract);
             let evaluate_result = self.evaluate_commit(op_reader);
+            self.clear_genesis_verification_memory();
             let stats = CONSUME_STATS
                 .with(|stats| stats.replace(previous_stats))
                 .unwrap_or_default();
@@ -2628,8 +2787,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 );
             }
             evaluate_result?;
-            let genesis = self.ledger.articles().genesis().clone();
-            let issue = Issue { version: issue_version, meta, codex, genesis };
             Ok(Articles::with(semantics, issue, sig, sig_validator)?)
         })()
         .map_err(MultiError::A)?;
@@ -2664,6 +2821,13 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             let issue_version = ReservedBytes::<1>::strict_decode(reader)?;
             let meta = ContractMeta::strict_decode(reader)?;
             let codex = Codex::strict_decode(reader)?;
+            let genesis = Genesis::strict_decode(reader)?;
+            let issue = Issue { version: issue_version, meta, codex, genesis };
+            if issue.contract_id() != self.contract_id {
+                return Err(ConsumeError::UnknownContract(issue.contract_id()));
+            }
+            let genesis_operations = ConsignmentGenesisOperations::from_issue(&issue);
+
             let evaluate_started_at = Instant::now();
             let previous_stats =
                 CONSUME_STATS.with(|stats| stats.replace(Some(ConsumeStats::default())));
@@ -2717,7 +2881,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             }
 
             let op_reader = PredecodedOpReader(VecDeque::from(operations));
+            self.stage_genesis_verification_memory(&genesis_operations.contract);
             let evaluate_result = self.evaluate_commit(op_reader);
+            self.clear_genesis_verification_memory();
             let stats = CONSUME_STATS
                 .with(|stats| stats.replace(previous_stats))
                 .unwrap_or_default();
@@ -2759,8 +2925,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 );
             }
             evaluate_result?;
-            let genesis = self.ledger.articles().genesis().clone();
-            let issue = Issue { version: issue_version, meta, codex, genesis };
             Ok(Articles::with(semantics, issue, sig, sig_validator)?)
         })()
         .map_err(MultiError::A)?;
@@ -2789,6 +2953,24 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     }
 }
 
+impl<S: Stock, P: Pile> Memory for Contract<S, P> {
+    fn destructible(&self, addr: CellAddr) -> Option<StateCell> {
+        self.ledger
+            .state()
+            .raw
+            .destructible(addr)
+            .or_else(|| self.genesis_verification_memory.destructible(addr))
+    }
+
+    fn immutable(&self, addr: CellAddr) -> Option<StateValue> {
+        self.ledger
+            .state()
+            .raw
+            .immutable(addr)
+            .or_else(|| self.genesis_verification_memory.immutable(addr))
+    }
+}
+
 impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
     fn contract_id(&self) -> ContractId {
         self.ledger.contract_id()
@@ -2800,7 +2982,7 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         self.ledger.articles()
     }
     fn memory(&self) -> &impl Memory {
-        &self.ledger.state().raw
+        self
     }
     fn is_known(&self, opid: Opid) -> bool {
         let known = self.valid_cache.contains(&opid);
@@ -2984,6 +3166,8 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
 
     fn apply_operation(&mut self, op: VerifiedOperation) {
         let opid = op.opid();
+        self.stage_missing_verification_inputs(op.as_operation())
+            .expect("unable to stage verification inputs");
         self.ledger.apply(op).expect("unable to apply operation");
         self.valid_cache.insert(opid);
         self.remove_op_aux_cache_entry(opid);
@@ -3076,8 +3260,31 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
     }
 }
 
+fn decode_operation_aux<Seal: RgbSeal, R: ReadRaw>(
+    reader: &mut StrictReader<R>,
+    operation: Operation,
+    seal_resolver: &mut impl FnMut(&Operation) -> BTreeMap<u16, Seal::Definition>,
+) -> Result<OperationSeals<Seal>, DecodeError>
+where
+    Seal::Client: StrictDecode,
+    Seal::Published: StrictDecode,
+    Seal::WitnessId: StrictDecode,
+{
+    let mut defined_seals = SmallOrdMap::strict_decode(reader)?;
+    with_consume_stats(|stats| stats.decoded_ops += 1);
+    defined_seals
+        .extend(seal_resolver(&operation))
+        .map_err(|_| {
+            DecodeError::DataIntegrityError(format!("too many seals for {}", operation.opid()))
+        })?;
+    let witness = Option::<SealWitness<Seal>>::strict_decode(reader)?;
+
+    Ok(OperationSeals { operation, defined_seals, witness })
+}
+
 fn decode_consignment_operations<Seal: RgbSeal, R: ReadRaw>(
     reader: &mut StrictReader<R>,
+    genesis_operation: Operation,
     mut seal_resolver: impl FnMut(&Operation) -> BTreeMap<u16, Seal::Definition>,
 ) -> Result<Vec<OperationSeals<Seal>>, DecodeError>
 where
@@ -3085,30 +3292,25 @@ where
     Seal::Published: StrictDecode,
     Seal::WitnessId: StrictDecode,
 {
-    let mut operations = Vec::new();
-    let mut count = u32::MAX;
-    loop {
-        if count == 0 {
-            return Ok(operations);
-        }
-
-        let operation = Operation::strict_decode(reader)?;
-        let mut defined_seals = SmallOrdMap::strict_decode(reader)?;
-        with_consume_stats(|stats| stats.decoded_ops += 1);
-        defined_seals
-            .extend(seal_resolver(&operation))
-            .map_err(|_| {
-                DecodeError::DataIntegrityError(format!("too many seals for {}", operation.opid()))
-            })?;
-        let witness = Option::<SealWitness<Seal>>::strict_decode(reader)?;
-        if count == u32::MAX {
-            count = u32::strict_decode(reader)?;
-            operations.reserve(count.min(MAX_CONSIGNMENT_OPS) as usize);
-        } else {
-            count -= 1;
-        }
-        operations.push(OperationSeals { operation, defined_seals, witness });
+    let genesis = decode_operation_aux(reader, genesis_operation, &mut seal_resolver)?;
+    let count = u32::strict_decode(reader)?;
+    if count > MAX_CONSIGNMENT_OPS {
+        return Err(DecodeError::DataIntegrityError(format!(
+            "number of operations in contract consignment ({count}) exceeds maximum allowed \
+             ({MAX_CONSIGNMENT_OPS})"
+        )));
     }
+
+    let mut operations = Vec::with_capacity(count as usize + 1);
+    operations.push(genesis);
+
+    for _ in 0..count {
+        let operation = Operation::strict_decode(reader)?;
+        let operation_seals = decode_operation_aux(reader, operation, &mut seal_resolver)?;
+        operations.push(operation_seals);
+    }
+
+    Ok(operations)
 }
 
 struct PredecodedOpReader<Seal: RgbSeal>(VecDeque<OperationSeals<Seal>>);
