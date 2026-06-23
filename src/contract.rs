@@ -422,6 +422,11 @@ pub struct Contract<S: Stock, P: Pile> {
     ledger: Ledger<S>,
     pile: P,
     genesis_verification_memory: GenesisVerificationMemory,
+    /// Genesis opid for which `genesis_verification_memory` is currently staged, if any.
+    /// Genesis state is immutable for the life of a contract (the contract id commits to it),
+    /// so once staged it can be reused across every consume instead of being rebuilt and
+    /// cleared each time. Only ever holds genesis state, which is always valid to fall back to.
+    genesis_verification_memory_staged_for: Option<Opid>,
     /// In-memory cache of valid opids for `ContractApi::is_known(&self)` which requires &self.
     valid_cache: HashSet<Opid>,
     seal_def_cache: HashMap<CellAddr, <P::Seal as RgbSeal>::Definition>,
@@ -667,6 +672,40 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         self.valid_cache = valid_cache;
     }
 
+    /// Incrementally update `valid_cache` after a `sync` rollback/forward instead of rebuilding
+    /// the whole set from a full `valid_opids()` scan.
+    ///
+    /// `affected` must be the descendant closure of the directly-affected ops
+    /// (`roll_back` ∪ `forward`), computed *before* the ledger rollback/forward so the
+    /// read/spent indices still reflect the pre-sync graph. The ledger's `rollback`/`forward`
+    /// operate over that descendant closure, so validity may have changed for any op in it, not
+    /// just the seeds. We re-read each op's authoritative `is_valid` from the ledger and update
+    /// only those entries. Genesis is always re-checked since it anchors the cache. This is
+    /// exactly equivalent to the full rebuild over the affected set, but bounded by the closure
+    /// size rather than the total number of operations.
+    fn apply_valid_cache_delta(&mut self, affected: HashSet<Opid>) {
+        let genesis_opid = self.ledger.articles().genesis_opid();
+        let statuses = self
+            .ledger
+            .with_session(|session| {
+                Ok::<_, core::convert::Infallible>(
+                    affected
+                        .into_iter()
+                        .chain([genesis_opid])
+                        .map(|opid| (opid, session.is_valid(opid)))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .expect("infallible valid cache delta");
+        for (opid, valid) in statuses {
+            if valid {
+                self.valid_cache.insert(opid);
+            } else {
+                self.valid_cache.remove(&opid);
+            }
+        }
+    }
+
     fn prewarm_known_operation_duplicate_caches(&mut self, operations: &[OperationSeals<P::Seal>]) {
         let known_ops = operations
             .iter()
@@ -787,6 +826,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             pile,
             contract_id,
             genesis_verification_memory: GenesisVerificationMemory::default(),
+            genesis_verification_memory_staged_for: None,
             valid_cache: HashSet::from([genesis_opid]),
             seal_def_cache: HashMap::new(),
             resolved_seal_cache: HashMap::new(),
@@ -804,7 +844,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let genesis_operation = contract.contract_genesis_operation();
         contract.stage_genesis_verification_memory(&genesis_operation);
         let evaluate_result = contract.evaluate_commit(consignment.into_operations());
-        contract.clear_genesis_verification_memory();
         evaluate_result.map_err(MultiError::from_a)?;
 
         Ok(contract)
@@ -867,6 +906,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             pile,
             contract_id,
             genesis_verification_memory: GenesisVerificationMemory::default(),
+            genesis_verification_memory_staged_for: None,
             valid_cache: HashSet::from([genesis_opid]),
             seal_def_cache: HashMap::new(),
             resolved_seal_cache: HashMap::new(),
@@ -895,6 +935,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             pile,
             contract_id,
             genesis_verification_memory: GenesisVerificationMemory::default(),
+            genesis_verification_memory_staged_for: None,
             valid_cache: HashSet::new(),
             seal_def_cache: HashMap::new(),
             resolved_seal_cache: HashMap::new(),
@@ -1568,6 +1609,14 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         }
         debug_assert_eq!(forward.intersection(&roll_back).count(), 0);
 
+        // Capture the descendant closure of all directly-affected ops *before* the ledger
+        // rollback/forward mutate the read/spent indices, so the incremental valid-cache update
+        // covers every op whose validity the ledger may flip (not just the seed ops).
+        let affected_closure = self
+            .ledger
+            .descendants(roll_back.iter().copied().chain(forward.iter().copied()))
+            .collect::<HashSet<_>>();
+
         // Step 5: ledger rollback/forward
         self.ledger.rollback(roll_back).map_err(MultiError::B)?;
         self.pile.session().commit_transaction();
@@ -1576,7 +1625,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         if status_changed {
             self.clear_owned_state_status_cache();
         }
-        self.refresh_valid_cache();
+        self.apply_valid_cache_delta(affected_closure);
         Ok(())
     }
 
@@ -1697,12 +1746,14 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
     fn stage_genesis_verification_memory(&mut self, operation: &Operation) {
         let genesis_opid = self.ledger.articles().genesis_opid();
+        // Genesis state is immutable for the life of the contract, so once staged for this
+        // genesis opid it can be reused across consumes without rebuilding.
+        if self.genesis_verification_memory_staged_for == Some(genesis_opid) {
+            return;
+        }
         self.genesis_verification_memory
             .replace_with_operation(genesis_opid, operation);
-    }
-
-    fn clear_genesis_verification_memory(&mut self) {
-        self.genesis_verification_memory.clear();
+        self.genesis_verification_memory_staged_for = Some(genesis_opid);
     }
 
     fn stage_missing_verification_inputs(&mut self, operation: &Operation) -> Result<(), S::Error> {
@@ -2813,7 +2864,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             let op_reader = PredecodedOpReader(VecDeque::from(operations));
             self.stage_genesis_verification_memory(&genesis_operations.contract);
             let evaluate_result = self.evaluate_commit(op_reader);
-            self.clear_genesis_verification_memory();
             let stats = CONSUME_STATS
                 .with(|stats| stats.replace(previous_stats))
                 .unwrap_or_default();
@@ -2949,7 +2999,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             let op_reader = PredecodedOpReader(VecDeque::from(operations));
             self.stage_genesis_verification_memory(&genesis_operations.contract);
             let evaluate_result = self.evaluate_commit(op_reader);
-            self.clear_genesis_verification_memory();
             let stats = CONSUME_STATS
                 .with(|stats| stats.replace(previous_stats))
                 .unwrap_or_default();
