@@ -19,10 +19,10 @@ use chrono::{DateTime, Utc};
 use commit_verify::{ReservedBytes, StrictHash};
 use hypersonic::{
     AcceptError, Api, Articles, AuthToken, CallParams, CellAddr, Codex, Consensus, ContractId,
-    CoreParams, DataCell, EffectiveState, Genesis, IssueError, IssueParams, Ledger, LibRepo, Memory,
-    MethodName, NamedState, Operation, Opid, ProcessedState, RawState, SemanticError, Semantics,
-    SigBlob, StateAtom, StateCell, StateData, StateName, StateValue, Stock, StockSession,
-    Transition,
+    CoreParams, DataCell, EffectiveState, Genesis, IssueError, IssueParams, Ledger, LibRepo,
+    Memory, MethodName, NamedState, Operation, Opid, ProcessedState, RawState, SemanticError,
+    Semantics, SigBlob, StateAtom, StateCell, StateData, StateName, StateValue, Stock,
+    StockSession, Transition,
 };
 use indexmap::{IndexMap, IndexSet};
 use rgb::{
@@ -431,7 +431,9 @@ pub struct Contract<S: Stock, P: Pile> {
     duplicate_seal_def_cache: HashSet<CellAddr>,
     duplicate_witness_cache: HashSet<(Opid, <P::Seal as RgbSeal>::WitnessId)>,
     op_aux_cache: HashMap<Opid, OpAuxCacheEntry<P::Seal>>,
-    op_aux_cache_order: VecDeque<Opid>,
+    op_aux_cache_order: BTreeMap<u64, Opid>,
+    op_aux_cache_positions: HashMap<Opid, u64>,
+    op_aux_cache_next_seq: u64,
     op_aux_cache_bytes: usize,
     owned_state_status_cache: OwnedStateStatusCache<<P::Seal as RgbSeal>::WitnessId>,
 }
@@ -525,11 +527,7 @@ impl SelectionPreloadPlan {
             }
         }
 
-        Self {
-            opids,
-            parent_ops: parent_count,
-            parent_edges,
-        }
+        Self { opids, parent_ops: parent_count, parent_edges }
     }
 
     fn len(&self) -> usize {
@@ -629,9 +627,11 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         prune_hashset_to(&mut self.duplicate_witness_cache, max_entries);
     }
 
-    fn known_operation_aux_is_cached(&self, operation_seals: &OperationSeals<P::Seal>) -> bool {
-        let opid = operation_seals.operation.opid();
-
+    fn known_operation_aux_is_cached(
+        &self,
+        opid: Opid,
+        operation_seals: &OperationSeals<P::Seal>,
+    ) -> bool {
         let seals_cached = operation_seals.defined_seals.iter().all(|(no, seal)| {
             let addr = CellAddr::new(opid, *no);
 
@@ -670,8 +670,11 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     fn prewarm_known_operation_duplicate_caches(&mut self, operations: &[OperationSeals<P::Seal>]) {
         let known_ops = operations
             .iter()
-            .filter(|op| self.valid_cache.contains(&op.operation.opid()))
-            .filter(|op| !self.known_operation_aux_is_cached(op))
+            .filter_map(|op| {
+                let opid = op.operation.opid();
+                (self.valid_cache.contains(&opid) && !self.known_operation_aux_is_cached(opid, op))
+                    .then_some((opid, op))
+            })
             .collect::<Vec<_>>();
         if known_ops.is_empty() {
             return;
@@ -691,6 +694,24 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         }
 
         self.prune_contract_caches();
+    }
+
+    fn preload_destructible_input_seals(&mut self, operations: &[OperationSeals<P::Seal>]) {
+        let cells = operations
+            .iter()
+            .flat_map(|operation_seals| {
+                operation_seals
+                    .operation
+                    .destructible_in
+                    .iter()
+                    .map(|input| input.addr)
+            })
+            .collect::<BTreeSet<_>>();
+        if cells.is_empty() {
+            return;
+        }
+
+        self.pile.session().preload_seals(cells);
     }
 
     fn clear_owned_state_status_cache(&mut self) {
@@ -774,7 +795,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             duplicate_seal_def_cache: HashSet::new(),
             duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
-            op_aux_cache_order: VecDeque::new(),
+            op_aux_cache_order: BTreeMap::new(),
+            op_aux_cache_positions: HashMap::new(),
+            op_aux_cache_next_seq: 0,
             op_aux_cache_bytes: 0,
             owned_state_status_cache: OwnedStateStatusCache::default(),
         };
@@ -852,7 +875,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             duplicate_seal_def_cache: HashSet::new(),
             duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
-            op_aux_cache_order: VecDeque::new(),
+            op_aux_cache_order: BTreeMap::new(),
+            op_aux_cache_positions: HashMap::new(),
+            op_aux_cache_next_seq: 0,
             op_aux_cache_bytes: 0,
             owned_state_status_cache: OwnedStateStatusCache::default(),
         })
@@ -878,7 +903,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             duplicate_seal_def_cache: HashSet::new(),
             duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
-            op_aux_cache_order: VecDeque::new(),
+            op_aux_cache_order: BTreeMap::new(),
+            op_aux_cache_positions: HashMap::new(),
+            op_aux_cache_next_seq: 0,
             op_aux_cache_bytes: 0,
             owned_state_status_cache: OwnedStateStatusCache::default(),
         };
@@ -1739,7 +1766,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         if let Some(entry) = self.op_aux_cache.remove(&opid) {
             self.op_aux_cache_bytes = self.op_aux_cache_bytes.saturating_sub(entry.bytes.len());
         }
-        self.op_aux_cache_order.retain(|cached| *cached != opid);
+        if let Some(seq) = self.op_aux_cache_positions.remove(&opid) {
+            self.op_aux_cache_order.remove(&seq);
+        }
     }
 
     /// Evicts cached seal data defined by `opid`.
@@ -1753,12 +1782,29 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     fn evict_op_seal_caches(&mut self, opid: Opid) {
         self.resolved_seal_cache.retain(|addr, _| addr.opid != opid);
         self.seal_def_cache.retain(|addr, _| addr.opid != opid);
-        self.duplicate_seal_def_cache.retain(|addr| addr.opid != opid);
+        self.duplicate_seal_def_cache
+            .retain(|addr| addr.opid != opid);
+    }
+
+    fn next_op_aux_cache_seq(&mut self) -> u64 {
+        let seq = self.op_aux_cache_next_seq;
+        self.op_aux_cache_next_seq = self.op_aux_cache_next_seq.wrapping_add(1);
+        seq
+    }
+
+    fn record_op_aux_cache_access(&mut self, opid: Opid) {
+        if let Some(seq) = self.op_aux_cache_positions.remove(&opid) {
+            self.op_aux_cache_order.remove(&seq);
+        }
+        let seq = self.next_op_aux_cache_seq();
+        self.op_aux_cache_positions.insert(opid, seq);
+        self.op_aux_cache_order.insert(seq, opid);
     }
 
     fn touch_op_aux_cache_entry(&mut self, opid: Opid) {
-        self.op_aux_cache_order.retain(|cached| *cached != opid);
-        self.op_aux_cache_order.push_back(opid);
+        if self.op_aux_cache.contains_key(&opid) {
+            self.record_op_aux_cache_access(opid);
+        }
     }
 
     fn insert_op_aux_cache_entry(&mut self, opid: Opid, entry: OpAuxCacheEntry<P::Seal>) {
@@ -1773,12 +1819,15 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 .op_aux_cache_bytes
                 .saturating_sub(old_entry.bytes.len());
         }
-        self.op_aux_cache_order.retain(|cached| *cached != opid);
+        if let Some(seq) = self.op_aux_cache_positions.remove(&opid) {
+            self.op_aux_cache_order.remove(&seq);
+        }
 
         while self.op_aux_cache_bytes.saturating_add(bytes_len) > max_bytes {
-            let Some(oldest) = self.op_aux_cache_order.pop_front() else {
+            let Some((_, oldest)) = self.op_aux_cache_order.pop_first() else {
                 break;
             };
+            self.op_aux_cache_positions.remove(&oldest);
             if let Some(old_entry) = self.op_aux_cache.remove(&oldest) {
                 self.op_aux_cache_bytes = self
                     .op_aux_cache_bytes
@@ -1787,7 +1836,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         }
 
         self.op_aux_cache.insert(opid, entry);
-        self.op_aux_cache_order.push_back(opid);
+        self.record_op_aux_cache_access(opid);
         self.op_aux_cache_bytes = self.op_aux_cache_bytes.saturating_add(bytes_len);
     }
 
@@ -2355,10 +2404,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 let select_ops_started_at = Instant::now();
 
                 let preload_started_at = Instant::now();
-                let preload_roots = terminal_opids
-                    .iter()
-                    .chain(published_roots.iter())
-                    .copied();
+                let preload_roots = terminal_opids.iter().chain(published_roots.iter()).copied();
                 let preload_plan = SelectionPreloadPlan::from_parent_ops(
                     session
                         .operation_parent_ops()
@@ -2732,8 +2778,11 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             let previous_stats =
                 CONSUME_STATS.with(|stats| stats.replace(Some(ConsumeStats::default())));
             let predecode_started_at = Instant::now();
-            let operations =
-                decode_consignment_operations(reader, genesis_operations.verification, seal_resolver)?;
+            let operations = decode_consignment_operations(
+                reader,
+                genesis_operations.verification,
+                seal_resolver,
+            )?;
             if let Some(elapsed_ms) = slow_rgb_stage_elapsed(predecode_started_at) {
                 tracing::warn!(
                     operation = "rgb_std",
@@ -2747,6 +2796,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
             let duplicate_cache_started_at = Instant::now();
             self.prewarm_known_operation_duplicate_caches(&operations);
+            self.preload_destructible_input_seals(&operations);
             if let Some(elapsed_ms) = slow_rgb_stage_elapsed(duplicate_cache_started_at) {
                 tracing::warn!(
                     operation = "rgb_std",
@@ -2881,6 +2931,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
             let duplicate_cache_started_at = Instant::now();
             self.prewarm_known_operation_duplicate_caches(&operations);
+            self.preload_destructible_input_seals(&operations);
             if let Some(elapsed_ms) = slow_rgb_stage_elapsed(duplicate_cache_started_at) {
                 tracing::warn!(
                     operation = "rgb_std",

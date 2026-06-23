@@ -26,10 +26,7 @@ pub struct KnownOperationAuxMatches<Seal: RgbSeal> {
 
 impl<Seal: RgbSeal> Default for KnownOperationAuxMatches<Seal> {
     fn default() -> Self {
-        Self {
-            seal_definitions: Vec::new(),
-            witnesses: Vec::new(),
-        }
+        Self { seal_definitions: Vec::new(), witnesses: Vec::new() }
     }
 }
 
@@ -272,12 +269,12 @@ pub trait PileSession {
 
     fn known_operation_aux_matches(
         &mut self,
-        operations: &[&OperationSeals<Self::Seal>],
+        operations: &[(Opid, &OperationSeals<Self::Seal>)],
     ) -> KnownOperationAuxMatches<Self::Seal> {
         let mut matches = KnownOperationAuxMatches::default();
 
-        for operation_seals in operations {
-            let opid = operation_seals.operation.opid();
+        for (opid, operation_seals) in operations {
+            let opid = *opid;
 
             if !operation_seals.defined_seals.is_empty()
                 && self.seal_definitions_match(opid, &operation_seals.defined_seals)
@@ -302,6 +299,10 @@ pub trait PileSession {
 
     fn preload_aux_reads(&mut self, ops: impl IntoIterator<Item = (Opid, u16)>) {
         let _ = ops;
+    }
+
+    fn preload_seals(&mut self, addrs: impl IntoIterator<Item = CellAddr>) {
+        let _ = addrs;
     }
 
     fn known_boundary_opids_by_cells(
