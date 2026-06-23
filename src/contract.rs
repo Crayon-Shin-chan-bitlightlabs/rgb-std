@@ -679,26 +679,21 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     /// (`roll_back` ∪ `forward`), computed *before* the ledger rollback/forward so the
     /// read/spent indices still reflect the pre-sync graph. The ledger's `rollback`/`forward`
     /// operate over that descendant closure, so validity may have changed for any op in it, not
-    /// just the seeds. We re-read each op's authoritative `is_valid` from the ledger and update
-    /// only those entries. Genesis is always re-checked since it anchors the cache. This is
-    /// exactly equivalent to the full rebuild over the affected set, but bounded by the closure
-    /// size rather than the total number of operations.
+    /// just the seeds. We re-read the reconciled `valid_opids()` set from the ledger and update
+    /// only those entries touched by the closure. This keeps the incremental path aligned with
+    /// backends which repair or reconcile materialized valid-opid indexes inside `valid_opids()`
+    /// instead of trusting a bare point `is_valid` lookup.
     fn apply_valid_cache_delta(&mut self, affected: HashSet<Opid>) {
-        let genesis_opid = self.ledger.articles().genesis_opid();
-        let statuses = self
+        let valid_opids = self
             .ledger
             .with_session(|session| {
                 Ok::<_, core::convert::Infallible>(
-                    affected
-                        .into_iter()
-                        .chain([genesis_opid])
-                        .map(|opid| (opid, session.is_valid(opid)))
-                        .collect::<Vec<_>>(),
+                    session.valid_opids().into_iter().collect::<HashSet<_>>(),
                 )
             })
             .expect("infallible valid cache delta");
-        for (opid, valid) in statuses {
-            if valid {
+        for opid in affected {
+            if valid_opids.contains(&opid) {
                 self.valid_cache.insert(opid);
             } else {
                 self.valid_cache.remove(&opid);
