@@ -62,6 +62,12 @@ fn rbf() {
         .next()
         .unwrap();
 
+    let warmed_seals = contract.known_resolved_seals();
+    let (addr, old_resolved_seal) = warmed_seals
+        .into_iter()
+        .find(|(addr, _)| addr.opid == opid)
+        .expect("target op should have a known resolved seal");
+
     let tx = Tx::strict_dumb();
     let rbf_txid = tx.txid();
     contract.apply_witness(opid, SealWitness::new(tx, strict_dumb!()));
@@ -72,4 +78,11 @@ fn rbf() {
             (rbf_txid, WitnessStatus::Mined(NonZeroU64::new(100).unwrap())),
         ])
         .unwrap();
+
+    let (_, new_resolved_seal) = contract
+        .known_resolved_seals()
+        .into_iter()
+        .find(|(known_addr, _)| *known_addr == addr)
+        .expect("target seal should remain known after RBF sync");
+    assert_ne!(old_resolved_seal, new_resolved_seal);
 }

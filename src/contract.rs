@@ -1528,6 +1528,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let mut forward = IndexSet::new();
         for (opid, old_status) in affected_ops {
             self.remove_op_aux_cache_entry(opid);
+            self.evict_op_seal_caches(opid);
             let new_status = self.best_op_status(opid);
             if old_status.is_valid() == new_status.is_valid() {
                 continue;
@@ -1739,6 +1740,20 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             self.op_aux_cache_bytes = self.op_aux_cache_bytes.saturating_sub(entry.bytes.len());
         }
         self.op_aux_cache_order.retain(|cached| *cached != opid);
+    }
+
+    /// Evicts cached seal data defined by `opid`.
+    ///
+    /// `resolved_seal_cache` stores witness-resolved seals (`definition.resolve(pub_id)`); after a
+    /// reorg the producing operation's witness `pub_id` can change (e.g. RBF), so any cached
+    /// resolved seal for that operation is stale and must be dropped. `seal_def_cache` and
+    /// `duplicate_seal_def_cache` are evicted alongside it to keep the local seal caches coherent
+    /// and force a fresh re-read from the pile on the next access. Only locally-owned caches are
+    /// touched; the externally-injected caches are not mutated here.
+    fn evict_op_seal_caches(&mut self, opid: Opid) {
+        self.resolved_seal_cache.retain(|addr, _| addr.opid != opid);
+        self.seal_def_cache.retain(|addr, _| addr.opid != opid);
+        self.duplicate_seal_def_cache.retain(|addr| addr.opid != opid);
     }
 
     fn touch_op_aux_cache_entry(&mut self, opid: Opid) {
