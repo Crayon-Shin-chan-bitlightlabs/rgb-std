@@ -7,7 +7,7 @@ use core::error::Error as StdError;
 use core::fmt::Debug;
 use core::marker::PhantomData;
 use core::num::NonZeroU64;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use amplify::confinement::SmallOrdMap;
 use hypersonic::Opid;
@@ -200,11 +200,34 @@ pub trait PileSession {
 
     fn op_witness_ids(&mut self, opid: Opid) -> Vec<<Self::Seal as RgbSeal>::WitnessId>;
 
+    fn op_witness_ids_for(
+        &mut self,
+        opids: impl IntoIterator<Item = Opid>,
+    ) -> Vec<(Opid, Vec<<Self::Seal as RgbSeal>::WitnessId>)> {
+        opids
+            .into_iter()
+            .map(|opid| {
+                let witness_ids = self.op_witness_ids(opid);
+                (opid, witness_ids)
+            })
+            .collect()
+    }
+
     fn ops_by_witness_id(&mut self, wid: <Self::Seal as RgbSeal>::WitnessId) -> Vec<Opid>;
 
     fn known_seal_cells(&mut self) -> Vec<CellAddr>;
 
     fn seal(&mut self, addr: CellAddr) -> Option<<Self::Seal as RgbSeal>::Definition>;
+
+    fn seals_for(
+        &mut self,
+        addrs: impl IntoIterator<Item = CellAddr>,
+    ) -> Vec<(CellAddr, <Self::Seal as RgbSeal>::Definition)> {
+        addrs
+            .into_iter()
+            .filter_map(|addr| self.seal(addr).map(|seal| (addr, seal)))
+            .collect()
+    }
 
     fn seals(
         &mut self,
@@ -328,16 +351,19 @@ pub trait PileSession {
         candidates: impl IntoIterator<Item = (Opid, u16)>,
         known_cells: &HashSet<CellAddr>,
     ) -> HashSet<Opid> {
+        let mut known_positions_by_opid = HashMap::<Opid, HashSet<u16>>::new();
+        for cell in known_cells {
+            known_positions_by_opid
+                .entry(cell.opid)
+                .or_default()
+                .insert(cell.pos);
+        }
+
         candidates
             .into_iter()
             .filter_map(|(opid, up_to)| {
-                let rels = self.op_relations(opid, up_to);
-                (!rels.defines.is_empty()
-                    && rels
-                        .defines
-                        .keys()
-                        .all(|no| known_cells.contains(&CellAddr::new(opid, *no))))
-                .then_some(opid)
+                let known_positions = known_positions_by_opid.get(&opid)?;
+                (up_to > 0 && known_positions.len() == up_to as usize).then_some(opid)
             })
             .collect()
     }
