@@ -176,11 +176,10 @@ pub trait PileSession {
             .collect()
     }
 
-    fn witness_ids(&mut self) -> impl Iterator<Item = <Self::Seal as RgbSeal>::WitnessId>;
+    fn witness_ids(&mut self) -> Vec<<Self::Seal as RgbSeal>::WitnessId>;
 
     fn witness_statuses(&mut self) -> Vec<(<Self::Seal as RgbSeal>::WitnessId, WitnessStatus)> {
-        let witness_ids = self.witness_ids().collect::<Vec<_>>();
-        witness_ids
+        self.witness_ids()
             .into_iter()
             .map(|wid| {
                 let status = self.witness_status(wid);
@@ -200,19 +199,13 @@ pub trait PileSession {
             .collect()
     }
 
-    fn witnesses(&mut self) -> impl Iterator<Item = Witness<Self::Seal>>;
+    fn witnesses(&mut self) -> Vec<Witness<Self::Seal>>;
 
-    fn op_witness_ids(
-        &mut self,
-        opid: Opid,
-    ) -> impl ExactSizeIterator<Item = <Self::Seal as RgbSeal>::WitnessId>;
+    fn op_witness_ids(&mut self, opid: Opid) -> Vec<<Self::Seal as RgbSeal>::WitnessId>;
 
-    fn ops_by_witness_id(
-        &mut self,
-        wid: <Self::Seal as RgbSeal>::WitnessId,
-    ) -> impl ExactSizeIterator<Item = Opid>;
+    fn ops_by_witness_id(&mut self, wid: <Self::Seal as RgbSeal>::WitnessId) -> Vec<Opid>;
 
-    fn known_seal_cells(&mut self) -> impl Iterator<Item = CellAddr>;
+    fn known_seal_cells(&mut self) -> Vec<CellAddr>;
 
     fn seal(&mut self, addr: CellAddr) -> Option<<Self::Seal as RgbSeal>::Definition>;
 
@@ -221,6 +214,29 @@ pub trait PileSession {
         opid: Opid,
         up_to: u16,
     ) -> SmallOrdMap<u16, <Self::Seal as RgbSeal>::Definition>;
+
+    fn preload_aux_reads(&mut self, ops: impl IntoIterator<Item = (Opid, u16)>) {
+        let _ = ops;
+    }
+
+    fn known_boundary_opids_by_cells(
+        &mut self,
+        candidates: impl IntoIterator<Item = (Opid, u16)>,
+        known_cells: &HashSet<CellAddr>,
+    ) -> HashSet<Opid> {
+        candidates
+            .into_iter()
+            .filter_map(|(opid, up_to)| {
+                let rels = self.op_relations(opid, up_to);
+                (!rels.defines.is_empty()
+                    && rels
+                        .defines
+                        .keys()
+                        .all(|no| known_cells.contains(&CellAddr::new(opid, *no))))
+                .then_some(opid)
+            })
+            .collect()
+    }
 
     fn op_relations(&mut self, opid: Opid, up_to: u16) -> OpRels<Self::Seal>;
 

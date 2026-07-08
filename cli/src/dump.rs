@@ -83,7 +83,7 @@ where
     serde_yaml::to_writer(&out, &contract.state())?;
 
     print!("Processing witnesses ... none found");
-    for (no, witness) in contract.witnesses().enumerate() {
+    for (no, witness) in contract.witnesses().into_iter().enumerate() {
         let out = File::create_new(dst.join(format!("witness-{}.yaml", witness.id)))?;
         serde_yaml::to_writer(&out, &witness)?;
         print!("\rProcessing witnesses ... {} processed", no + 1);

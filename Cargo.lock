@@ -916,7 +916,7 @@ dependencies = [
 [[package]]
 name = "rgb-core"
 version = "0.12.0"
-source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/rgb-core.git?branch=temp#93bdf4d0b273826b8410b1ae18fd52c416f29b12"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/rgb-core.git?branch=v0.12.0-perf#93bdf4d0b273826b8410b1ae18fd52c416f29b12"
 dependencies = [
  "amplify",
  "bp-core",
