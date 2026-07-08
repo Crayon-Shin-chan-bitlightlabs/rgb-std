@@ -29,6 +29,8 @@ use core::cell::RefCell;
 use core::future::Future;
 use std::collections::{HashMap, HashSet};
 use std::io;
+#[cfg(feature = "async")]
+use std::time::{Duration, Instant};
 
 use amplify::confinement::{KeyedCollection, SmallOrdMap};
 use amplify::MultiError;
@@ -40,6 +42,8 @@ use hypersonic::{
 };
 use indexmap::{IndexMap, IndexSet};
 use rgb::RgbSeal;
+#[cfg(feature = "async")]
+use single_use_seals::PublishedWitness;
 use strict_encoding::{
     ReadRaw, StrictDecode, StrictDumb, StrictEncode, StrictReader, StrictWriter, WriteRaw,
 };
@@ -50,6 +54,28 @@ use crate::{
     ContractRef, ContractState, CreateParams, Identity, ImmutableState, Issuer, Operation,
     OwnedState, Pile, SigBlob, StateName, Stockpile, WitnessStatus,
 };
+
+#[cfg(feature = "async")]
+const RGB_STD_SLOW_STAGE_THRESHOLD: Duration = Duration::from_millis(500);
+
+#[cfg(feature = "async")]
+fn slow_rgb_stage_elapsed(started_at: Instant) -> Option<u128> {
+    let elapsed = started_at.elapsed();
+    (elapsed >= RGB_STD_SLOW_STAGE_THRESHOLD).then_some(elapsed.as_millis())
+}
+
+#[cfg(feature = "async")]
+fn witness_status_is_mature(
+    status: WitnessStatus,
+    last_block_height: u64,
+    min_conformations: u32,
+) -> bool {
+    matches!(
+        status,
+        WitnessStatus::Mined(height)
+            if last_block_height.saturating_sub(height.get()) > min_conformations as u64
+    )
+}
 
 #[cfg(feature = "async")]
 pub trait TxidResolver<Sp: Stockpile, E: core::error::Error> {
@@ -143,6 +169,10 @@ pub struct Contracts<
 {
     issuers: RefCell<S>,
     contracts: RefCell<C>,
+    #[cfg(feature = "async")]
+    witness_update_candidates: RefCell<
+        HashMap<(ContractId, u32), IndexSet<<<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId>>,
+    >,
     persistence: Sp,
 }
 
@@ -157,7 +187,37 @@ where
         S: Default,
         C: Default,
     {
-        Self { issuers: none!(), contracts: none!(), persistence }
+        Self {
+            issuers: none!(),
+            contracts: none!(),
+            #[cfg(feature = "async")]
+            witness_update_candidates: none!(),
+            persistence,
+        }
+    }
+
+    #[cfg(feature = "async")]
+    pub fn witness_update_candidates(
+        &self,
+        contract_id: ContractId,
+        min_conformations: u32,
+    ) -> Option<Vec<<<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId>> {
+        self.witness_update_candidates
+            .borrow()
+            .get(&(contract_id, min_conformations))
+            .map(|candidates| candidates.iter().copied().collect())
+    }
+
+    #[cfg(feature = "async")]
+    pub fn set_witness_update_candidates(
+        &mut self,
+        contract_id: ContractId,
+        min_conformations: u32,
+        candidates: impl IntoIterator<Item = <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId>,
+    ) {
+        self.witness_update_candidates
+            .borrow_mut()
+            .insert((contract_id, min_conformations), candidates.into_iter().collect());
     }
 
     #[allow(dead_code)]
@@ -582,6 +642,7 @@ where
         R: Fn(<<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId) -> Fut + Sync,
         Fut: Future<Output = Result<WitnessStatus, E>> + Send,
     {
+        let total_started_at = Instant::now();
         let mut resolved_statuses = IndexMap::<_, WitnessStatus>::new();
         let contract_ids = match contract_id {
             Some(contract_id) => {
@@ -592,24 +653,69 @@ where
             }
             _ => self.contract_ids().collect::<IndexSet<_>>(),
         };
+        let contract_count = contract_ids.len();
 
         let mut witness_ids = IndexSet::new();
+        let mut contract_witnesses = IndexMap::new();
+        let mut next_candidates = IndexMap::new();
+        let collect_started_at = Instant::now();
+        let mut scanned_witnesses = 0usize;
+        let mut skipped_mature_mined = 0usize;
+        let mut cache_hits = 0usize;
+        let mut cache_misses = 0usize;
         for contract_id in contract_ids.iter().copied() {
-            self.with_contract_mut(
-                contract_id,
-                |contract| {
-                    for witness_id in contract.witness_ids() {
-                        let old_status = contract.witness_status(witness_id);
-                        if matches!(old_status, WitnessStatus::Mined(height) if last_block_height - height.get() > min_conformations as u64) {
-                            continue;
-                        }
-                        witness_ids.insert(witness_id);
+            let cached_candidates = self
+                .witness_update_candidates
+                .borrow()
+                .get(&(contract_id, min_conformations))
+                .cloned();
+
+            let candidates = self.with_contract_mut(contract_id, |contract| {
+                if let Some(candidates) = cached_candidates {
+                    cache_hits += 1;
+                    candidates.into_iter().collect::<Vec<_>>()
+                } else {
+                    cache_misses += 1;
+                    contract.witness_ids()
+                }
+            });
+
+            self.with_contract_mut(contract_id, |contract| {
+                let mut pending_witnesses = Vec::with_capacity(candidates.len());
+                for witness_id in candidates {
+                    scanned_witnesses += 1;
+                    let old_status = contract.witness_status(witness_id);
+                    if witness_status_is_mature(old_status, last_block_height, min_conformations) {
+                        skipped_mature_mined += 1;
+                        continue;
                     }
-                },
+                    witness_ids.insert(witness_id);
+                    pending_witnesses.push((witness_id, old_status));
+                }
+                contract_witnesses.insert(contract_id, pending_witnesses);
+            });
+        }
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(collect_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "update_witnesses_collect",
+                elapsed_ms,
+                requested_contract = ?contract_id,
+                contract_count,
+                scanned_witnesses,
+                unique_witnesses = witness_ids.len(),
+                skipped_mature_mined,
+                cache_hits,
+                cache_misses,
+                last_block_height,
+                min_conformations,
+                "Slow rgb-std stage"
             );
         }
 
         let resolver = &resolver;
+        let resolve_started_at = Instant::now();
+        let unique_witnesses = witness_ids.len();
         let resolved = stream::iter(witness_ids.into_iter().map(|witness_id| {
             let resolver = resolver;
             async move {
@@ -623,33 +729,101 @@ where
         .buffer_unordered(RESOLVER_CONCURRENCY_LIMIT)
         .try_collect::<Vec<_>>()
         .await?;
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(resolve_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "update_witnesses_resolve",
+                elapsed_ms,
+                requested_contract = ?contract_id,
+                contract_count,
+                unique_witnesses,
+                resolved = resolved.len(),
+                resolver_concurrency = RESOLVER_CONCURRENCY_LIMIT,
+                "Slow rgb-std stage"
+            );
+        }
 
         resolved_statuses.extend(resolved);
 
+        let sync_started_at = Instant::now();
+        let mut sync_scanned_witnesses = 0usize;
+        let mut changed_statuses_total = 0usize;
+        let mut synced_contracts = 0usize;
         for contract_id in contract_ids {
+            let witnesses = contract_witnesses
+                .shift_remove(&contract_id)
+                .unwrap_or_default();
+            let mut next_contract_candidates = IndexSet::new();
             self.with_contract_mut(
                 contract_id,
                 |contract| -> Result<(), MultiError<SyncError<E>, <Sp::Stock as Stock>::Error>> {
                     let mut changed_statuses = IndexMap::<_, WitnessStatus>::new();
-                    for witness_id in contract.witness_ids() {
-                        let old_status = contract.witness_status(witness_id);
-                        if matches!(old_status, WitnessStatus::Mined(height) if last_block_height - height.get() > min_conformations as u64) {
-                            continue;
+                    for (witness_id, old_status) in witnesses {
+                        sync_scanned_witnesses += 1;
+                        let new_status = resolved_statuses
+                            .get(&witness_id)
+                            .copied()
+                            .unwrap_or(old_status);
+                        if !witness_status_is_mature(
+                            new_status,
+                            last_block_height,
+                            min_conformations,
+                        ) {
+                            next_contract_candidates.insert(witness_id);
                         }
-
-                        if let Some(new_status) = resolved_statuses.get(&witness_id).copied() {
-                            if new_status != old_status {
-                                changed_statuses.insert(witness_id, new_status);
-                            }
+                        if new_status != old_status {
+                            changed_statuses.insert(witness_id, new_status);
                         }
                     }
-
-                    contract
-                        .sync(changed_statuses.iter().map(|(id, status)| (*id, *status)))
-                        .map_err(MultiError::from_other_a)?;
+                    changed_statuses_total += changed_statuses.len();
+                    if !changed_statuses.is_empty() {
+                        synced_contracts += 1;
+                        contract
+                            .sync(changed_statuses.iter().map(|(id, status)| (*id, *status)))
+                            .map_err(MultiError::from_other_a)?;
+                    }
                     Ok(())
                 },
             )?;
+            next_candidates.insert((contract_id, min_conformations), next_contract_candidates);
+        }
+        {
+            let mut witness_update_candidates = self.witness_update_candidates.borrow_mut();
+            for (key, candidates) in next_candidates {
+                witness_update_candidates.insert(key, candidates);
+            }
+        }
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(sync_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "update_witnesses_sync",
+                elapsed_ms,
+                requested_contract = ?contract_id,
+                contract_count,
+                sync_scanned_witnesses,
+                changed_statuses_total,
+                synced_contracts,
+                cache_hits,
+                cache_misses,
+                "Slow rgb-std stage"
+            );
+        }
+
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(total_started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "update_witnesses_total",
+                elapsed_ms,
+                requested_contract = ?contract_id,
+                contract_count,
+                scanned_witnesses,
+                unique_witnesses,
+                changed_statuses_total,
+                synced_contracts,
+                cache_hits,
+                cache_misses,
+                "Slow rgb-std stage"
+            );
         }
 
         Ok(())
@@ -679,6 +853,17 @@ where
         pub_witness: &<<Sp::Pile as Pile>::Seal as RgbSeal>::Published,
         anchor: <<Sp::Pile as Pile>::Seal as RgbSeal>::Client,
     ) {
+        #[cfg(feature = "async")]
+        {
+            let witness_id = pub_witness.pub_id();
+            for ((cached_contract_id, _), candidates) in
+                self.witness_update_candidates.borrow_mut().iter_mut()
+            {
+                if *cached_contract_id == contract_id {
+                    candidates.insert(witness_id);
+                }
+            }
+        }
         self.with_contract_mut(contract_id, |contract| contract.include(opid, anchor, pub_witness))
     }
 
@@ -787,6 +972,35 @@ where
         )
     }
 
+    pub fn resolved_owned_state_entries_filtered(
+        &mut self,
+        contract_id: ContractId,
+        name: &StateName,
+        predicate: impl FnMut(&<Sp::Pile as Pile>::Seal) -> bool,
+    ) -> Vec<OwnedState<<Sp::Pile as Pile>::Seal>>
+    where
+        <Sp::Pile as Pile>::Seal: Clone,
+    {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.resolved_owned_state_entries_filtered(name, predicate)
+        })
+    }
+
+    pub fn resolved_owned_state_entries_filtered_take(
+        &mut self,
+        contract_id: ContractId,
+        name: &StateName,
+        predicate: impl FnMut(&<Sp::Pile as Pile>::Seal) -> bool,
+        limit: Option<usize>,
+    ) -> Vec<OwnedState<<Sp::Pile as Pile>::Seal>>
+    where
+        <Sp::Pile as Pile>::Seal: Clone,
+    {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.resolved_owned_state_entries_filtered_take(name, predicate, limit)
+        })
+    }
+
     /// Consume a consignment stream.
     ///
     /// The method:
@@ -845,15 +1059,54 @@ where
 
                 let contract = self.persistence.import_contract(articles, consignment)?;
                 self.contracts.borrow_mut().insert(contract_id, contract);
+                #[cfg(feature = "async")]
+                {
+                    self.witness_update_candidates
+                        .borrow_mut()
+                        .retain(|(cached_contract_id, _), _| *cached_contract_id != contract_id);
+                }
                 Ok(())
             } else {
                 Err(MultiError::A(ConsumeError::UnknownContract(contract_id)))
             }
         } else {
-            self.with_contract_mut(contract_id, |contract| {
+            #[cfg(feature = "async")]
+            let previous_witness_ids = self.with_contract_mut(contract_id, |contract| {
+                contract.witness_ids().into_iter().collect::<IndexSet<_>>()
+            });
+            let result = self.with_contract_mut(contract_id, |contract| {
                 contract.consume_internal(reader, seal_resolver, sig_validator)
-            })
-            .map_err(|err| match err {
+            });
+            if result.is_ok() {
+                #[cfg(feature = "async")]
+                {
+                    let new_witness_ids = self.with_contract_mut(contract_id, |contract| {
+                        contract
+                            .witness_ids()
+                            .into_iter()
+                            .filter(|witness_id| !previous_witness_ids.contains(witness_id))
+                            .collect::<Vec<_>>()
+                    });
+                    if !new_witness_ids.is_empty()
+                        && self
+                            .witness_update_candidates
+                            .borrow()
+                            .keys()
+                            .any(|(cached_contract_id, _)| *cached_contract_id == contract_id)
+                    {
+                        let mut witness_update_candidates =
+                            self.witness_update_candidates.borrow_mut();
+                        for ((cached_contract_id, _), candidates) in
+                            witness_update_candidates.iter_mut()
+                        {
+                            if *cached_contract_id == contract_id {
+                                candidates.extend(new_witness_ids.iter().copied());
+                            }
+                        }
+                    }
+                }
+            }
+            result.map_err(|err| match err {
                 MultiError::A(a) => MultiError::A(a),
                 MultiError::B(b) => MultiError::B(b),
                 MultiError::C(_) => unreachable!(),
