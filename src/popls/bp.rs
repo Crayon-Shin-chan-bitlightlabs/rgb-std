@@ -50,7 +50,7 @@ use hypersonic::{
 use indexmap::IndexSet;
 use invoice::bp::{Address, WitnessOut};
 use invoice::{RgbBeneficiary, RgbInvoice};
-use rgb::RgbSealDef;
+use rgb::{OperationSeals, RgbSealDef};
 use rgbcore::LIB_NAME_RGB;
 use strict_encoding::{ReadRaw, StrictDecode, StrictReader, TypeName};
 use strict_types::StrictVal;
@@ -1085,6 +1085,45 @@ where
         };
         self.contracts
             .consume(allow_unknown, reader, seal_resolver, sig_validator)
+    }
+
+    /// Consume a consignment stream using operations decoded while creating the consignment.
+    ///
+    /// This preserves the same wallet seal-resolution semantics as [`Self::consume`].
+    #[allow(clippy::result_large_err)]
+    pub fn consume_predecoded_operations<E>(
+        &mut self,
+        reader: &mut StrictReader<impl ReadRaw>,
+        operations: Vec<OperationSeals<<Sp::Pile as Pile>::Seal>>,
+        sig_validator: impl FnOnce(StrictHash, &Identity, &SigBlob) -> Result<(), E>,
+    ) -> Result<
+        (),
+        MultiError<ConsumeError<WTxoSeal>, <Sp::Stock as Stock>::Error, <Sp::Pile as Pile>::Error>,
+    >
+    where
+        <Sp::Pile as Pile>::Conf: From<<Sp::Stock as Stock>::Conf>,
+    {
+        let seal_resolver = |op: &Operation| {
+            self.wallet
+                .resolve_seals(op.destructible_out.iter().map(|cell| cell.auth))
+                .map(|seal| {
+                    let auth = seal.auth_token();
+                    let op_out =
+                        op.destructible_out
+                            .iter()
+                            .position(|cell| cell.auth == auth)
+                            .expect("invalid wallet implementation") as u16;
+                    (op_out, seal)
+                })
+                .collect()
+        };
+
+        self.contracts.consume_predecoded_operations(
+            reader,
+            operations,
+            seal_resolver,
+            sig_validator,
+        )
     }
 
     #[cfg(not(feature = "async"))]

@@ -72,8 +72,8 @@ pub mod stl;
 pub use bp::{Outpoint, Txid};
 pub use consignment::{parse_consignment, Consignment, MAX_CONSIGNMENT_OPS};
 pub use contract::{
-    Assignment, ConsumeError, Contract, ContractState, CreateParams, EitherSeal, ImmutableState,
-    OwnedState,
+    take_last_consume_op_counts, Assignment, ConsumeError, Contract, ContractState, CreateParams,
+    EitherSeal, ImmutableState, LastConsumeOpCounts, OwnedState,
 };
 #[cfg(feature = "async")]
 pub use contracts::TxidResolver;
@@ -83,7 +83,7 @@ pub use contracts::{
     ContractStateName, Contracts, IssuerError, SyncError, WalletState, CONSIGN_VERSION,
 };
 pub use hypersonic::*;
-pub use pile::{OpRels, Pile, PileSession, Witness, WitnessStatus};
+pub use pile::{KnownOperationAuxMatches, OpRels, Pile, PileSession, Witness, WitnessStatus};
 pub use rgb::*;
 pub use stockpile::Stockpile;
 pub use util::{ContractRef, InvalidContractRef};

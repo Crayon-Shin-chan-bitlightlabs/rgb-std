@@ -22,7 +22,7 @@
 // or implied. See the License for the specific language governing permissions and limitations under
 // the License.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use core::borrow::Borrow;
 use core::cell::RefCell;
 #[cfg(feature = "async")]
@@ -43,7 +43,7 @@ use hypersonic::{
     AcceptError, AuthToken, CallParams, CellAddr, CodexId, ContractId, ContractName, Opid, Stock,
 };
 use indexmap::{IndexMap, IndexSet};
-use rgb::RgbSeal;
+use rgb::{OperationSeals, RgbSeal};
 #[cfg(feature = "async")]
 use single_use_seals::PublishedWitness;
 use strict_encoding::{
@@ -116,9 +116,7 @@ pub struct WalletState<Seal> {
 }
 
 impl<Seal> Default for WalletState<Seal> {
-    fn default() -> Self {
-        Self { immutable: bmap! {}, owned: bmap! {}, aggregated: bmap! {} }
-    }
+    fn default() -> Self { Self { immutable: bmap! {}, owned: bmap! {}, aggregated: bmap! {} } }
 }
 
 impl<Seal> WalletState<Seal> {
@@ -329,13 +327,9 @@ where
         self.persistence.codex_ids()
     }
 
-    pub fn issuers_count(&self) -> usize {
-        self.persistence.issuers_count()
-    }
+    pub fn issuers_count(&self) -> usize { self.persistence.issuers_count() }
 
-    pub fn has_issuer(&self, codex_id: CodexId) -> bool {
-        self.persistence.has_issuer(codex_id)
-    }
+    pub fn has_issuer(&self, codex_id: CodexId) -> bool { self.persistence.has_issuer(codex_id) }
 
     pub fn issuers(&self) -> impl Iterator<Item = (CodexId, Issuer)> + use<'_, Sp, S, C> {
         self.persistence
@@ -352,9 +346,7 @@ where
         Some(issuer)
     }
 
-    pub fn contracts_count(&self) -> usize {
-        self.persistence.contracts_count()
-    }
+    pub fn contracts_count(&self) -> usize { self.persistence.contracts_count() }
 
     pub fn has_contract(&self, contract_id: ContractId) -> bool {
         self.persistence.has_contract(contract_id)
@@ -383,6 +375,10 @@ where
 
     pub fn contract_known_seal_cells(&mut self, contract_id: ContractId) -> Vec<CellAddr> {
         self.with_contract_mut(contract_id, |contract| contract.known_seal_cells())
+    }
+
+    pub fn contract_valid_opids(&mut self, contract_id: ContractId) -> Vec<Opid> {
+        self.with_contract_mut(contract_id, |contract| contract.valid_opids())
     }
 
     pub fn contract_known_resolved_seals(
@@ -415,9 +411,7 @@ where
     pub fn extend_contract_external_seal_definitions(
         &mut self,
         contract_id: ContractId,
-        seals: impl IntoIterator<
-            Item = (CellAddr, <<Sp::Pile as Pile>::Seal as RgbSeal>::Definition),
-        >,
+        seals: impl IntoIterator<Item = (CellAddr, <<Sp::Pile as Pile>::Seal as RgbSeal>::Definition)>,
     ) {
         self.with_contract_mut(contract_id, |contract| {
             contract.extend_external_seal_definitions(seals);
@@ -1030,7 +1024,9 @@ where
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
     where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1063,11 +1059,39 @@ where
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
     where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
         self.with_contract_mut(contract_id, |contract| contract.consign(terminals, writer))
+    }
+
+    pub fn terminal_opids(
+        &self,
+        contract_id: ContractId,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+    ) -> BTreeSet<Opid> {
+        self.with_contract(contract_id, |contract| contract.terminal_opids(terminals), None)
+    }
+
+    pub fn consign_predecoded(
+        &mut self,
+        contract_id: ContractId,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<Vec<OperationSeals<<Sp::Pile as Pile>::Seal>>>
+    where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.consign_predecoded(terminals, writer)
+        })
     }
 
     pub fn consign_with_known_opids(
@@ -1078,7 +1102,9 @@ where
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
     where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1095,7 +1121,9 @@ where
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
     where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1113,7 +1141,9 @@ where
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
     where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1148,6 +1178,175 @@ where
         result
     }
 
+    pub fn consign_with_known_cells_and_opids_predecoded(
+        &mut self,
+        contract_id: ContractId,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+        known_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<Vec<OperationSeals<<Sp::Pile as Pile>::Seal>>>
+    where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        let started_at = Instant::now();
+        tracing::debug!(
+            operation = "rgb_std",
+            stage = "contracts_consign_known_boundaries_start",
+            ?contract_id,
+            trusted_known_opids = false,
+            predecoded_operations = true,
+            "Starting rgb-std contracts consignment wrapper"
+        );
+        let result = self.with_contract_mut(contract_id, |contract| {
+            tracing::debug!(
+                operation = "rgb_std",
+                stage = "contracts_consign_known_boundaries_contract_ready",
+                ?contract_id,
+                trusted_known_opids = false,
+                predecoded_operations = true,
+                "RGB contract ready for consignment"
+            );
+            contract.consign_with_known_cells_and_opids_predecoded(
+                terminals,
+                known_cells,
+                known_opids,
+                writer,
+            )
+        });
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "contracts_consign_known_boundaries_total",
+                elapsed_ms,
+                ?contract_id,
+                trusted_known_opids = false,
+                predecoded_operations = true,
+                "Slow rgb-std stage"
+            );
+        }
+        result
+    }
+
+    pub fn consign_with_known_cells_opids_and_immutable_checkpoints(
+        &mut self,
+        contract_id: ContractId,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+        known_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        immutable_checkpoint_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<()>
+    where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        let started_at = Instant::now();
+        tracing::debug!(
+            operation = "rgb_std",
+            stage = "contracts_consign_known_boundaries_start",
+            ?contract_id,
+            trusted_known_opids = false,
+            immutable_checkpoints = true,
+            "Starting rgb-std contracts consignment wrapper"
+        );
+        let result = self.with_contract_mut(contract_id, |contract| {
+            tracing::debug!(
+                operation = "rgb_std",
+                stage = "contracts_consign_known_boundaries_contract_ready",
+                ?contract_id,
+                trusted_known_opids = false,
+                immutable_checkpoints = true,
+                "RGB contract ready for consignment"
+            );
+            contract.consign_with_known_cells_opids_and_immutable_checkpoints(
+                terminals,
+                known_cells,
+                known_opids,
+                immutable_checkpoint_opids,
+                writer,
+            )
+        });
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "contracts_consign_known_boundaries_total",
+                elapsed_ms,
+                ?contract_id,
+                trusted_known_opids = false,
+                immutable_checkpoints = true,
+                "Slow rgb-std stage"
+            );
+        }
+        result
+    }
+
+    pub fn consign_with_known_cells_opids_and_immutable_checkpoints_predecoded(
+        &mut self,
+        contract_id: ContractId,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+        known_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        immutable_checkpoint_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<Vec<OperationSeals<<Sp::Pile as Pile>::Seal>>>
+    where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        let started_at = Instant::now();
+        tracing::debug!(
+            operation = "rgb_std",
+            stage = "contracts_consign_known_boundaries_start",
+            ?contract_id,
+            trusted_known_opids = false,
+            immutable_checkpoints = true,
+            predecoded_operations = true,
+            "Starting rgb-std contracts consignment wrapper"
+        );
+        let result = self.with_contract_mut(contract_id, |contract| {
+            tracing::debug!(
+                operation = "rgb_std",
+                stage = "contracts_consign_known_boundaries_contract_ready",
+                ?contract_id,
+                trusted_known_opids = false,
+                immutable_checkpoints = true,
+                predecoded_operations = true,
+                "RGB contract ready for consignment"
+            );
+            contract.consign_with_known_cells_opids_and_immutable_checkpoints_predecoded(
+                terminals,
+                known_cells,
+                known_opids,
+                immutable_checkpoint_opids,
+                writer,
+            )
+        });
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "contracts_consign_known_boundaries_total",
+                elapsed_ms,
+                ?contract_id,
+                trusted_known_opids = false,
+                immutable_checkpoints = true,
+                predecoded_operations = true,
+                "Slow rgb-std stage"
+            );
+        }
+        result
+    }
+
     pub fn consign_with_trusted_known_cells_and_opids(
         &mut self,
         contract_id: ContractId,
@@ -1157,7 +1356,9 @@ where
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
     where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1204,7 +1405,9 @@ where
         writer: StrictWriter<impl WriteRaw>,
     ) -> io::Result<()>
     where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
@@ -1383,6 +1586,81 @@ where
             })
         }
     }
+
+    pub fn consume_predecoded_operations<E>(
+        &mut self,
+        reader: &mut StrictReader<impl ReadRaw>,
+        operations: Vec<OperationSeals<<Sp::Pile as Pile>::Seal>>,
+        seal_resolver: impl FnMut(
+            &Operation,
+        )
+            -> BTreeMap<u16, <<Sp::Pile as Pile>::Seal as RgbSeal>::Definition>,
+        sig_validator: impl FnOnce(StrictHash, &Identity, &SigBlob) -> Result<(), E>,
+    ) -> Result<
+        (),
+        MultiError<
+            ConsumeError<<<Sp::Pile as Pile>::Seal as RgbSeal>::Definition>,
+            <Sp::Stock as Stock>::Error,
+            <Sp::Pile as Pile>::Error,
+        >,
+    >
+    where
+        <Sp::Pile as Pile>::Conf: From<<Sp::Stock as Stock>::Conf>,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDecode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDecode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictDecode,
+    {
+        let contract_id = parse_consignment(reader).map_err(MultiError::from_a)?;
+        if !self.has_contract(contract_id) {
+            return Err(MultiError::A(ConsumeError::UnknownContract(contract_id)));
+        }
+
+        #[cfg(feature = "async")]
+        let previous_witness_ids = self.with_contract_mut(contract_id, |contract| {
+            contract.witness_ids().into_iter().collect::<IndexSet<_>>()
+        });
+        let result = self.with_contract_mut(contract_id, |contract| {
+            contract.consume_internal_predecoded_operations(
+                reader,
+                operations,
+                seal_resolver,
+                sig_validator,
+            )
+        });
+        if result.is_ok() {
+            #[cfg(feature = "async")]
+            {
+                let new_witness_ids = self.with_contract_mut(contract_id, |contract| {
+                    contract
+                        .witness_ids()
+                        .into_iter()
+                        .filter(|witness_id| !previous_witness_ids.contains(witness_id))
+                        .collect::<Vec<_>>()
+                });
+                if !new_witness_ids.is_empty()
+                    && self
+                        .witness_update_candidates
+                        .borrow()
+                        .keys()
+                        .any(|(cached_contract_id, _)| *cached_contract_id == contract_id)
+                {
+                    let mut witness_update_candidates = self.witness_update_candidates.borrow_mut();
+                    for ((cached_contract_id, _), candidates) in
+                        witness_update_candidates.iter_mut()
+                    {
+                        if *cached_contract_id == contract_id {
+                            candidates.extend(new_witness_ids.iter().copied());
+                        }
+                    }
+                }
+            }
+        }
+        result.map_err(|err| match err {
+            MultiError::A(a) => MultiError::A(a),
+            MultiError::B(b) => MultiError::B(b),
+            MultiError::C(_) => unreachable!(),
+        })
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Display, Error, From)]
@@ -1463,7 +1741,9 @@ mod _fs {
             terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
         ) -> io::Result<()>
         where
+            <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
             <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+            <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
             <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
             <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
         {
