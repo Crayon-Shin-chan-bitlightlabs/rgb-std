@@ -9,6 +9,7 @@ use core::error::Error;
 use core::marker::PhantomData;
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use amplify::confinement::SmallOrdMap;
@@ -40,6 +41,9 @@ use crate::{
 
 const RGB_STD_SLOW_STAGE_THRESHOLD: Duration = Duration::from_millis(500);
 const OP_AUX_CACHE_MAX_BYTES: usize = 3 * 1024 * 1024;
+const OWNED_STATE_STATUS_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+const OWNED_STATE_STATUS_CACHE_MAX_OPS: usize = 50_000;
+const OWNED_STATE_STATUS_CACHE_MAX_WITNESSES: usize = 50_000;
 
 fn slow_rgb_stage_elapsed(started_at: Instant) -> Option<u128> {
     let elapsed = started_at.elapsed();
@@ -59,14 +63,18 @@ pub enum EitherSeal<Seal> {
 
 impl<Seal> EitherSeal<Seal> {
     pub fn auth_token(&self) -> AuthToken
-    where Seal: RgbSealDef {
+    where
+        Seal: RgbSealDef,
+    {
         match self {
             EitherSeal::Alt(seal) => seal.auth_token(),
             EitherSeal::Token(auth) => *auth,
         }
     }
     pub fn to_explicit(&self) -> Option<Seal>
-    where Seal: Clone {
+    where
+        Seal: Clone,
+    {
         match self {
             EitherSeal::Alt(seal) => Some(seal.clone()),
             EitherSeal::Token(_) => None,
@@ -85,7 +93,9 @@ pub struct Assignment<Seal> {
     pub data: StrictVal,
 }
 impl<Seal> Assignment<Seal> {
-    pub fn new(seal: Seal, data: impl Into<StrictVal>) -> Self { Self { seal, data: data.into() } }
+    pub fn new(seal: Seal, data: impl Into<StrictVal>) -> Self {
+        Self { seal, data: data.into() }
+    }
 }
 impl<Seal> Assignment<EitherSeal<Seal>> {
     pub fn new_external(auth: AuthToken, data: impl Into<StrictVal>) -> Self {
@@ -110,6 +120,41 @@ pub struct OwnedState<Seal> {
 }
 
 type ResolvedOwnedEntry<Seal> = (CellAddr, Assignment<Seal>);
+
+#[derive(Clone, Debug)]
+struct OwnedStateStatusCache<Wid> {
+    genesis_opid: Option<Opid>,
+    parent_ops: BTreeMap<Opid, Vec<Opid>>,
+    op_witness_ids: BTreeMap<Opid, Vec<Wid>>,
+    witness_statuses: BTreeMap<Wid, WitnessStatus>,
+    best_statuses: BTreeMap<Opid, WitnessStatus>,
+    ancestor_statuses: BTreeMap<Opid, WitnessStatus>,
+    touched_at: Instant,
+}
+
+impl<Wid> Default for OwnedStateStatusCache<Wid> {
+    fn default() -> Self {
+        Self {
+            genesis_opid: None,
+            parent_ops: BTreeMap::new(),
+            op_witness_ids: BTreeMap::new(),
+            witness_statuses: BTreeMap::new(),
+            best_statuses: BTreeMap::new(),
+            ancestor_statuses: BTreeMap::new(),
+            touched_at: Instant::now(),
+        }
+    }
+}
+
+impl<Wid> OwnedStateStatusCache<Wid> {
+    fn is_warm(&self) -> bool {
+        self.genesis_opid.is_some()
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -254,8 +299,14 @@ pub struct Contract<S: Stock, P: Pile> {
     pile: P,
     /// In-memory cache of valid opids for `ContractApi::is_known(&self)` which requires &self.
     valid_cache: HashSet<Opid>,
+    seal_def_cache: HashMap<CellAddr, <P::Seal as RgbSeal>::Definition>,
+    resolved_seal_cache: HashMap<CellAddr, P::Seal>,
+    external_resolved_seal_cache: Arc<HashMap<CellAddr, P::Seal>>,
+    duplicate_seal_def_cache: HashSet<CellAddr>,
+    duplicate_witness_cache: HashSet<(Opid, <P::Seal as RgbSeal>::WitnessId)>,
     op_aux_cache: HashMap<Opid, Vec<u8>>,
     op_aux_cache_bytes: usize,
+    owned_state_status_cache: OwnedStateStatusCache<<P::Seal as RgbSeal>::WitnessId>,
 }
 
 #[derive(Debug, Default)]
@@ -268,6 +319,7 @@ struct ConsumeStats {
     duplicate_seal_updates: usize,
     witness_updates: usize,
     duplicate_witness_updates: usize,
+    known_materialized_skips: usize,
 }
 
 thread_local! {
@@ -292,19 +344,64 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 if session.is_valid(genesis_opid) {
                     valid.insert(genesis_opid);
                 }
-                let opids = session
-                    .operations()
-                    .map(|(opid, _)| opid)
-                    .collect::<Vec<_>>();
-                for opid in opids {
-                    if session.is_valid(opid) {
-                        valid.insert(opid);
-                    }
+                for opid in session.valid_opids() {
+                    valid.insert(opid);
                 }
                 Ok::<_, core::convert::Infallible>(valid)
             })
             .expect("infallible valid cache refresh");
         self.valid_cache = valid_cache;
+    }
+
+    fn clear_owned_state_status_cache(&mut self) {
+        self.owned_state_status_cache.clear();
+    }
+
+    fn ensure_owned_state_status_cache(
+        &mut self,
+        cache: &mut OwnedStateStatusCache<<P::Seal as RgbSeal>::WitnessId>,
+    ) {
+        if cache.is_warm() && cache.touched_at.elapsed() < OWNED_STATE_STATUS_CACHE_TTL {
+            cache.touched_at = Instant::now();
+            return;
+        }
+        cache.clear();
+
+        let genesis_opid = self.ledger.articles().genesis_opid();
+        let parent_ops: BTreeMap<Opid, Vec<Opid>> = self
+            .ledger
+            .operation_parent_ops()
+            .collect();
+
+        if parent_ops.len() > OWNED_STATE_STATUS_CACHE_MAX_OPS {
+            return;
+        }
+
+        let mut op_witness_ids = BTreeMap::new();
+        let mut witness_statuses = BTreeMap::new();
+        {
+            let mut session = self.pile.session();
+            for opid in parent_ops.keys().copied().chain([genesis_opid]) {
+                let wids = session.op_witness_ids(opid).collect::<Vec<_>>();
+                for wid in &wids {
+                    witness_statuses
+                        .entry(*wid)
+                        .or_insert_with(|| session.witness_status(*wid));
+                    if witness_statuses.len() > OWNED_STATE_STATUS_CACHE_MAX_WITNESSES {
+                        return;
+                    }
+                }
+                op_witness_ids.insert(opid, wids);
+            }
+        }
+
+        cache.genesis_opid = Some(genesis_opid);
+        cache.parent_ops = parent_ops;
+        cache.op_witness_ids = op_witness_ids;
+        cache.witness_statuses = witness_statuses;
+        cache.best_statuses.clear();
+        cache.ancestor_statuses.clear();
+        cache.touched_at = Instant::now();
     }
 
     pub fn with(
@@ -331,8 +428,14 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             pile,
             contract_id,
             valid_cache: HashSet::from([genesis_opid]),
+            seal_def_cache: HashMap::new(),
+            resolved_seal_cache: HashMap::new(),
+            external_resolved_seal_cache: Arc::new(HashMap::new()),
+            duplicate_seal_def_cache: HashSet::new(),
+            duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
             op_aux_cache_bytes: 0,
+            owned_state_status_cache: OwnedStateStatusCache::default(),
         };
         contract
             .evaluate_commit(consignment.into_operations())
@@ -397,8 +500,14 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             pile,
             contract_id,
             valid_cache: HashSet::from([genesis_opid]),
+            seal_def_cache: HashMap::new(),
+            resolved_seal_cache: HashMap::new(),
+            external_resolved_seal_cache: Arc::new(HashMap::new()),
+            duplicate_seal_def_cache: HashSet::new(),
+            duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
             op_aux_cache_bytes: 0,
+            owned_state_status_cache: OwnedStateStatusCache::default(),
         })
     }
 
@@ -414,16 +523,28 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             pile,
             contract_id,
             valid_cache: HashSet::new(),
+            seal_def_cache: HashMap::new(),
+            resolved_seal_cache: HashMap::new(),
+            external_resolved_seal_cache: Arc::new(HashMap::new()),
+            duplicate_seal_def_cache: HashSet::new(),
+            duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
             op_aux_cache_bytes: 0,
+            owned_state_status_cache: OwnedStateStatusCache::default(),
         };
         contract.refresh_valid_cache();
         Ok(contract)
     }
 
-    pub fn contract_id(&self) -> ContractId { self.contract_id }
-    pub fn articles(&self) -> &Articles { self.ledger.articles() }
-    pub fn full_state(&self) -> &EffectiveState { self.ledger.state() }
+    pub fn contract_id(&self) -> ContractId {
+        self.contract_id
+    }
+    pub fn articles(&self) -> &Articles {
+        self.ledger.articles()
+    }
+    pub fn full_state(&self) -> &EffectiveState {
+        self.ledger.state()
+    }
 
     fn best_op_status(&mut self, opid: Opid) -> WitnessStatus {
         let wids: Vec<_> = self.pile.session().op_witness_ids(opid).collect();
@@ -528,10 +649,83 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             .collect()
     }
 
-    pub fn trace_ops(&mut self) -> Vec<(Opid, Transition)> { self.ledger.trace_iter().collect() }
+    pub fn trace_ops(&mut self) -> Vec<(Opid, Transition)> {
+        self.ledger.trace_iter().collect()
+    }
+
+    pub fn known_seal_cells(&mut self) -> Vec<CellAddr> {
+        self.pile.session().known_seal_cells().collect()
+    }
+
+    pub fn known_resolved_seals(&mut self) -> Vec<(CellAddr, P::Seal)> {
+        self.known_seal_cells()
+            .into_iter()
+            .filter_map(|addr| self.known_seal(addr).map(|seal| (addr, seal)))
+            .collect()
+    }
+
+    pub fn extend_external_resolved_seals(
+        &mut self,
+        seals: impl IntoIterator<Item = (CellAddr, P::Seal)>,
+    ) {
+        Arc::make_mut(&mut self.external_resolved_seal_cache).extend(seals);
+    }
+
+    pub fn set_external_resolved_seals(&mut self, seals: Arc<HashMap<CellAddr, P::Seal>>) {
+        self.external_resolved_seal_cache = seals;
+    }
+
+    pub fn boundary_opids_for_known_cells(
+        &mut self,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+    ) -> Vec<Opid> {
+        let known_cells = known_cells
+            .into_iter()
+            .map(|cell| *cell.borrow())
+            .collect::<HashSet<_>>();
+        if known_cells.is_empty() {
+            return vec![];
+        }
+
+        let mut pile_session = self.pile.session();
+        let known_seal_cells = pile_session
+            .known_seal_cells()
+            .filter(|cell| known_cells.contains(cell));
+        let mut known_positions_by_opid = HashMap::<Opid, HashSet<u16>>::new();
+        for cell in known_seal_cells {
+            known_positions_by_opid
+                .entry(cell.opid)
+                .or_default()
+                .insert(cell.pos);
+        }
+
+        self.ledger
+            .operation_output_counts()
+            .filter_map(|(opid, count)| {
+                let known_positions = known_positions_by_opid.get(&opid)?;
+                (known_positions.len() == count as usize
+                    && (0..count).all(|pos| known_positions.contains(&pos)))
+                    .then_some(opid)
+            })
+            .collect()
+    }
 
     pub fn witness_ids(&mut self) -> Vec<<P::Seal as RgbSeal>::WitnessId> {
         self.pile.session().witness_ids().collect()
+    }
+
+    pub fn witness_statuses(&mut self) -> Vec<(<P::Seal as RgbSeal>::WitnessId, WitnessStatus)> {
+        self.pile.session().witness_statuses()
+    }
+
+    pub fn witness_statuses_requiring_update(
+        &mut self,
+        last_block_height: u64,
+        min_confirmations: u32,
+    ) -> Vec<(<P::Seal as RgbSeal>::WitnessId, WitnessStatus)> {
+        self.pile
+            .session()
+            .witness_statuses_requiring_update(last_block_height, min_confirmations)
     }
 
     pub fn witnesses(&mut self) -> Vec<Witness<P::Seal>> {
@@ -540,6 +734,17 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
     pub fn witness_status(&mut self, wid: <P::Seal as RgbSeal>::WitnessId) -> WitnessStatus {
         self.pile.session().witness_status(wid)
+    }
+
+    pub fn witness_statuses_for(
+        &mut self,
+        witness_ids: impl IntoIterator<Item = <P::Seal as RgbSeal>::WitnessId>,
+    ) -> Vec<(<P::Seal as RgbSeal>::WitnessId, WitnessStatus)> {
+        self.pile.session().witness_statuses_for(witness_ids)
+    }
+
+    pub fn has_witness(&mut self, wid: <P::Seal as RgbSeal>::WitnessId) -> bool {
+        self.pile.session().has_witness(wid)
     }
 
     pub fn ops_by_witness_id(&mut self, wid: <P::Seal as RgbSeal>::WitnessId) -> Vec<Opid> {
@@ -556,7 +761,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     }
 
     pub fn owned_state_entries(&mut self, name: &StateName) -> Vec<(CellAddr, P::Seal, StrictVal)>
-    where P::Seal: Clone {
+    where
+        P::Seal: Clone,
+    {
         let Some(states) = self.ledger.state().main.owned.get(name) else {
             return vec![];
         };
@@ -575,7 +782,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     }
 
     pub fn resolved_owned_state_entries(&mut self, name: &StateName) -> Vec<OwnedState<P::Seal>>
-    where P::Seal: Clone {
+    where
+        P::Seal: Clone,
+    {
         self.state().owned.remove(name).unwrap_or_default()
     }
 
@@ -642,24 +851,23 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             return vec![];
         }
 
-        let genesis_opid = self.ledger.articles().genesis_opid();
-        let parent_ops: BTreeMap<Opid, Vec<Opid>> = self
-            .ledger
-            .operations()
-            .map(|(opid, op)| {
-                let parents = op
-                    .immutable_in
-                    .iter()
-                    .map(|inp| inp.opid)
-                    .chain(op.destructible_in.iter().map(|inp| inp.addr.opid))
-                    .collect();
-                (opid, parents)
-            })
-            .collect();
-        let mut op_witness_ids_cache = BTreeMap::new();
-        let mut witness_status_cache = BTreeMap::new();
-        let mut best_status_cache: BTreeMap<Opid, WitnessStatus> = BTreeMap::new();
-        let mut ancestor_cache: BTreeMap<Opid, WitnessStatus> = BTreeMap::new();
+        let mut status_cache = core::mem::take(&mut self.owned_state_status_cache);
+        self.ensure_owned_state_status_cache(&mut status_cache);
+        let fallback_parent_ops;
+        let (genesis_opid, parent_ops) = if let Some(genesis_opid) = status_cache.genesis_opid {
+            (genesis_opid, &status_cache.parent_ops)
+        } else {
+            let genesis_opid = self.ledger.articles().genesis_opid();
+            fallback_parent_ops = self
+                .ledger
+                .operation_parent_ops()
+                .collect();
+            (genesis_opid, &fallback_parent_ops)
+        };
+        let mut op_witness_ids_cache = core::mem::take(&mut status_cache.op_witness_ids);
+        let mut witness_status_cache = core::mem::take(&mut status_cache.witness_statuses);
+        let mut best_status_cache = core::mem::take(&mut status_cache.best_statuses);
+        let mut ancestor_cache = core::mem::take(&mut status_cache.ancestor_statuses);
 
         let mut result = selected
             .into_iter()
@@ -674,7 +882,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     .ancestor_status_cached(
                         addr.opid,
                         genesis_opid,
-                        &parent_ops,
+                        parent_ops,
                         &mut op_witness_ids_cache,
                         &mut witness_status_cache,
                         &mut best_status_cache,
@@ -698,7 +906,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     .ancestor_status_cached(
                         addr.opid,
                         genesis_opid,
-                        &parent_ops,
+                        parent_ops,
                         &mut op_witness_ids_cache,
                         &mut witness_status_cache,
                         &mut best_status_cache,
@@ -714,6 +922,15 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     break;
                 }
             }
+        }
+
+        if status_cache.genesis_opid.is_some() {
+            status_cache.op_witness_ids = op_witness_ids_cache;
+            status_cache.witness_statuses = witness_status_cache;
+            status_cache.best_statuses = best_status_cache;
+            status_cache.ancestor_statuses = ancestor_cache;
+            status_cache.touched_at = Instant::now();
+            self.owned_state_status_cache = status_cache;
         }
 
         result
@@ -893,6 +1110,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             let old = affected_wids.insert(wid, status);
             debug_assert!(old.is_none() || old == Some(status));
         }
+        let status_changed = !affected_wids.is_empty();
 
         let mut affected_ops = IndexMap::new();
         // Collect opids first, then compute status separately to avoid borrow conflict
@@ -944,6 +1162,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         self.pile.session().commit_transaction();
         self.ledger.forward(forward)?;
         self.pile.session().commit_transaction();
+        if status_changed {
+            self.clear_owned_state_status_cache();
+        }
         self.refresh_valid_cache();
         Ok(())
     }
@@ -956,9 +1177,14 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let opid = self.ledger.call(call)?;
         let operation = self.ledger.operation(opid);
         debug_assert_eq!(operation.opid(), opid);
+        for (no, seal) in &seals {
+            self.seal_def_cache
+                .insert(CellAddr::new(opid, *no), seal.clone());
+        }
         self.pile.session().add_seals(opid, seals);
         self.valid_cache.insert(opid);
         self.remove_op_aux_cache_entry(opid);
+        self.clear_owned_state_status_cache();
         debug_assert_eq!(operation.contract_id, self.contract_id());
         Ok(operation)
     }
@@ -996,9 +1222,12 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             ps.include_commit_transaction();
         }
         self.remove_op_aux_cache_entry(opid);
+        self.clear_owned_state_status_cache();
     }
 
-    pub(crate) fn commit_pile_transaction(&mut self) { self.pile.session().commit_transaction(); }
+    pub(crate) fn commit_pile_transaction(&mut self) {
+        self.pile.session().commit_transaction();
+    }
 
     fn aux<W: WriteRaw>(
         &mut self,
@@ -1109,7 +1338,114 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <P::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
+        self.consign_with_known_opids(terminals, std::iter::empty::<Opid>(), writer)
+    }
+
+    pub fn consign_with_known_opids(
+        &mut self,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<()>
+    where
+        <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        let known_opids = known_opids
+            .into_iter()
+            .map(|opid| *opid.borrow())
+            .collect::<HashSet<_>>();
+        self.consign_with_known_boundaries(terminals, known_opids, HashSet::new(), false, writer)
+    }
+
+    pub fn consign_with_known_cells(
+        &mut self,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<()>
+    where
+        <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        let known_cells = known_cells
+            .into_iter()
+            .map(|cell| *cell.borrow())
+            .collect::<HashSet<_>>();
+        self.consign_with_known_boundaries(terminals, HashSet::new(), known_cells, false, writer)
+    }
+
+    pub fn consign_with_known_cells_and_opids(
+        &mut self,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+        known_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<()>
+    where
+        <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        let known_cells = known_cells
+            .into_iter()
+            .map(|cell| *cell.borrow())
+            .collect::<HashSet<_>>();
+        let known_opids = known_opids
+            .into_iter()
+            .map(|opid| *opid.borrow())
+            .collect::<HashSet<_>>();
+        self.consign_with_known_boundaries(terminals, known_opids, known_cells, false, writer)
+    }
+
+    pub fn consign_with_trusted_known_cells_and_opids(
+        &mut self,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+        known_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<()>
+    where
+        <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        let known_cells = known_cells
+            .into_iter()
+            .map(|cell| *cell.borrow())
+            .collect::<HashSet<_>>();
+        let known_opids = known_opids
+            .into_iter()
+            .map(|opid| *opid.borrow())
+            .collect::<HashSet<_>>();
+        self.consign_with_known_boundaries(terminals, known_opids, known_cells, true, writer)
+    }
+
+    fn consign_with_known_boundaries(
+        &mut self,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_opids: HashSet<Opid>,
+        known_cells: HashSet<CellAddr>,
+        trust_known_opids: bool,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<()>
+    where
+        <P::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <P::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
         let total_started_at = Instant::now();
+        let raw_known_opids = known_opids.len();
+        let known_opids = if trust_known_opids {
+            known_opids
+        } else {
+            known_opids
+                .into_iter()
+                .filter(|opid| self.op_definitions_known_by_cells(*opid, &known_cells))
+                .collect::<HashSet<_>>()
+        };
         // Collect terminal opids
         let terminal_started_at = Instant::now();
         let terminal_opids: BTreeSet<Opid> = terminals
@@ -1135,10 +1471,16 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         macro_rules! include_op_with_dependencies {
             ($root:expr) => {{
                 let root = $root;
-                if root != genesis_opid && !selected_opids.contains(&root) {
+                if root != genesis_opid
+                    && !known_opids.contains(&root)
+                    && !selected_opids.contains(&root)
+                {
                     let mut stack = vec![(root, false)];
                     while let Some((opid, expanded)) = stack.pop() {
-                        if opid == genesis_opid || selected_opids.contains(&opid) {
+                        if opid == genesis_opid
+                            || known_opids.contains(&opid)
+                            || selected_opids.contains(&opid)
+                        {
                             continue;
                         }
                         if expanded {
@@ -1150,8 +1492,13 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
                         stack.push((opid, true));
                         let st = self.ledger.transition(opid);
-                        for prev in st.destroyed.into_keys().map(|addr| addr.opid) {
-                            if prev != genesis_opid && !selected_opids.contains(&prev) {
+                        for addr in st.destroyed.into_keys() {
+                            let prev = addr.opid;
+                            if prev != genesis_opid
+                                && !known_opids.contains(&prev)
+                                && !known_cells.contains(&addr)
+                                && !selected_opids.contains(&prev)
+                            {
                                 stack.push((prev, false));
                             }
                         }
@@ -1205,6 +1552,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 contract_id = ?self.contract_id,
                 terminal_ops = terminal_opids.len(),
                 selected_ops = selected_opids.len(),
+                known_ops = known_opids.len(),
+                raw_known_ops = raw_known_opids,
+                known_cells = known_cells.len(),
+                trust_known_opids,
                 published_ops_added,
                 "Slow rgb-std stage"
             );
@@ -1222,6 +1573,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 contract_id = ?self.contract_id,
                 selected_ops = ops.len(),
                 terminal_ops = terminal_opids.len(),
+                known_ops = known_opids.len(),
+                raw_known_ops = raw_known_opids,
+                known_cells = known_cells.len(),
+                trust_known_opids,
                 published_ops_added,
                 "Slow rgb-std stage"
             );
@@ -1247,6 +1602,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 elapsed_ms,
                 ?contract_id,
                 selected_ops = count,
+                known_ops = known_opids.len(),
+                raw_known_ops = raw_known_opids,
+                known_cells = known_cells.len(),
+                trust_known_opids,
                 "Slow rgb-std stage"
             );
         }
@@ -1257,10 +1616,27 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 elapsed_ms,
                 ?contract_id,
                 selected_ops = count,
+                known_ops = known_opids.len(),
+                raw_known_ops = raw_known_opids,
+                known_cells = known_cells.len(),
+                trust_known_opids,
                 "Slow rgb-std stage"
             );
         }
         Ok(())
+    }
+
+    fn op_definitions_known_by_cells(
+        &mut self,
+        opid: Opid,
+        known_cells: &HashSet<CellAddr>,
+    ) -> bool {
+        let op = self.ledger.operation(opid);
+        let up_to = op.destructible_out.len_u16();
+        let rels = self.pile.session().op_relations(opid, up_to);
+        (0..up_to).all(|no| {
+            rels.defines.contains_key(&no) && known_cells.contains(&CellAddr::new(opid, no))
+        })
     }
 
     pub fn consume<E>(
@@ -1331,6 +1707,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     duplicate_seal_updates = stats.duplicate_seal_updates,
                     witness_updates = stats.witness_updates,
                     duplicate_witness_updates = stats.duplicate_witness_updates,
+                    known_materialized_skips = stats.known_materialized_skips,
                     "Slow rgb-std stage"
                 );
             }
@@ -1406,10 +1783,18 @@ impl<'r, Seal: RgbSeal, R: ReadRaw, F: FnMut(&Operation) -> BTreeMap<u16, Seal::
 }
 
 impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
-    fn contract_id(&self) -> ContractId { self.ledger.contract_id() }
-    fn codex(&self) -> &Codex { self.ledger.articles().codex() }
-    fn repo(&self) -> &impl LibRepo { self.ledger.articles() }
-    fn memory(&self) -> &impl Memory { &self.ledger.state().raw }
+    fn contract_id(&self) -> ContractId {
+        self.ledger.contract_id()
+    }
+    fn codex(&self) -> &Codex {
+        self.ledger.articles().codex()
+    }
+    fn repo(&self) -> &impl LibRepo {
+        self.ledger.articles()
+    }
+    fn memory(&self) -> &impl Memory {
+        &self.ledger.state().raw
+    }
     fn is_known(&self, opid: Opid) -> bool {
         let known = self.valid_cache.contains(&opid);
         with_consume_stats(|stats| {
@@ -1424,12 +1809,104 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
 
     fn is_witness_known(&mut self, opid: Opid, witness: &SealWitness<P::Seal>) -> bool {
         let wid = witness.published.pub_id();
+        if self.duplicate_witness_cache.contains(&(opid, wid)) {
+            with_consume_stats(|stats| stats.duplicate_witness_updates += 1);
+            return true;
+        }
+
         let mut ps = self.pile.session();
         let known = ps.has_witness(wid)
             && ps.cli_witness(wid) == witness.client
             && ps.ops_by_witness_id(wid).any(|op| op == opid);
         if known {
+            self.duplicate_witness_cache.insert((opid, wid));
             with_consume_stats(|stats| stats.duplicate_witness_updates += 1);
+        }
+        known
+    }
+
+    fn known_seal(&mut self, addr: CellAddr) -> Option<P::Seal> {
+        if let Some(seal) = self.resolved_seal_cache.get(&addr) {
+            return Some(seal.clone());
+        }
+
+        let definition = if let Some(definition) = self.seal_def_cache.get(&addr) {
+            definition.clone()
+        } else {
+            match self.pile.session().seal(addr) {
+                Some(definition) => {
+                    self.seal_def_cache.insert(addr, definition.clone());
+                    definition
+                }
+                None => {
+                    return self.external_resolved_seal_cache.get(&addr).cloned();
+                }
+            }
+        };
+        if let Some(seal) = definition.to_src() {
+            self.resolved_seal_cache.insert(addr, seal.clone());
+            return Some(seal);
+        }
+        let Some(witness) = self.retrieve(addr.opid) else {
+            return self.external_resolved_seal_cache.get(&addr).cloned();
+        };
+        let seal = definition.resolve(witness.published.pub_id());
+        self.resolved_seal_cache.insert(addr, seal.clone());
+        Some(seal)
+    }
+
+    fn are_seals_known(
+        &mut self,
+        opid: Opid,
+        seals: &SmallOrdMap<u16, <P::Seal as RgbSeal>::Definition>,
+    ) -> bool {
+        if seals.is_empty() {
+            with_consume_stats(|stats| stats.known_materialized_skips += 1);
+            return true;
+        }
+
+        let cached = seals.iter().all(|(no, seal)| {
+            let addr = CellAddr::new(opid, *no);
+            self.seal_def_cache
+                .get(&addr)
+                .is_some_and(|stored| stored == seal)
+        });
+        if cached {
+            with_consume_stats(|stats| {
+                stats.duplicate_seal_updates += 1;
+                stats.known_materialized_skips += 1;
+            });
+            return true;
+        }
+
+        let mut ps = self.pile.session();
+        let known = seals.iter().all(|(no, seal)| {
+            let addr = CellAddr::new(opid, *no);
+            if self
+                .seal_def_cache
+                .get(&addr)
+                .is_some_and(|stored| stored == seal)
+            {
+                return true;
+            }
+            let Some(stored) = ps.seal(addr) else {
+                return false;
+            };
+            if stored != *seal {
+                return false;
+            }
+            self.seal_def_cache.insert(addr, stored);
+            true
+        });
+        drop(ps);
+
+        if known {
+            self.duplicate_seal_def_cache
+                .extend(seals.keys().map(|no| CellAddr::new(opid, *no)));
+            with_consume_stats(|stats| {
+                stats.duplicate_seal_updates += 1;
+                stats.known_materialized_skips += 1;
+            });
         }
         known
     }
@@ -1439,6 +1916,7 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         self.ledger.apply(op).expect("unable to apply operation");
         self.valid_cache.insert(opid);
         self.remove_op_aux_cache_entry(opid);
+        self.clear_owned_state_status_cache();
     }
 
     fn apply_seals(
@@ -1451,25 +1929,64 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
             return;
         }
         with_consume_stats(|stats| stats.seal_updates_non_empty += 1);
-        let duplicate = {
-            let mut ps = self.pile.session();
-            seals.iter().all(|(no, seal)| {
-                ps.seal(CellAddr::new(opid, *no))
-                    .as_ref()
+
+        let cached_duplicate = seals.iter().all(|(no, seal)| {
+            let addr = CellAddr::new(opid, *no);
+            self.duplicate_seal_def_cache.contains(&addr)
+                && self
+                    .seal_def_cache
+                    .get(&addr)
                     .is_some_and(|stored| stored == seal)
-            })
-        };
-        if duplicate {
+        });
+        if cached_duplicate {
             with_consume_stats(|stats| stats.duplicate_seal_updates += 1);
             return;
         }
+
+        let duplicate = {
+            let mut ps = self.pile.session();
+            seals.iter().all(|(no, seal)| {
+                let addr = CellAddr::new(opid, *no);
+                if self
+                    .seal_def_cache
+                    .get(&addr)
+                    .is_some_and(|stored| stored == seal)
+                {
+                    return true;
+                }
+                let Some(stored) = ps.seal(addr) else {
+                    return false;
+                };
+                if stored != *seal {
+                    return false;
+                }
+                self.seal_def_cache.insert(addr, stored);
+                true
+            })
+        };
+        if duplicate {
+            self.duplicate_seal_def_cache
+                .extend(seals.keys().map(|no| CellAddr::new(opid, *no)));
+            with_consume_stats(|stats| stats.duplicate_seal_updates += 1);
+            return;
+        }
+        for (no, seal) in &seals {
+            let addr = CellAddr::new(opid, *no);
+            self.seal_def_cache.insert(addr, seal.clone());
+            self.resolved_seal_cache.remove(&addr);
+            self.duplicate_seal_def_cache.insert(addr);
+        }
         self.pile.session().add_seals(opid, seals);
         self.remove_op_aux_cache_entry(opid);
+        self.clear_owned_state_status_cache();
     }
 
     fn apply_witness(&mut self, opid: Opid, witness: SealWitness<P::Seal>) {
         with_consume_stats(|stats| stats.witness_updates += 1);
-        self.include(opid, witness.client, &witness.published)
+        let wid = witness.published.pub_id();
+        self.include(opid, witness.client, &witness.published);
+        self.duplicate_witness_cache.insert((opid, wid));
+        self.resolved_seal_cache.retain(|addr, _| addr.opid != opid);
     }
 }
 

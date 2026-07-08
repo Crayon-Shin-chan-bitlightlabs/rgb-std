@@ -35,11 +35,33 @@ impl WitnessStatus {
     const OFFCHAIN: u64 = u64::MAX ^ 0x02;
     const ARCHIVED: u64 = u64::MAX;
 
-    pub fn is_mined(&self) -> bool { matches!(self, Self::Mined(_)) }
-    pub fn is_valid(&self) -> bool { !matches!(self, Self::Archived) }
-    pub fn is_tentative(&self) -> bool { matches!(self, Self::Tentative) }
-    pub fn is_archived(&self) -> bool { matches!(self, Self::Archived) }
-    pub fn is_offchain(&self) -> bool { matches!(self, Self::Offchain) }
+    pub fn is_mined(&self) -> bool {
+        matches!(self, Self::Mined(_))
+    }
+    pub fn is_valid(&self) -> bool {
+        !matches!(self, Self::Archived)
+    }
+    pub fn is_tentative(&self) -> bool {
+        matches!(self, Self::Tentative)
+    }
+    pub fn is_archived(&self) -> bool {
+        matches!(self, Self::Archived)
+    }
+    pub fn is_offchain(&self) -> bool {
+        matches!(self, Self::Offchain)
+    }
+    pub fn is_mature(self, last_block_height: u64, min_confirmations: u32) -> bool {
+        let Self::Mined(height) = self else {
+            return false;
+        };
+        let Some(confirmations) = last_block_height
+            .checked_sub(height.get())
+            .and_then(|depth| depth.checked_add(1))
+        else {
+            return false;
+        };
+        confirmations >= min_confirmations as u64
+    }
 
     fn quasi_height(&self) -> u64 {
         match self {
@@ -51,8 +73,12 @@ impl WitnessStatus {
         }
     }
 
-    pub fn is_better(self, other: Self) -> bool { self.quasi_height() < other.quasi_height() }
-    pub fn is_worse(self, other: Self) -> bool { !self.is_better(other) }
+    pub fn is_better(self, other: Self) -> bool {
+        self.quasi_height() < other.quasi_height()
+    }
+    pub fn is_worse(self, other: Self) -> bool {
+        !self.is_better(other)
+    }
     pub fn best(self, other: Self) -> Self {
         if self.is_better(other) {
             self
@@ -84,7 +110,9 @@ impl From<[u8; 8]> for WitnessStatus {
 }
 
 impl From<WitnessStatus> for [u8; 8] {
-    fn from(value: WitnessStatus) -> Self { (u64::MAX - value.quasi_height()).to_be_bytes() }
+    fn from(value: WitnessStatus) -> Self {
+        (u64::MAX - value.quasi_height()).to_be_bytes()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -135,7 +163,42 @@ pub trait PileSession {
 
     fn witness_status(&mut self, wid: <Self::Seal as RgbSeal>::WitnessId) -> WitnessStatus;
 
+    fn witness_statuses_for(
+        &mut self,
+        witness_ids: impl IntoIterator<Item = <Self::Seal as RgbSeal>::WitnessId>,
+    ) -> Vec<(<Self::Seal as RgbSeal>::WitnessId, WitnessStatus)> {
+        witness_ids
+            .into_iter()
+            .map(|wid| {
+                let status = self.witness_status(wid);
+                (wid, status)
+            })
+            .collect()
+    }
+
     fn witness_ids(&mut self) -> impl Iterator<Item = <Self::Seal as RgbSeal>::WitnessId>;
+
+    fn witness_statuses(&mut self) -> Vec<(<Self::Seal as RgbSeal>::WitnessId, WitnessStatus)> {
+        let witness_ids = self.witness_ids().collect::<Vec<_>>();
+        witness_ids
+            .into_iter()
+            .map(|wid| {
+                let status = self.witness_status(wid);
+                (wid, status)
+            })
+            .collect()
+    }
+
+    fn witness_statuses_requiring_update(
+        &mut self,
+        last_block_height: u64,
+        min_confirmations: u32,
+    ) -> Vec<(<Self::Seal as RgbSeal>::WitnessId, WitnessStatus)> {
+        self.witness_statuses()
+            .into_iter()
+            .filter(|(_, status)| !status.is_mature(last_block_height, min_confirmations))
+            .collect()
+    }
 
     fn witnesses(&mut self) -> impl Iterator<Item = Witness<Self::Seal>>;
 
@@ -148,6 +211,8 @@ pub trait PileSession {
         &mut self,
         wid: <Self::Seal as RgbSeal>::WitnessId,
     ) -> impl ExactSizeIterator<Item = Opid>;
+
+    fn known_seal_cells(&mut self) -> impl Iterator<Item = CellAddr>;
 
     fn seal(&mut self, addr: CellAddr) -> Option<<Self::Seal as RgbSeal>::Definition>;
 
@@ -195,7 +260,9 @@ pub trait PileSession {
     /// method as a no-op to avoid a per-operation database round-trip.  The outer
     /// [`Contract::evaluate_commit`] still calls [`Pile::commit_transaction`] once at the end
     /// to durably persist all accumulated writes.
-    fn include_commit_transaction(&mut self) { self.commit_transaction(); }
+    fn include_commit_transaction(&mut self) {
+        self.commit_transaction();
+    }
 }
 
 /// Persistent storage for contract witness and single-use seal definition data.
@@ -207,13 +274,16 @@ pub trait Pile {
     /// Session type for all I/O access.
     /// For lock-free backends: `type Session<'s> = &'s mut Self`.
     type Session<'s>: PileSession<Seal = Self::Seal, Error = Self::Error>
-    where Self: 's;
+    where
+        Self: 's;
 
     fn new(conf: Self::Conf) -> Result<Self, Self::Error>
-    where Self: Sized;
+    where
+        Self: Sized;
 
     fn load(conf: Self::Conf) -> Result<Self, Self::Error>
-    where Self: Sized;
+    where
+        Self: Sized;
 
     /// Opens a session for all I/O operations.
     fn session(&mut self) -> Self::Session<'_>;
@@ -241,5 +311,18 @@ mod tests {
         assert!(WitnessStatus::Tentative.is_worse(WitnessStatus::Offchain));
         assert!(WitnessStatus::Offchain.is_better(WitnessStatus::Archived));
         assert!(WitnessStatus::Archived.is_worse(WitnessStatus::Genesis));
+    }
+
+    #[test]
+    fn mined_witness_maturity_counts_confirmations() {
+        let mined_at_100 = WitnessStatus::Mined(NonZeroU64::new(100).unwrap());
+
+        assert!(mined_at_100.is_mature(100, 0));
+        assert!(mined_at_100.is_mature(100, 1));
+        assert!(mined_at_100.is_mature(101, 2));
+        assert!(!mined_at_100.is_mature(100, 2));
+        assert!(!mined_at_100.is_mature(99, 0));
+        assert!(!WitnessStatus::Tentative.is_mature(100, 0));
+        assert!(!WitnessStatus::Offchain.is_mature(100, 0));
     }
 }

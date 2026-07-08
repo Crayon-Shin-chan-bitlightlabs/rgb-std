@@ -647,7 +647,7 @@ dependencies = [
 [[package]]
 name = "hypersonic"
 version = "0.12.0"
-source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=feat%2Fsession-ledger#0061a2e7a41f4a1f1f95d7a85107ef77a7a93dd6"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=feat%2Fsession-ledger#ee542536591dc6c94fc000b8f9b34531366e251a"
 dependencies = [
  "aluvm",
  "amplify",
@@ -916,7 +916,7 @@ dependencies = [
 [[package]]
 name = "rgb-core"
 version = "0.12.0"
-source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/rgb-core.git?branch=temp#da326d46ad3bb481b8d464de48a9b7bd5ae9985d"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/rgb-core.git?branch=temp#93bdf4d0b273826b8410b1ae18fd52c416f29b12"
 dependencies = [
  "amplify",
  "bp-core",
@@ -1179,7 +1179,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "sonic-api"
 version = "0.12.0"
-source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=feat%2Fsession-ledger#0061a2e7a41f4a1f1f95d7a85107ef77a7a93dd6"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=feat%2Fsession-ledger#ee542536591dc6c94fc000b8f9b34531366e251a"
 dependencies = [
  "aluvm",
  "amplify",
@@ -1202,7 +1202,7 @@ dependencies = [
 [[package]]
 name = "sonic-callreq"
 version = "0.12.0"
-source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=feat%2Fsession-ledger#0061a2e7a41f4a1f1f95d7a85107ef77a7a93dd6"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=feat%2Fsession-ledger#ee542536591dc6c94fc000b8f9b34531366e251a"
 dependencies = [
  "amplify",
  "baid64",
@@ -1222,7 +1222,7 @@ dependencies = [
 [[package]]
 name = "sonic-persist-fs"
 version = "0.12.0"
-source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=feat%2Fsession-ledger#0061a2e7a41f4a1f1f95d7a85107ef77a7a93dd6"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=feat%2Fsession-ledger#ee542536591dc6c94fc000b8f9b34531366e251a"
 dependencies = [
  "amplify",
  "aora",

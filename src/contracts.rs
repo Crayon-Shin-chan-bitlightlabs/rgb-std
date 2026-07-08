@@ -26,9 +26,12 @@ use alloc::collections::BTreeMap;
 use core::borrow::Borrow;
 use core::cell::RefCell;
 #[cfg(feature = "async")]
+use core::convert::Infallible;
+#[cfg(feature = "async")]
 use core::future::Future;
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::sync::Arc;
 #[cfg(feature = "async")]
 use std::time::{Duration, Instant};
 
@@ -64,17 +67,12 @@ fn slow_rgb_stage_elapsed(started_at: Instant) -> Option<u128> {
     (elapsed >= RGB_STD_SLOW_STAGE_THRESHOLD).then_some(elapsed.as_millis())
 }
 
-#[cfg(feature = "async")]
 fn witness_status_is_mature(
     status: WitnessStatus,
     last_block_height: u64,
     min_conformations: u32,
 ) -> bool {
-    matches!(
-        status,
-        WitnessStatus::Mined(height)
-            if last_block_height.saturating_sub(height.get()) > min_conformations as u64
-    )
+    status.is_mature(last_block_height, min_conformations)
 }
 
 #[cfg(feature = "async")]
@@ -121,7 +119,9 @@ pub struct WalletState<Seal> {
 }
 
 impl<Seal> Default for WalletState<Seal> {
-    fn default() -> Self { Self { immutable: bmap! {}, owned: bmap! {}, aggregated: bmap! {} } }
+    fn default() -> Self {
+        Self { immutable: bmap! {}, owned: bmap! {}, aggregated: bmap! {} }
+    }
 }
 
 impl<Seal> WalletState<Seal> {
@@ -220,6 +220,65 @@ where
             .insert((contract_id, min_conformations), candidates.into_iter().collect());
     }
 
+    #[cfg(feature = "async")]
+    pub fn sync_contract_witness_statuses(
+        &mut self,
+        contract_id: ContractId,
+        statuses: impl IntoIterator<
+            Item = (<<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId, WitnessStatus),
+        >,
+        last_block_height: u64,
+    ) -> Result<usize, MultiError<SyncError<Infallible>, <Sp::Stock as Stock>::Error>> {
+        if !self.has_contract(contract_id) {
+            return Err(MultiError::A(SyncError::ContractNotFound(contract_id)));
+        }
+
+        let mut known_statuses = IndexMap::new();
+        self.with_contract_mut(
+            contract_id,
+            |contract| -> Result<
+                (),
+                MultiError<SyncError<Infallible>, <Sp::Stock as Stock>::Error>,
+            > {
+                let mut changed_statuses = IndexMap::<_, WitnessStatus>::new();
+                for (witness_id, status) in statuses {
+                    if !contract.has_witness(witness_id) {
+                        continue;
+                    }
+                    known_statuses.insert(witness_id, status);
+                    if contract.witness_status(witness_id) != status {
+                        changed_statuses.insert(witness_id, status);
+                    }
+                }
+                if !changed_statuses.is_empty() {
+                    contract
+                        .sync(changed_statuses.iter().map(|(id, status)| (*id, *status)))
+                        .map_err(MultiError::from_other_a)?;
+                }
+                Ok(())
+            },
+        )?;
+
+        if !known_statuses.is_empty() {
+            for ((cached_contract_id, min_conformations), candidates) in
+                self.witness_update_candidates.borrow_mut().iter_mut()
+            {
+                if *cached_contract_id != contract_id {
+                    continue;
+                }
+                for (witness_id, status) in &known_statuses {
+                    if witness_status_is_mature(*status, last_block_height, *min_conformations) {
+                        candidates.shift_remove(witness_id);
+                    } else {
+                        candidates.insert(*witness_id);
+                    }
+                }
+            }
+        }
+
+        Ok(known_statuses.len())
+    }
+
     #[allow(dead_code)]
     fn with_contract<R>(
         &self,
@@ -273,9 +332,13 @@ where
         self.persistence.codex_ids()
     }
 
-    pub fn issuers_count(&self) -> usize { self.persistence.issuers_count() }
+    pub fn issuers_count(&self) -> usize {
+        self.persistence.issuers_count()
+    }
 
-    pub fn has_issuer(&self, codex_id: CodexId) -> bool { self.persistence.has_issuer(codex_id) }
+    pub fn has_issuer(&self, codex_id: CodexId) -> bool {
+        self.persistence.has_issuer(codex_id)
+    }
 
     pub fn issuers(&self) -> impl Iterator<Item = (CodexId, Issuer)> + use<'_, Sp, S, C> {
         self.persistence
@@ -292,7 +355,9 @@ where
         Some(issuer)
     }
 
-    pub fn contracts_count(&self) -> usize { self.persistence.contracts_count() }
+    pub fn contracts_count(&self) -> usize {
+        self.persistence.contracts_count()
+    }
 
     pub fn has_contract(&self, contract_id: ContractId) -> bool {
         self.persistence.has_contract(contract_id)
@@ -307,6 +372,57 @@ where
         contract_id: ContractId,
     ) -> Vec<<<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId> {
         self.with_contract_mut(contract_id, |contract| contract.witness_ids())
+    }
+
+    pub fn contract_trace_opids(&mut self, contract_id: ContractId) -> Vec<Opid> {
+        self.with_contract_mut(contract_id, |contract| {
+            contract
+                .trace_ops()
+                .into_iter()
+                .map(|(opid, _)| opid)
+                .collect()
+        })
+    }
+
+    pub fn contract_known_seal_cells(&mut self, contract_id: ContractId) -> Vec<CellAddr> {
+        self.with_contract_mut(contract_id, |contract| contract.known_seal_cells())
+    }
+
+    pub fn contract_known_resolved_seals(
+        &mut self,
+        contract_id: ContractId,
+    ) -> Vec<(CellAddr, <Sp::Pile as Pile>::Seal)> {
+        self.with_contract_mut(contract_id, |contract| contract.known_resolved_seals())
+    }
+
+    pub fn extend_contract_external_resolved_seals(
+        &mut self,
+        contract_id: ContractId,
+        seals: impl IntoIterator<Item = (CellAddr, <Sp::Pile as Pile>::Seal)>,
+    ) {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.extend_external_resolved_seals(seals);
+        });
+    }
+
+    pub fn set_contract_external_resolved_seals(
+        &mut self,
+        contract_id: ContractId,
+        seals: Arc<HashMap<CellAddr, <Sp::Pile as Pile>::Seal>>,
+    ) {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.set_external_resolved_seals(seals);
+        });
+    }
+
+    pub fn contract_boundary_opids_for_known_cells(
+        &mut self,
+        contract_id: ContractId,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+    ) -> Vec<Opid> {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.boundary_opids_for_known_cells(known_cells)
+        })
     }
 
     /// Get the contract state.
@@ -335,6 +451,23 @@ where
     {
         self.with_contract_mut(contract_id, |contract| contract.owned_state_entries(state_name))
             .into()
+    }
+
+    pub fn contract_owned_state_cell(
+        &mut self,
+        contract_id: ContractId,
+        addr: CellAddr,
+    ) -> Option<(StateName, StrictVal)> {
+        self.with_contract_mut(contract_id, |contract| {
+            contract
+                .full_state()
+                .main
+                .owned
+                .iter()
+                .find_map(|(name, cells)| {
+                    cells.get(&addr).map(|value| (name.clone(), value.clone()))
+                })
+        })
     }
 
     pub fn contract_resolved_owned_state_entries(
@@ -473,7 +606,11 @@ where
                 |contract| -> Result<(), MultiError<SyncError<E>, <Sp::Stock as Stock>::Error>> {
                     for witness_id in contract.witness_ids() {
                         let old_status = contract.witness_status(witness_id);
-                        if matches!(old_status, WitnessStatus::Mined(height) if last_block_height - height.get() > min_conformations as u64) {
+                        if witness_status_is_mature(
+                            old_status,
+                            last_block_height,
+                            min_conformations,
+                        ) {
                             continue;
                         }
                         let new_status = match changed_statuses.get(&witness_id) {
@@ -512,20 +649,12 @@ where
         let mut resolved_statuses = IndexMap::<_, WitnessStatus>::new();
         let contract_ids = self.persistence.contract_ids().collect::<IndexSet<_>>();
         for contract_id in contract_ids {
-            let witnesses = self.with_contract_mut(contract_id, |contract| {
-                let ids = contract.witness_ids();
-                ids.into_iter()
-                    .map(|wid| {
-                        let status = contract.witness_status(wid);
-                        (wid, status)
-                    })
-                    .collect::<Vec<_>>()
-            });
+            let witnesses =
+                self.with_contract_mut(contract_id, |contract| contract.witness_statuses());
 
             let mut changed_statuses = IndexMap::<_, WitnessStatus>::new();
             for (witness_id, old_status) in witnesses {
-                if matches!(old_status, WitnessStatus::Mined(height) if last_block_height - height.get() > min_conformations as u64)
-                {
+                if witness_status_is_mature(old_status, last_block_height, min_conformations) {
                     continue;
                 }
                 let new_status = match resolved_statuses.get(&witness_id) {
@@ -581,20 +710,12 @@ where
         };
 
         for contract_id in contract_ids {
-            let witnesses = self.with_contract_mut(contract_id, |contract| {
-                let ids = contract.witness_ids();
-                ids.into_iter()
-                    .map(|wid| {
-                        let status = contract.witness_status(wid);
-                        (wid, status)
-                    })
-                    .collect::<Vec<_>>()
-            });
+            let witnesses =
+                self.with_contract_mut(contract_id, |contract| contract.witness_statuses());
 
             let mut changed_statuses = IndexMap::<_, WitnessStatus>::new();
             for (witness_id, old_status) in witnesses {
-                if matches!(old_status, WitnessStatus::Mined(height) if last_block_height - height.get() > min_conformations as u64)
-                {
+                if witness_status_is_mature(old_status, last_block_height, min_conformations) {
                     continue;
                 }
                 let new_status = match resolved_statuses.get(&witness_id) {
@@ -673,18 +794,17 @@ where
             let candidates = self.with_contract_mut(contract_id, |contract| {
                 if let Some(candidates) = cached_candidates {
                     cache_hits += 1;
-                    candidates.into_iter().collect::<Vec<_>>()
+                    contract.witness_statuses_for(candidates)
                 } else {
                     cache_misses += 1;
-                    contract.witness_ids()
+                    contract.witness_statuses_requiring_update(last_block_height, min_conformations)
                 }
             });
 
-            self.with_contract_mut(contract_id, |contract| {
+            self.with_contract_mut(contract_id, |_contract| {
                 let mut pending_witnesses = Vec::with_capacity(candidates.len());
-                for witness_id in candidates {
+                for (witness_id, old_status) in candidates {
                     scanned_witnesses += 1;
-                    let old_status = contract.witness_status(witness_id);
                     if witness_status_is_mature(old_status, last_block_height, min_conformations) {
                         skipped_mature_mined += 1;
                         continue;
@@ -925,6 +1045,81 @@ where
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
         self.with_contract_mut(contract_id, |contract| contract.consign(terminals, writer))
+    }
+
+    pub fn consign_with_known_opids(
+        &mut self,
+        contract_id: ContractId,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<()>
+    where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.consign_with_known_opids(terminals, known_opids, writer)
+        })
+    }
+
+    pub fn consign_with_known_cells(
+        &mut self,
+        contract_id: ContractId,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<()>
+    where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.consign_with_known_cells(terminals, known_cells, writer)
+        })
+    }
+
+    pub fn consign_with_known_cells_and_opids(
+        &mut self,
+        contract_id: ContractId,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+        known_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<()>
+    where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.consign_with_known_cells_and_opids(terminals, known_cells, known_opids, writer)
+        })
+    }
+
+    pub fn consign_with_trusted_known_cells_and_opids(
+        &mut self,
+        contract_id: ContractId,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+        known_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<()>
+    where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.consign_with_trusted_known_cells_and_opids(
+                terminals,
+                known_cells,
+                known_opids,
+                writer,
+            )
+        })
     }
 
     pub fn consign_by_addrs(
