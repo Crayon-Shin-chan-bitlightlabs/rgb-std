@@ -100,73 +100,6 @@ fn parallel_verify_diag_enabled() -> bool {
     })
 }
 
-fn known_operation_duplicate_prewarm_disabled() -> bool {
-    static DISABLED: OnceLock<bool> = OnceLock::new();
-    *DISABLED.get_or_init(|| {
-        env::var("RGB_STD_DISABLE_KNOWN_OP_DUP_PREWARM")
-            .map(|value| {
-                let value = value.trim();
-                value == "1"
-                    || value.eq_ignore_ascii_case("true")
-                    || value.eq_ignore_ascii_case("on")
-            })
-            .unwrap_or(false)
-    })
-}
-
-/// Escape hatch restoring the selection-preload behavior of pruning the candidate walk at
-/// receiver-known opids. The selection loop unconditionally walks destructible-lineage
-/// producers through known opids (accept must resolve producing-cell seal definitions), so
-/// trimming the plan just converts that walk's batched preloads into per-op point lookups
-/// over the whole known ancestry; keep this off unless the wider preload itself misbehaves.
-fn consign_plan_trim_known_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        env::var("RGB_STD_CONSIGN_PLAN_TRIM_KNOWN")
-            .map(|value| {
-                let value = value.trim();
-                value == "1"
-                    || value.eq_ignore_ascii_case("true")
-                    || value.eq_ignore_ascii_case("on")
-            })
-            .unwrap_or(false)
-    })
-}
-
-/// Apply-path seal-definition prewarm (Cut 1). Opt-in, defaults to current behavior. When enabled,
-/// each consume batch-preloads its operations' own output-seal cells (with negative caching of
-/// confirmed-absent cells) so the per-op `seal_definitions_match` during apply resolves from cache.
-fn apply_path_seal_prewarm_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        env::var("RGB_STD_APPLY_PATH_SEAL_PREWARM")
-            .map(|value| {
-                let value = value.trim();
-                value == "1"
-                    || value.eq_ignore_ascii_case("true")
-                    || value.eq_ignore_ascii_case("on")
-            })
-            .unwrap_or(false)
-    })
-}
-
-/// Apply-path witness existence prewarm (Cut 2a). Opt-in, defaults to current behavior. When
-/// enabled, each consume batch-preloads the new cohort's witness ids into the backend witness
-/// lookup cache so `has_witness` during apply can resolve present/absent without a per-op DB hit.
-fn apply_path_witness_prewarm_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        env::var("RGB_STD_APPLY_PATH_WITNESS_PREWARM")
-            .map(|value| {
-                let value = value.trim();
-                value == "1"
-                    || value.eq_ignore_ascii_case("true")
-                    || value.eq_ignore_ascii_case("on")
-            })
-            .unwrap_or(false)
-    })
-}
-
 fn op_aux_cache_max_bytes() -> usize {
     static MAX_BYTES: OnceLock<usize> = OnceLock::new();
     *MAX_BYTES.get_or_init(|| {
@@ -726,25 +659,18 @@ impl SelectionPreloadPlan {
     fn from_parent_ops(
         parent_ops: HashMap<Opid, Vec<Opid>>,
         roots: impl IntoIterator<Item = Opid>,
-        known_opids: &HashSet<Opid>,
         genesis_opid: Opid,
     ) -> Self {
         let parent_count = parent_ops.len();
         let parent_edges = parent_ops.values().map(Vec::len).sum::<usize>();
-        // The selection loop never prunes destructible-lineage producers at known
-        // boundaries (accept must resolve their seal definitions), so the walk is deep
-        // regardless; pruning the plan here would only turn those operations' reads into
-        // per-op point lookups. The parent map does not distinguish edge kinds, so the walk
-        // may overshoot into immutable-only subtrees behind known ops the loop later skips.
-        let trim_known = consign_plan_trim_known_enabled();
+        // The selection loop never prunes destructible-lineage producers at known boundaries
+        // (accept must resolve their seal definitions), so the walk is deep regardless; pruning
+        // the plan here would only turn those operations' batched reads into per-op point lookups.
         let mut opids = HashSet::new();
         let mut stack = roots.into_iter().collect::<Vec<_>>();
 
         while let Some(opid) = stack.pop() {
-            if opid == genesis_opid
-                || (trim_known && known_opids.contains(&opid))
-                || !opids.insert(opid)
-            {
+            if opid == genesis_opid || !opids.insert(opid) {
                 continue;
             }
 
@@ -753,10 +679,7 @@ impl SelectionPreloadPlan {
             };
 
             for parent in parents {
-                if *parent != genesis_opid
-                    && !(trim_known && known_opids.contains(parent))
-                    && !opids.contains(parent)
-                {
+                if *parent != genesis_opid && !opids.contains(parent) {
                     stack.push(*parent);
                 }
             }
@@ -989,7 +912,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         operations_total: usize,
         known_ops: Vec<(Opid, &OperationSeals<P::Seal>)>,
     ) {
-        if known_operation_duplicate_prewarm_disabled() || known_ops.is_empty() {
+        if known_ops.is_empty() {
             return;
         }
 
@@ -1094,16 +1017,16 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         );
     }
 
-    /// Cut 1 (apply-path): batch-preload each operation's *own* output-seal cells so the per-op
+    /// Batch-preload each operation's *own* output-seal cells so the per-op
     /// `seal_definitions_match` during apply resolves from the pile cache instead of issuing a
-    /// per-op database round-trip. Opt-in via `RGB_STD_APPLY_PATH_SEAL_PREWARM`. Cells are
-    /// opid-scoped; the negative cache is overwritten by `add_seals` when an op is applied, so the
-    /// prewarm snapshot stays coherent within the consume.
+    /// per-op database round-trip. Cells are opid-scoped; the negative cache is overwritten by
+    /// `add_seals` when an op is applied, so the prewarm snapshot stays coherent within the
+    /// consume.
     fn preload_consume_output_seals(
         &mut self,
         new_operations: &[(Opid, &OperationSeals<P::Seal>)],
     ) {
-        if !apply_path_seal_prewarm_enabled() || new_operations.is_empty() {
+        if new_operations.is_empty() {
             return;
         }
         let total_started_at = Instant::now();
@@ -1155,12 +1078,11 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         );
     }
 
-    /// Cut 2a (apply-path): batch-preload the new cohort's witness ids into the pile witness
-    /// existence cache. This deliberately only targets `has_witness`; the reverse
-    /// `ops_by_witness_id` path stays lazy until measurements show it is worth a separate batch
-    /// cache. Opt-in via `RGB_STD_APPLY_PATH_WITNESS_PREWARM`.
+    /// Batch-preload the new cohort's witness ids into the pile witness existence cache. This
+    /// deliberately only targets `has_witness`; the reverse `ops_by_witness_id` path stays lazy
+    /// until measurements show it is worth a separate batch cache.
     fn preload_consume_witnesses(&mut self, new_operations: &[(Opid, &OperationSeals<P::Seal>)]) {
-        if !apply_path_witness_prewarm_enabled() || new_operations.is_empty() {
+        if new_operations.is_empty() {
             return;
         }
         let total_started_at = Instant::now();
@@ -3059,13 +2981,15 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             if let Some(entry) = self.op_aux_cache.get(opid) {
                 if Self::op_aux_entry_covers_outputs(entry) {
                     // Copy the covering entry into the per-consign `retained` snapshot instead of
-                    // just skipping it. `retained` is the authoritative source the write loop reads;
-                    // the persistent `op_aux_cache` is only 3 MiB and warming the *other* pending
-                    // ops below evicts these covered ones (LRU) before the write loop reaches them.
+                    // just skipping it. `retained` is the authoritative source the write loop
+                    // reads; the persistent `op_aux_cache` is only 3 MiB and
+                    // warming the *other* pending ops below evicts these
+                    // covered ones (LRU) before the write loop reaches them.
                     // Dropping them here left the write loop to rebuild each via a per-op DB round
-                    // trip — a linear wall on deep consigns whose ancestry exceeds the cache (a 9k-op
-                    // consign following another only retained ~4.5k, the rest rebuilt ≈ 200s+).
-                    // Retaining them keeps that knowledge local to this consign (transient, freed
+                    // trip — a linear wall on deep consigns whose ancestry exceeds the cache (a
+                    // 9k-op consign following another only retained ~4.5k, the
+                    // rest rebuilt ≈ 200s+). Retaining them keeps that
+                    // knowledge local to this consign (transient, freed
                     // after write) without growing the persistent cache.
                     let entry = entry.clone();
                     retained_bytes = retained_bytes.saturating_add(entry.bytes.len());
@@ -3671,7 +3595,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                         .into_iter()
                         .collect::<HashMap<_, _>>(),
                     preload_roots,
-                    &boundaries.known_opids,
                     genesis_opid,
                 );
                 session.preload_selection_plan(&preload_plan);
@@ -4400,12 +4323,12 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         // Fresh per-consume set of not-known ops applied in this run (see `applied_new_ops`); keeps
         // `apply_seals`'s new-op fast path bounded to this consignment's cohort.
         self.applied_new_ops.clear();
-        // NB: `consume_seal_defs` is intentionally NOT cleared here. The consume prewarm populates it
-        // *before* calling this method, and clearing it here would wipe those 80k+ prewarmed
-        // known-op/input-cell seal defs before verification ever reads them — leaving known_seal /
-        // are_seals_known to re-hit the DB per op (the ~130s + ~40s residuals). The two prewarming
-        // consume paths clear it up front; the one non-prewarming caller is a fresh contract whose
-        // map is already empty.
+        // NB: `consume_seal_defs` is intentionally NOT cleared here. The consume prewarm populates
+        // it *before* calling this method, and clearing it here would wipe those 80k+
+        // prewarmed known-op/input-cell seal defs before verification ever reads them —
+        // leaving known_seal / are_seals_known to re-hit the DB per op (the ~130s + ~40s
+        // residuals). The two prewarming consume paths clear it up front; the one
+        // non-prewarming caller is a fresh contract whose map is already empty.
 
         // Opt-in topology-parallel verification (off unless `RGB_PARALLEL_VERIFY` is set). The
         // serial `evaluate` remains the default and the authority. `evaluate_parallel` keeps the
@@ -4699,10 +4622,11 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         let cached = seals.iter().all(|(no, seal)| {
             let addr = CellAddr::new(opid, *no);
             // Compare the provided definition against the stored one from either the bounded cache
-            // or the non-evicting prewarm backstop (`consume_seal_defs`, populated from known-op aux
-            // matches). Matching stored defs is exactly what `seal_definitions_match` confirms, so a
-            // hit here is authoritative and skips the per-op DB round-trip after the bounded cache
-            // evicts the prewarmed entries.
+            // or the non-evicting prewarm backstop (`consume_seal_defs`, populated from known-op
+            // aux matches). Matching stored defs is exactly what
+            // `seal_definitions_match` confirms, so a hit here is authoritative and
+            // skips the per-op DB round-trip after the bounded cache evicts the
+            // prewarmed entries.
             self.seal_def_cache
                 .get(&addr)
                 .or_else(|| self.consume_seal_defs.get(&addr))
@@ -4929,11 +4853,12 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         for (no, seal) in &seals {
             let addr = CellAddr::new(opid, *no);
             self.seal_def_cache.insert(addr, seal.clone());
-            // Non-evicting intra-consignment backstop: this op's freshly-applied output seals are the
-            // producer cells that *later* new ops in the same closure consume. `seal_def_cache` is
-            // bounded and prunes them mid-consume, forcing `known_seal` back to a per-cell DB round
-            // trip on deep closures (~5k checks ≈ 136s). Mirroring them here (cleared per consume,
-            // ~working-set MB) keeps that resolution in memory. The pile-time `seals_for` prewarm
+            // Non-evicting intra-consignment backstop: this op's freshly-applied output seals are
+            // the producer cells that *later* new ops in the same closure consume.
+            // `seal_def_cache` is bounded and prunes them mid-consume, forcing
+            // `known_seal` back to a per-cell DB round trip on deep closures (~5k
+            // checks ≈ 136s). Mirroring them here (cleared per consume, ~working-set
+            // MB) keeps that resolution in memory. The pile-time `seals_for` prewarm
             // cannot cover these because they are not stored until this very `apply_seals` runs.
             self.consume_seal_defs.insert(addr, seal.clone());
             self.resolved_seal_cache.remove(&addr);
