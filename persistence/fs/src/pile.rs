@@ -21,7 +21,8 @@ const MINE_MAGIC: u64 = u64::from_be_bytes(*b"RGBMINES");
 
 #[derive(Debug)]
 pub struct PileFs<Seal: RgbSeal>
-where Seal::WitnessId: From<[u8; 32]> + Into<[u8; 32]>
+where
+    Seal::WitnessId: From<[u8; 32]> + Into<[u8; 32]>,
 {
     hoard: FileAoraMap<Seal::WitnessId, Seal::Client, HOARD_MAGIC, 1>,
     cache: FileAoraMap<Seal::WitnessId, Seal::Published, CACHE_MAGIC, 1>,
@@ -46,22 +47,30 @@ where
     fn pub_witness(&mut self, wid: Seal::WitnessId) -> Seal::Published {
         self.cache.get_expect(wid)
     }
-    fn has_witness(&mut self, wid: Seal::WitnessId) -> bool { self.hoard.contains_key(wid) }
-    fn cli_witness(&mut self, wid: Seal::WitnessId) -> Seal::Client { self.hoard.get_expect(wid) }
+    fn has_witness(&mut self, wid: Seal::WitnessId) -> bool {
+        self.hoard.contains_key(wid)
+    }
+    fn cli_witness(&mut self, wid: Seal::WitnessId) -> Seal::Client {
+        self.hoard.get_expect(wid)
+    }
     fn witness_status(&mut self, wid: Seal::WitnessId) -> WitnessStatus {
         self.mine.get(wid).unwrap_or(WitnessStatus::Archived)
     }
-    fn witness_ids(&mut self) -> impl Iterator<Item = Seal::WitnessId> { self.stand.keys() }
-    fn op_witness_ids(&mut self, opid: Opid) -> impl ExactSizeIterator<Item = Seal::WitnessId> {
-        self.index.get(opid)
+    fn witness_ids(&mut self) -> Vec<Seal::WitnessId> {
+        self.stand.keys().collect()
     }
-    fn ops_by_witness_id(&mut self, wid: Seal::WitnessId) -> impl ExactSizeIterator<Item = Opid> {
-        self.stand.get(wid)
+    fn op_witness_ids(&mut self, opid: Opid) -> Vec<Seal::WitnessId> {
+        self.index.get(opid).collect()
     }
-    fn known_seal_cells(&mut self) -> impl Iterator<Item = CellAddr> {
-        self.keep.iter().map(|(addr, _)| addr)
+    fn ops_by_witness_id(&mut self, wid: Seal::WitnessId) -> Vec<Opid> {
+        self.stand.get(wid).collect()
     }
-    fn seal(&mut self, addr: CellAddr) -> Option<Seal::Definition> { self.keep.get(addr) }
+    fn known_seal_cells(&mut self) -> Vec<CellAddr> {
+        self.keep.iter().map(|(addr, _)| addr).collect()
+    }
+    fn seal(&mut self, addr: CellAddr) -> Option<Seal::Definition> {
+        self.keep.get(addr)
+    }
     fn seals(&mut self, opid: Opid, up_to: u16) -> SmallOrdMap<u16, Seal::Definition> {
         let mut seals = SmallOrdMap::new();
         for no in 0..up_to {
@@ -71,13 +80,16 @@ where
         }
         seals
     }
-    fn witnesses(&mut self) -> impl Iterator<Item = Witness<Self::Seal>> {
-        self.hoard.iter().map(|(wid, client)| {
-            let published = self.cache.get_expect(wid);
-            let status = self.mine.get_expect(wid);
-            let opids = self.stand.get(wid).collect();
-            Witness { id: wid, published, client, status, opids }
-        })
+    fn witnesses(&mut self) -> Vec<Witness<Self::Seal>> {
+        self.hoard
+            .iter()
+            .map(|(wid, client)| {
+                let published = self.cache.get_expect(wid);
+                let status = self.mine.get_expect(wid);
+                let opids = self.stand.get(wid).collect();
+                Witness { id: wid, published, client, status, opids }
+            })
+            .collect()
     }
     fn op_relations(&mut self, opid: Opid, up_to: u16) -> OpRels<Self::Seal> {
         let seals = self.seals(opid, up_to);
@@ -110,7 +122,9 @@ where
     fn update_witness_status(&mut self, wid: Seal::WitnessId, status: WitnessStatus) {
         self.mine.update_only(wid, status);
     }
-    fn commit_transaction(&mut self) { self.mine.commit_transaction(); }
+    fn commit_transaction(&mut self) {
+        self.mine.commit_transaction();
+    }
 }
 
 impl<Seal: RgbSeal> Pile for PileFs<Seal>
@@ -124,10 +138,13 @@ where
     type Error = io::Error;
     type Session<'s>
         = &'s mut Self
-    where Self: 's;
+    where
+        Self: 's;
 
     fn new(path: PathBuf) -> Result<Self, io::Error>
-    where Self: Sized {
+    where
+        Self: Sized,
+    {
         Ok(Self {
             hoard: FileAoraMap::create_new(&path, "hoard")?,
             cache: FileAoraMap::create_new(&path, "cache")?,
@@ -140,7 +157,9 @@ where
     }
 
     fn load(path: PathBuf) -> Result<Self, io::Error>
-    where Self: Sized {
+    where
+        Self: Sized,
+    {
         Ok(Self {
             hoard: FileAoraMap::open(&path, "hoard")?,
             cache: FileAoraMap::open(&path, "cache")?,
@@ -152,5 +171,7 @@ where
         })
     }
 
-    fn session(&mut self) -> &mut Self { self }
+    fn session(&mut self) -> &mut Self {
+        self
+    }
 }

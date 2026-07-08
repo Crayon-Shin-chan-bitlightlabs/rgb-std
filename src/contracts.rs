@@ -32,7 +32,6 @@ use core::future::Future;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
-#[cfg(feature = "async")]
 use std::time::{Duration, Instant};
 
 use amplify::confinement::{KeyedCollection, SmallOrdMap};
@@ -58,10 +57,8 @@ use crate::{
     OwnedState, Pile, SigBlob, StateName, Stockpile, WitnessStatus,
 };
 
-#[cfg(feature = "async")]
 const RGB_STD_SLOW_STAGE_THRESHOLD: Duration = Duration::from_millis(500);
 
-#[cfg(feature = "async")]
 fn slow_rgb_stage_elapsed(started_at: Instant) -> Option<u128> {
     let elapsed = started_at.elapsed();
     (elapsed >= RGB_STD_SLOW_STAGE_THRESHOLD).then_some(elapsed.as_millis())
@@ -415,6 +412,28 @@ where
         });
     }
 
+    pub fn extend_contract_external_seal_definitions(
+        &mut self,
+        contract_id: ContractId,
+        seals: impl IntoIterator<
+            Item = (CellAddr, <<Sp::Pile as Pile>::Seal as RgbSeal>::Definition),
+        >,
+    ) {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.extend_external_seal_definitions(seals);
+        });
+    }
+
+    pub fn set_contract_external_seal_definitions(
+        &mut self,
+        contract_id: ContractId,
+        seals: Arc<HashMap<CellAddr, <<Sp::Pile as Pile>::Seal as RgbSeal>::Definition>>,
+    ) {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.set_external_seal_definitions(seals);
+        });
+    }
+
     pub fn contract_boundary_opids_for_known_cells(
         &mut self,
         contract_id: ContractId,
@@ -458,16 +477,20 @@ where
         contract_id: ContractId,
         addr: CellAddr,
     ) -> Option<(StateName, StrictVal)> {
-        self.with_contract_mut(contract_id, |contract| {
-            contract
-                .full_state()
-                .main
-                .owned
-                .iter()
-                .find_map(|(name, cells)| {
-                    cells.get(&addr).map(|value| (name.clone(), value.clone()))
-                })
-        })
+        self.with_contract(
+            contract_id,
+            |contract| {
+                contract
+                    .full_state()
+                    .main
+                    .owned
+                    .iter()
+                    .find_map(|(name, cells)| {
+                        cells.get(&addr).map(|value| (name.clone(), value.clone()))
+                    })
+            },
+            Some(None),
+        )
     }
 
     pub fn contract_resolved_owned_state_entries(
@@ -1094,9 +1117,35 @@ where
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
-        self.with_contract_mut(contract_id, |contract| {
+        let started_at = Instant::now();
+        tracing::debug!(
+            operation = "rgb_std",
+            stage = "contracts_consign_known_boundaries_start",
+            ?contract_id,
+            trusted_known_opids = false,
+            "Starting rgb-std contracts consignment wrapper"
+        );
+        let result = self.with_contract_mut(contract_id, |contract| {
+            tracing::debug!(
+                operation = "rgb_std",
+                stage = "contracts_consign_known_boundaries_contract_ready",
+                ?contract_id,
+                trusted_known_opids = false,
+                "RGB contract ready for consignment"
+            );
             contract.consign_with_known_cells_and_opids(terminals, known_cells, known_opids, writer)
-        })
+        });
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "contracts_consign_known_boundaries_total",
+                elapsed_ms,
+                ?contract_id,
+                trusted_known_opids = false,
+                "Slow rgb-std stage"
+            );
+        }
+        result
     }
 
     pub fn consign_with_trusted_known_cells_and_opids(
@@ -1112,14 +1161,40 @@ where
         <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
     {
-        self.with_contract_mut(contract_id, |contract| {
+        let started_at = Instant::now();
+        tracing::debug!(
+            operation = "rgb_std",
+            stage = "contracts_consign_known_boundaries_start",
+            ?contract_id,
+            trusted_known_opids = true,
+            "Starting rgb-std contracts consignment wrapper"
+        );
+        let result = self.with_contract_mut(contract_id, |contract| {
+            tracing::debug!(
+                operation = "rgb_std",
+                stage = "contracts_consign_known_boundaries_contract_ready",
+                ?contract_id,
+                trusted_known_opids = true,
+                "RGB contract ready for consignment"
+            );
             contract.consign_with_trusted_known_cells_and_opids(
                 terminals,
                 known_cells,
                 known_opids,
                 writer,
             )
-        })
+        });
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "contracts_consign_known_boundaries_total",
+                elapsed_ms,
+                ?contract_id,
+                trusted_known_opids = true,
+                "Slow rgb-std stage"
+            );
+        }
+        result
     }
 
     pub fn consign_by_addrs(

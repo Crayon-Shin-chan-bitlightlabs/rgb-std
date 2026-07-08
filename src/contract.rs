@@ -6,10 +6,11 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use core::borrow::Borrow;
 use core::cell::RefCell;
 use core::error::Error;
-use core::marker::PhantomData;
-use std::collections::{HashMap, HashSet};
+use core::hash::Hash;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::env;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use amplify::confinement::SmallOrdMap;
@@ -36,11 +37,15 @@ use strict_types::StrictVal;
 
 use crate::{
     parse_consignment, Consignment, ContractMeta, Identity, Issue, Issuer, IssuerError, IssuerSpec,
-    OpRels, Pile, PileSession, VerifiedOperation, Witness, WitnessStatus,
+    OpRels, Pile, PileSession, VerifiedOperation, Witness, WitnessStatus, MAX_CONSIGNMENT_OPS,
 };
 
 const RGB_STD_SLOW_STAGE_THRESHOLD: Duration = Duration::from_millis(500);
-const OP_AUX_CACHE_MAX_BYTES: usize = 3 * 1024 * 1024;
+const OP_AUX_CACHE_DEFAULT_MAX_BYTES: usize = 3 * 1024 * 1024;
+const OP_AUX_CACHE_HARD_MAX_BYTES: usize = 64 * 1024 * 1024;
+const CONTRACT_CACHE_DEFAULT_MAX_ENTRIES: usize = 50_000;
+const CONTRACT_CACHE_HARD_MAX_ENTRIES: usize = 250_000;
+const SEALS_KNOWN_BATCH_UP_TO_MAX: u16 = 2048;
 const OWNED_STATE_STATUS_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const OWNED_STATE_STATUS_CACHE_MAX_OPS: usize = 50_000;
 const OWNED_STATE_STATUS_CACHE_MAX_WITNESSES: usize = 50_000;
@@ -48,6 +53,58 @@ const OWNED_STATE_STATUS_CACHE_MAX_WITNESSES: usize = 50_000;
 fn slow_rgb_stage_elapsed(started_at: Instant) -> Option<u128> {
     let elapsed = started_at.elapsed();
     (elapsed >= RGB_STD_SLOW_STAGE_THRESHOLD).then_some(elapsed.as_millis())
+}
+
+fn op_aux_cache_max_bytes() -> usize {
+    static MAX_BYTES: OnceLock<usize> = OnceLock::new();
+    *MAX_BYTES.get_or_init(|| {
+        env::var("RGB_STD_OP_AUX_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .map(|value| value.min(OP_AUX_CACHE_HARD_MAX_BYTES))
+            .unwrap_or(OP_AUX_CACHE_DEFAULT_MAX_BYTES)
+    })
+}
+
+fn contract_cache_max_entries() -> usize {
+    static MAX_ENTRIES: OnceLock<usize> = OnceLock::new();
+    *MAX_ENTRIES.get_or_init(|| {
+        env::var("RGB_STD_CONTRACT_CACHE_MAX_ENTRIES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .map(|value| value.min(CONTRACT_CACHE_HARD_MAX_ENTRIES))
+            .unwrap_or(CONTRACT_CACHE_DEFAULT_MAX_ENTRIES)
+    })
+}
+
+fn prune_hashset_to<K>(cache: &mut HashSet<K>, max_entries: usize)
+where
+    K: Copy + Eq + Hash,
+{
+    if cache.len() <= max_entries {
+        return;
+    }
+    let remove_count = cache.len().saturating_sub(max_entries);
+    let keys = cache.iter().take(remove_count).copied().collect::<Vec<_>>();
+    for key in keys {
+        cache.remove(&key);
+    }
+}
+
+fn prune_hashmap_to<K, V>(cache: &mut HashMap<K, V>, max_entries: usize)
+where
+    K: Copy + Eq + Hash,
+{
+    if cache.len() <= max_entries {
+        return;
+    }
+    let remove_count = cache.len().saturating_sub(max_entries);
+    let keys = cache.keys().take(remove_count).copied().collect::<Vec<_>>();
+    for key in keys {
+        cache.remove(&key);
+    }
 }
 #[derive(Copy, Clone, PartialEq, Eq, Debug, From)]
 #[cfg_attr(
@@ -301,10 +358,12 @@ pub struct Contract<S: Stock, P: Pile> {
     valid_cache: HashSet<Opid>,
     seal_def_cache: HashMap<CellAddr, <P::Seal as RgbSeal>::Definition>,
     resolved_seal_cache: HashMap<CellAddr, P::Seal>,
+    external_seal_def_cache: Arc<HashMap<CellAddr, <P::Seal as RgbSeal>::Definition>>,
     external_resolved_seal_cache: Arc<HashMap<CellAddr, P::Seal>>,
     duplicate_seal_def_cache: HashSet<CellAddr>,
     duplicate_witness_cache: HashSet<(Opid, <P::Seal as RgbSeal>::WitnessId)>,
     op_aux_cache: HashMap<Opid, Vec<u8>>,
+    op_aux_cache_order: VecDeque<Opid>,
     op_aux_cache_bytes: usize,
     owned_state_status_cache: OwnedStateStatusCache<<P::Seal as RgbSeal>::WitnessId>,
 }
@@ -314,6 +373,17 @@ struct ConsumeStats {
     decoded_ops: usize,
     known_ops: usize,
     new_ops: usize,
+    witness_known_cache_hits: usize,
+    witness_known_db_checks: usize,
+    witness_known_db_elapsed_ms: u128,
+    known_seal_cache_hits: usize,
+    known_seal_external_hits: usize,
+    known_seal_db_checks: usize,
+    known_seal_db_elapsed_ms: u128,
+    seals_known_cache_hits: usize,
+    seals_known_external_hits: usize,
+    seals_known_db_checks: usize,
+    seals_known_db_elapsed_ms: u128,
     seal_updates_empty: usize,
     seal_updates_non_empty: usize,
     duplicate_seal_updates: usize,
@@ -335,6 +405,14 @@ fn with_consume_stats(update: impl FnOnce(&mut ConsumeStats)) {
 }
 
 impl<S: Stock, P: Pile> Contract<S, P> {
+    fn prune_contract_caches(&mut self) {
+        let max_entries = contract_cache_max_entries();
+        prune_hashmap_to(&mut self.seal_def_cache, max_entries);
+        prune_hashmap_to(&mut self.resolved_seal_cache, max_entries);
+        prune_hashset_to(&mut self.duplicate_seal_def_cache, max_entries);
+        prune_hashset_to(&mut self.duplicate_witness_cache, max_entries);
+    }
+
     fn refresh_valid_cache(&mut self) {
         let genesis_opid = self.ledger.articles().genesis_opid();
         let valid_cache = self
@@ -353,6 +431,83 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         self.valid_cache = valid_cache;
     }
 
+    fn prewarm_known_operation_duplicate_caches(&mut self, operations: &[OperationSeals<P::Seal>]) {
+        let known_ops = operations
+            .iter()
+            .filter(|op| self.valid_cache.contains(&op.operation.opid()))
+            .collect::<Vec<_>>();
+        if known_ops.is_empty() {
+            return;
+        }
+
+        let mut session = self.pile.session();
+        let preload_ops = known_ops
+            .iter()
+            .map(|op| (op.operation.opid(), op.operation.destructible_out.len_u16()));
+        session.preload_aux_reads(preload_ops);
+
+        for op in known_ops {
+            let opid = op.operation.opid();
+
+            let seals_cached = !op.defined_seals.is_empty()
+                && op.defined_seals.iter().all(|(no, seal)| {
+                    let addr = CellAddr::new(opid, *no);
+                    self.duplicate_seal_def_cache.contains(&addr)
+                        && self
+                            .seal_def_cache
+                            .get(&addr)
+                            .is_some_and(|stored| stored == seal)
+                });
+
+            if !op.defined_seals.is_empty() && !seals_cached {
+                let seals_match = if let Some(up_to) = op
+                    .defined_seals
+                    .keys()
+                    .next_back()
+                    .and_then(|no| no.checked_add(1))
+                    .filter(|up_to| *up_to <= SEALS_KNOWN_BATCH_UP_TO_MAX)
+                {
+                    let stored = session.seals(opid, up_to);
+                    op.defined_seals.iter().all(|(no, seal)| {
+                        stored
+                            .get(no)
+                            .is_some_and(|stored_seal| stored_seal == seal)
+                    })
+                } else {
+                    op.defined_seals.iter().all(|(no, seal)| {
+                        let addr = CellAddr::new(opid, *no);
+                        session.seal(addr).is_some_and(|stored| stored == *seal)
+                    })
+                };
+
+                if seals_match {
+                    for (no, seal) in &op.defined_seals {
+                        let addr = CellAddr::new(opid, *no);
+                        self.seal_def_cache.insert(addr, seal.clone());
+                        self.duplicate_seal_def_cache.insert(addr);
+                    }
+                }
+            }
+
+            if let Some(witness) = &op.witness {
+                let wid = witness.published.pub_id();
+                if self.duplicate_witness_cache.contains(&(opid, wid)) {
+                    continue;
+                }
+
+                let witness_matches = session.op_witness_ids(opid).contains(&wid)
+                    && session.has_witness(wid)
+                    && session.cli_witness(wid) == witness.client;
+                if witness_matches {
+                    self.duplicate_witness_cache.insert((opid, wid));
+                }
+            }
+        }
+
+        drop(session);
+        self.prune_contract_caches();
+    }
+
     fn clear_owned_state_status_cache(&mut self) {
         self.owned_state_status_cache.clear();
     }
@@ -368,10 +523,8 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         cache.clear();
 
         let genesis_opid = self.ledger.articles().genesis_opid();
-        let parent_ops: BTreeMap<Opid, Vec<Opid>> = self
-            .ledger
-            .operation_parent_ops()
-            .collect();
+        let parent_ops: BTreeMap<Opid, Vec<Opid>> =
+            self.ledger.operation_parent_ops().into_iter().collect();
 
         if parent_ops.len() > OWNED_STATE_STATUS_CACHE_MAX_OPS {
             return;
@@ -382,7 +535,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         {
             let mut session = self.pile.session();
             for opid in parent_ops.keys().copied().chain([genesis_opid]) {
-                let wids = session.op_witness_ids(opid).collect::<Vec<_>>();
+                let wids = session.op_witness_ids(opid);
                 for wid in &wids {
                     witness_statuses
                         .entry(*wid)
@@ -430,10 +583,12 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             valid_cache: HashSet::from([genesis_opid]),
             seal_def_cache: HashMap::new(),
             resolved_seal_cache: HashMap::new(),
+            external_seal_def_cache: Arc::new(HashMap::new()),
             external_resolved_seal_cache: Arc::new(HashMap::new()),
             duplicate_seal_def_cache: HashSet::new(),
             duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
+            op_aux_cache_order: VecDeque::new(),
             op_aux_cache_bytes: 0,
             owned_state_status_cache: OwnedStateStatusCache::default(),
         };
@@ -502,10 +657,12 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             valid_cache: HashSet::from([genesis_opid]),
             seal_def_cache: HashMap::new(),
             resolved_seal_cache: HashMap::new(),
+            external_seal_def_cache: Arc::new(HashMap::new()),
             external_resolved_seal_cache: Arc::new(HashMap::new()),
             duplicate_seal_def_cache: HashSet::new(),
             duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
+            op_aux_cache_order: VecDeque::new(),
             op_aux_cache_bytes: 0,
             owned_state_status_cache: OwnedStateStatusCache::default(),
         })
@@ -525,10 +682,12 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             valid_cache: HashSet::new(),
             seal_def_cache: HashMap::new(),
             resolved_seal_cache: HashMap::new(),
+            external_seal_def_cache: Arc::new(HashMap::new()),
             external_resolved_seal_cache: Arc::new(HashMap::new()),
             duplicate_seal_def_cache: HashSet::new(),
             duplicate_witness_cache: HashSet::new(),
             op_aux_cache: HashMap::new(),
+            op_aux_cache_order: VecDeque::new(),
             op_aux_cache_bytes: 0,
             owned_state_status_cache: OwnedStateStatusCache::default(),
         };
@@ -547,7 +706,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     }
 
     fn best_op_status(&mut self, opid: Opid) -> WitnessStatus {
-        let wids: Vec<_> = self.pile.session().op_witness_ids(opid).collect();
+        let wids = self.pile.session().op_witness_ids(opid);
         wids.into_iter()
             .map(|wid| self.pile.session().witness_status(wid))
             .reduce(|best, other| best.best(other))
@@ -567,7 +726,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         *best_status_cache.entry(opid).or_insert_with(|| {
             let wids = op_witness_ids_cache
                 .entry(opid)
-                .or_insert_with(|| self.pile.session().op_witness_ids(opid).collect::<Vec<_>>());
+                .or_insert_with(|| self.pile.session().op_witness_ids(opid));
             wids.iter()
                 .copied()
                 .map(|wid| {
@@ -622,19 +781,26 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         })
     }
 
-    fn retrieve(&mut self, opid: Opid) -> Option<SealWitness<P::Seal>> {
-        let wids: Vec<_> = self.pile.session().op_witness_ids(opid).collect();
+    fn retrieve_with_session<PS>(ps: &mut PS, opid: Opid) -> Option<SealWitness<P::Seal>>
+    where
+        PS: PileSession<Seal = P::Seal>,
+    {
+        let wids = ps.op_witness_ids(opid);
         let (status, wid) = wids
             .into_iter()
-            .map(|wid| (self.pile.session().witness_status(wid), wid))
+            .map(|wid| (ps.witness_status(wid), wid))
             .reduce(|best, other| if best.0.is_better(other.0) { best } else { other })?;
         if !status.is_valid() {
             return None;
         }
-        let mut ps = self.pile.session();
         let client = ps.cli_witness(wid);
         let published = ps.pub_witness(wid);
         Some(SealWitness::new(published, client))
+    }
+
+    fn retrieve(&mut self, opid: Opid) -> Option<SealWitness<P::Seal>> {
+        let mut ps = self.pile.session();
+        Self::retrieve_with_session(&mut ps, opid)
     }
 
     /// Operations with their pile relations — returns collected Vec to avoid borrow conflicts.
@@ -654,7 +820,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     }
 
     pub fn known_seal_cells(&mut self) -> Vec<CellAddr> {
-        self.pile.session().known_seal_cells().collect()
+        self.pile.session().known_seal_cells()
     }
 
     pub fn known_resolved_seals(&mut self) -> Vec<(CellAddr, P::Seal)> {
@@ -675,6 +841,33 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         self.external_resolved_seal_cache = seals;
     }
 
+    pub fn extend_external_seal_definitions(
+        &mut self,
+        seals: impl IntoIterator<Item = (CellAddr, <P::Seal as RgbSeal>::Definition)>,
+    ) {
+        let cache = Arc::make_mut(&mut self.external_seal_def_cache);
+        cache.extend(seals);
+        prune_hashmap_to(cache, contract_cache_max_entries());
+    }
+
+    pub fn set_external_seal_definitions(
+        &mut self,
+        seals: Arc<HashMap<CellAddr, <P::Seal as RgbSeal>::Definition>>,
+    ) {
+        let max_entries = contract_cache_max_entries();
+        self.external_seal_def_cache = if seals.len() <= max_entries {
+            seals
+        } else {
+            Arc::new(
+                seals
+                    .iter()
+                    .take(max_entries)
+                    .map(|(addr, seal)| (*addr, seal.clone()))
+                    .collect(),
+            )
+        };
+    }
+
     pub fn boundary_opids_for_known_cells(
         &mut self,
         known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
@@ -690,6 +883,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let mut pile_session = self.pile.session();
         let known_seal_cells = pile_session
             .known_seal_cells()
+            .into_iter()
             .filter(|cell| known_cells.contains(cell));
         let mut known_positions_by_opid = HashMap::<Opid, HashSet<u16>>::new();
         for cell in known_seal_cells {
@@ -701,17 +895,18 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
         self.ledger
             .operation_output_counts()
+            .into_iter()
             .filter_map(|(opid, count)| {
                 let known_positions = known_positions_by_opid.get(&opid)?;
                 (known_positions.len() == count as usize
                     && (0..count).all(|pos| known_positions.contains(&pos)))
-                    .then_some(opid)
+                .then_some(opid)
             })
             .collect()
     }
 
     pub fn witness_ids(&mut self) -> Vec<<P::Seal as RgbSeal>::WitnessId> {
-        self.pile.session().witness_ids().collect()
+        self.pile.session().witness_ids()
     }
 
     pub fn witness_statuses(&mut self) -> Vec<(<P::Seal as RgbSeal>::WitnessId, WitnessStatus)> {
@@ -729,7 +924,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     }
 
     pub fn witnesses(&mut self) -> Vec<Witness<P::Seal>> {
-        self.pile.session().witnesses().collect()
+        self.pile.session().witnesses()
     }
 
     pub fn witness_status(&mut self, wid: <P::Seal as RgbSeal>::WitnessId) -> WitnessStatus {
@@ -748,7 +943,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     }
 
     pub fn ops_by_witness_id(&mut self, wid: <P::Seal as RgbSeal>::WitnessId) -> Vec<Opid> {
-        self.pile.session().ops_by_witness_id(wid).collect()
+        self.pile.session().ops_by_witness_id(wid)
     }
 
     pub fn op_seals(&mut self, opid: Opid, up_to: u16) -> OpRels<P::Seal> {
@@ -841,7 +1036,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                         }
                     }
                 } else {
-                    let wids = session.op_witness_ids(addr.opid).collect::<Vec<_>>();
+                    let wids = session.op_witness_ids(addr.opid);
                     unresolved.push((*addr, seal, data.clone(), wids));
                 }
             }
@@ -858,10 +1053,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             (genesis_opid, &status_cache.parent_ops)
         } else {
             let genesis_opid = self.ledger.articles().genesis_opid();
-            fallback_parent_ops = self
-                .ledger
-                .operation_parent_ops()
-                .collect();
+            fallback_parent_ops = self.ledger.operation_parent_ops().into_iter().collect();
             (genesis_opid, &fallback_parent_ops)
         };
         let mut op_witness_ids_cache = core::mem::take(&mut status_cache.op_witness_ids);
@@ -945,7 +1137,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             let mut op_witness_ids = BTreeMap::new();
             let mut statuses = BTreeMap::new();
             for opid in all_ops.keys().copied().chain([genesis_opid]) {
-                let wids: Vec<_> = session.op_witness_ids(opid).collect();
+                let wids = session.op_witness_ids(opid);
                 for wid in &wids {
                     statuses
                         .entry(*wid)
@@ -1117,12 +1309,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let opids_per_wid: Vec<Vec<Opid>> = affected_wids
             .keys()
             .copied()
-            .map(|wid| {
-                self.pile
-                    .session()
-                    .ops_by_witness_id(wid)
-                    .collect::<Vec<_>>()
-            })
+            .map(|wid| self.pile.session().ops_by_witness_id(wid))
             .collect();
         for opids in opids_per_wid {
             for opid in opids {
@@ -1198,13 +1385,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let wid = published.pub_id();
         let anchor = if self.pile.session().has_witness(wid) {
             let mut prev = self.pile.session().cli_witness(wid);
-            if prev == anchor
-                && self
-                    .pile
-                    .session()
-                    .ops_by_witness_id(wid)
-                    .any(|op| op == opid)
-            {
+            if prev == anchor && self.pile.session().ops_by_witness_id(wid).contains(&opid) {
                 with_consume_stats(|stats| stats.duplicate_witness_updates += 1);
                 return;
             }
@@ -1229,18 +1410,18 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         self.pile.session().commit_transaction();
     }
 
-    fn aux<W: WriteRaw>(
-        &mut self,
+    fn aux_with_session<W: WriteRaw, PS>(
+        ps: &mut PS,
         opid: Opid,
         op: &Operation,
         mut writer: StrictWriter<W>,
-    ) -> io::Result<StrictWriter<W>> {
-        let seals = self
-            .pile
-            .session()
-            .seals(opid, op.destructible_out.len_u16());
+    ) -> io::Result<StrictWriter<W>>
+    where
+        PS: PileSession<Seal = P::Seal>,
+    {
+        let seals = ps.seals(opid, op.destructible_out.len_u16());
         writer = seals.strict_encode(writer)?;
-        let witness = self.retrieve(opid);
+        let witness = Self::retrieve_with_session(ps, opid);
         writer = witness.is_some().strict_encode(writer)?;
         if let Some(w) = witness {
             writer = w.strict_encode(writer)?;
@@ -1252,22 +1433,58 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         if let Some(bytes) = self.op_aux_cache.remove(&opid) {
             self.op_aux_cache_bytes = self.op_aux_cache_bytes.saturating_sub(bytes.len());
         }
+        self.op_aux_cache_order.retain(|cached| *cached != opid);
+    }
+
+    fn touch_op_aux_cache_entry(&mut self, opid: Opid) {
+        self.op_aux_cache_order.retain(|cached| *cached != opid);
+        self.op_aux_cache_order.push_back(opid);
     }
 
     fn insert_op_aux_cache_entry(&mut self, opid: Opid, bytes: Vec<u8>) {
+        let max_bytes = op_aux_cache_max_bytes();
         let bytes_len = bytes.len();
-        if bytes_len > OP_AUX_CACHE_MAX_BYTES {
+        if bytes_len > max_bytes {
             return;
         }
-        let replaced_bytes_len = self.op_aux_cache.get(&opid).map_or(0, Vec::len);
-        let cache_bytes_after_replace = self.op_aux_cache_bytes.saturating_sub(replaced_bytes_len);
-        if cache_bytes_after_replace.saturating_add(bytes_len) > OP_AUX_CACHE_MAX_BYTES {
-            return;
-        }
-        if let Some(old_bytes) = self.op_aux_cache.insert(opid, bytes) {
+
+        if let Some(old_bytes) = self.op_aux_cache.remove(&opid) {
             self.op_aux_cache_bytes = self.op_aux_cache_bytes.saturating_sub(old_bytes.len());
         }
+        self.op_aux_cache_order.retain(|cached| *cached != opid);
+
+        while self.op_aux_cache_bytes.saturating_add(bytes_len) > max_bytes {
+            let Some(oldest) = self.op_aux_cache_order.pop_front() else {
+                break;
+            };
+            if let Some(old_bytes) = self.op_aux_cache.remove(&oldest) {
+                self.op_aux_cache_bytes = self.op_aux_cache_bytes.saturating_sub(old_bytes.len());
+            }
+        }
+
+        self.op_aux_cache.insert(opid, bytes);
+        self.op_aux_cache_order.push_back(opid);
         self.op_aux_cache_bytes = self.op_aux_cache_bytes.saturating_add(bytes_len);
+    }
+
+    fn build_op_aux_cache_entry(&mut self, opid: Opid, op: &Operation) -> io::Result<Vec<u8>> {
+        let mut ps = self.pile.session();
+        Self::build_op_aux_cache_entry_with_session(&mut ps, opid, op)
+    }
+
+    fn build_op_aux_cache_entry_with_session<PS>(
+        ps: &mut PS,
+        opid: Opid,
+        op: &Operation,
+    ) -> io::Result<Vec<u8>>
+    where
+        PS: PileSession<Seal = P::Seal>,
+    {
+        let mem_writer = StrictWriter::with(StreamWriter::in_memory::<{ usize::MAX }>());
+        let mem_writer = op.strict_encode(mem_writer)?;
+        Ok(Self::aux_with_session(ps, opid, op, mem_writer)?
+            .unbox()
+            .unconfine())
     }
 
     fn op_aux_cached<W: WriteRaw>(
@@ -1277,20 +1494,89 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         mut writer: StrictWriter<W>,
     ) -> io::Result<StrictWriter<W>> {
         if let Some(bytes) = self.op_aux_cache.get(&opid) {
+            let bytes = bytes.clone();
+            self.touch_op_aux_cache_entry(opid);
             unsafe {
-                writer.raw_writer().write_raw::<{ usize::MAX }>(bytes)?;
+                writer.raw_writer().write_raw::<{ usize::MAX }>(&bytes)?;
             }
             return Ok(writer);
         }
 
-        let mem_writer = StrictWriter::with(StreamWriter::in_memory::<{ usize::MAX }>());
-        let mem_writer = op.strict_encode(mem_writer)?;
-        let bytes = self.aux(opid, op, mem_writer)?.unbox().unconfine();
+        let bytes = self.build_op_aux_cache_entry(opid, op)?;
         unsafe {
             writer.raw_writer().write_raw::<{ usize::MAX }>(&bytes)?;
         }
         self.insert_op_aux_cache_entry(opid, bytes);
         Ok(writer)
+    }
+
+    fn prewarm_op_aux_cache(
+        &mut self,
+        ops: &[(Opid, Operation)],
+        contract_id: ContractId,
+    ) -> io::Result<usize> {
+        let prewarm_started_at = Instant::now();
+        let mut encoded = 0usize;
+        let mut pending = Vec::new();
+        for (idx, (opid, op)) in ops.iter().enumerate() {
+            if self.op_aux_cache.contains_key(opid) {
+                self.touch_op_aux_cache_entry(*opid);
+                continue;
+            }
+            pending.push((idx, *opid, op));
+        }
+
+        let mut warmed = Vec::with_capacity(pending.len());
+        {
+            let mut ps = self.pile.session();
+            let preload_ops = pending
+                .iter()
+                .map(|(_, opid, op)| (*opid, op.destructible_out.len_u16()));
+            ps.preload_aux_reads(preload_ops);
+            for (idx, opid, op) in pending {
+                let op_started_at = Instant::now();
+                let bytes = Self::build_op_aux_cache_entry_with_session(&mut ps, opid, op)?;
+                let elapsed_ms = slow_rgb_stage_elapsed(op_started_at);
+                warmed.push((idx, opid, bytes, elapsed_ms));
+            }
+        }
+
+        for (idx, opid, bytes, elapsed_ms) in warmed {
+            let bytes_len = bytes.len();
+            self.insert_op_aux_cache_entry(opid, bytes);
+            encoded += 1;
+            if let Some(elapsed_ms) = elapsed_ms {
+                tracing::warn!(
+                    operation = "rgb_std",
+                    stage = "consign_prewarm_operation",
+                    elapsed_ms,
+                    ?contract_id,
+                    opid = ?opid,
+                    idx,
+                    total_ops = ops.len(),
+                    bytes = bytes_len,
+                    cache_bytes = self.op_aux_cache_bytes,
+                    cache_entries = self.op_aux_cache.len(),
+                    "Slow rgb-std stage"
+                );
+            }
+        }
+        if encoded > 0 {
+            if let Some(elapsed_ms) = slow_rgb_stage_elapsed(prewarm_started_at) {
+                tracing::warn!(
+                    operation = "rgb_std",
+                    stage = "consign_prewarm_operations",
+                    elapsed_ms,
+                    ?contract_id,
+                    selected_ops = ops.len(),
+                    encoded_ops = encoded,
+                    cache_bytes = self.op_aux_cache_bytes,
+                    cache_entries = self.op_aux_cache.len(),
+                    "Slow rgb-std stage"
+                );
+            }
+        }
+        Ok(encoded)
     }
 
     fn aux_uncached<W: WriteRaw>(
@@ -1299,7 +1585,8 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         op: &Operation,
         writer: StrictWriter<W>,
     ) -> io::Result<StrictWriter<W>> {
-        self.aux(opid, op, writer)
+        let mut ps = self.pile.session();
+        Self::aux_with_session(&mut ps, opid, op, writer)
     }
 
     pub fn export(&mut self, writer: StrictWriter<impl WriteRaw>) -> io::Result<()>
@@ -1441,10 +1728,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let known_opids = if trust_known_opids {
             known_opids
         } else {
-            known_opids
-                .into_iter()
-                .filter(|opid| self.op_definitions_known_by_cells(*opid, &known_cells))
-                .collect::<HashSet<_>>()
+            self.known_boundary_opids_by_cells(known_opids, &known_cells)
         };
         // Collect terminal opids
         let terminal_started_at = Instant::now();
@@ -1464,53 +1748,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         }
         // Match Ledger::export_aux semantics: follow destroyed cells backwards from
         // terminals and include published global-state definitions required by validation.
-        let select_ops_started_at = Instant::now();
         let genesis_opid = self.ledger.articles().genesis_opid();
-        let mut selected_opids = HashSet::new();
-        let mut ordered_opids = Vec::new();
-        macro_rules! include_op_with_dependencies {
-            ($root:expr) => {{
-                let root = $root;
-                if root != genesis_opid
-                    && !known_opids.contains(&root)
-                    && !selected_opids.contains(&root)
-                {
-                    let mut stack = vec![(root, false)];
-                    while let Some((opid, expanded)) = stack.pop() {
-                        if opid == genesis_opid
-                            || known_opids.contains(&opid)
-                            || selected_opids.contains(&opid)
-                        {
-                            continue;
-                        }
-                        if expanded {
-                            if selected_opids.insert(opid) {
-                                ordered_opids.push(opid);
-                            }
-                            continue;
-                        }
-
-                        stack.push((opid, true));
-                        let st = self.ledger.transition(opid);
-                        for addr in st.destroyed.into_keys() {
-                            let prev = addr.opid;
-                            if prev != genesis_opid
-                                && !known_opids.contains(&prev)
-                                && !known_cells.contains(&addr)
-                                && !selected_opids.contains(&prev)
-                            {
-                                stack.push((prev, false));
-                            }
-                        }
-                    }
-                }
-            }};
-        }
-
-        for opid in terminal_opids.iter().copied() {
-            include_op_with_dependencies!(opid);
-        }
-
         let mut published_roots = BTreeSet::new();
         {
             let articles = self.ledger.articles();
@@ -1540,49 +1778,138 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             }
         }
         let published_ops_added = published_roots.len();
-        for opid in published_roots {
-            include_op_with_dependencies!(opid);
-        }
+        tracing::debug!(
+            operation = "rgb_std",
+            stage = "consign_select_start",
+            contract_id = ?self.contract_id,
+            terminal_ops = terminal_opids.len(),
+            known_ops = known_opids.len(),
+            raw_known_ops = raw_known_opids,
+            known_cells = known_cells.len(),
+            trust_known_opids,
+            published_ops_added,
+            "Starting rgb-std consignment operation selection"
+        );
+        let (_, ops) = self
+            .ledger
+            .with_session(|session| -> io::Result<_> {
+                let select_ops_started_at = Instant::now();
+                let mut selected_opids = HashSet::new();
+                let mut pending_opids = HashSet::new();
+                let mut ordered_opids = Vec::new();
+                macro_rules! include_op_with_dependencies {
+                    ($root:expr) => {{
+                        let root = $root;
+                        if root != genesis_opid
+                            && !known_opids.contains(&root)
+                            && !selected_opids.contains(&root)
+                            && pending_opids.insert(root)
+                        {
+                            let mut stack = vec![(root, false)];
+                            while let Some((opid, expanded)) = stack.pop() {
+                                if opid == genesis_opid
+                                    || known_opids.contains(&opid)
+                                    || selected_opids.contains(&opid)
+                                {
+                                    continue;
+                                }
+                                if expanded {
+                                    pending_opids.remove(&opid);
+                                    if selected_opids.insert(opid) {
+                                        ordered_opids.push(opid);
+                                    }
+                                    continue;
+                                }
 
-        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(select_ops_started_at) {
-            tracing::warn!(
-                operation = "rgb_std",
-                stage = "consign_select_operations",
-                elapsed_ms,
-                contract_id = ?self.contract_id,
-                terminal_ops = terminal_opids.len(),
-                selected_ops = selected_opids.len(),
-                known_ops = known_opids.len(),
-                raw_known_ops = raw_known_opids,
-                known_cells = known_cells.len(),
-                trust_known_opids,
-                published_ops_added,
-                "Slow rgb-std stage"
-            );
-        }
-        let filter_ops_started_at = Instant::now();
-        let ops = ordered_opids
-            .into_iter()
-            .map(|opid| (opid, self.ledger.operation(opid)))
-            .collect::<Vec<_>>();
-        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(filter_ops_started_at) {
-            tracing::warn!(
-                operation = "rgb_std",
-                stage = "consign_filter_operations",
-                elapsed_ms,
-                contract_id = ?self.contract_id,
-                selected_ops = ops.len(),
-                terminal_ops = terminal_opids.len(),
-                known_ops = known_opids.len(),
-                raw_known_ops = raw_known_opids,
-                known_cells = known_cells.len(),
-                trust_known_opids,
-                published_ops_added,
-                "Slow rgb-std stage"
-            );
-        }
+                                stack.push((opid, true));
+                                let op = session.operation(opid);
+                                for input in &op.immutable_in {
+                                    let prev = input.opid;
+                                    if prev != genesis_opid
+                                        && !known_opids.contains(&prev)
+                                        && !selected_opids.contains(&prev)
+                                    {
+                                        pending_opids.insert(prev);
+                                        stack.push((prev, false));
+                                    }
+                                }
+                                for input in &op.destructible_in {
+                                    let prev = input.addr.opid;
+                                    if prev != genesis_opid
+                                        && !known_opids.contains(&prev)
+                                        && !selected_opids.contains(&prev)
+                                    {
+                                        pending_opids.insert(prev);
+                                        stack.push((prev, false));
+                                    }
+                                }
+                                let st = session.transition(opid);
+                                for addr in st.destroyed.into_keys() {
+                                    let prev = addr.opid;
+                                    if prev != genesis_opid
+                                        && !known_opids.contains(&prev)
+                                        && !selected_opids.contains(&prev)
+                                    {
+                                        pending_opids.insert(prev);
+                                        stack.push((prev, false));
+                                    }
+                                }
+                            }
+                        }
+                    }};
+                }
+
+                for opid in terminal_opids.iter().copied() {
+                    include_op_with_dependencies!(opid);
+                }
+                for opid in published_roots {
+                    include_op_with_dependencies!(opid);
+                }
+
+                if let Some(elapsed_ms) = slow_rgb_stage_elapsed(select_ops_started_at) {
+                    tracing::warn!(
+                        operation = "rgb_std",
+                        stage = "consign_select_operations",
+                        elapsed_ms,
+                        contract_id = ?self.contract_id,
+                        terminal_ops = terminal_opids.len(),
+                        selected_ops = selected_opids.len(),
+                        known_ops = known_opids.len(),
+                        raw_known_ops = raw_known_opids,
+                        known_cells = known_cells.len(),
+                        trust_known_opids,
+                        published_ops_added,
+                        "Slow rgb-std stage"
+                    );
+                }
+                let filter_ops_started_at = Instant::now();
+                let ops = ordered_opids
+                    .into_iter()
+                    .map(|opid| (opid, session.operation(opid)))
+                    .collect::<Vec<_>>();
+                if let Some(elapsed_ms) = slow_rgb_stage_elapsed(filter_ops_started_at) {
+                    tracing::warn!(
+                        operation = "rgb_std",
+                        stage = "consign_filter_operations",
+                        elapsed_ms,
+                        contract_id = ?self.contract_id,
+                        selected_ops = ops.len(),
+                        terminal_ops = terminal_opids.len(),
+                        known_ops = known_opids.len(),
+                        raw_known_ops = raw_known_opids,
+                        known_cells = known_cells.len(),
+                        trust_known_opids,
+                        published_ops_added,
+                        "Slow rgb-std stage"
+                    );
+                }
+
+                Ok((selected_opids.len(), ops))
+            })
+            .map_err(|err| io::Error::other(err.to_string()))?;
         let count = ops.len() as u32;
         let contract_id = self.contract_id;
+        let prewarmed_ops = self.prewarm_op_aux_cache(&ops, contract_id)?;
         let mut writer = writer;
         let write_started_at = Instant::now();
         let genesis_op = self.ledger.articles().genesis().to_operation(contract_id);
@@ -1606,6 +1933,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 raw_known_ops = raw_known_opids,
                 known_cells = known_cells.len(),
                 trust_known_opids,
+                prewarmed_ops,
                 "Slow rgb-std stage"
             );
         }
@@ -1626,17 +1954,78 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         Ok(())
     }
 
-    fn op_definitions_known_by_cells(
+    fn known_boundary_opids_by_cells(
         &mut self,
-        opid: Opid,
+        known_opids: HashSet<Opid>,
         known_cells: &HashSet<CellAddr>,
-    ) -> bool {
-        let op = self.ledger.operation(opid);
-        let up_to = op.destructible_out.len_u16();
-        let rels = self.pile.session().op_relations(opid, up_to);
-        (0..up_to).all(|no| {
-            rels.defines.contains_key(&no) && known_cells.contains(&CellAddr::new(opid, no))
-        })
+    ) -> HashSet<Opid> {
+        if known_opids.is_empty() || known_cells.is_empty() {
+            return HashSet::new();
+        }
+
+        let started_at = Instant::now();
+        let raw_known_opids = known_opids.len();
+        let output_counts = self
+            .ledger
+            .operation_output_counts()
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        let output_count_entries = output_counts.len();
+        let mut operation_decode_fallbacks = 0usize;
+        let mut missing_operations = 0usize;
+        let candidates = known_opids
+            .into_iter()
+            .filter_map(|opid| {
+                if let Some(count) = output_counts.get(&opid).copied() {
+                    return Some((opid, count));
+                }
+
+                if !self.ledger.has_operation(opid) {
+                    missing_operations = missing_operations.saturating_add(1);
+                    return None;
+                }
+
+                operation_decode_fallbacks = operation_decode_fallbacks.saturating_add(1);
+                let op = self.ledger.operation(opid);
+                Some((opid, op.destructible_out.len_u16()))
+            })
+            .collect::<Vec<_>>();
+
+        let known_opids = self
+            .pile
+            .session()
+            .known_boundary_opids_by_cells(candidates.iter().copied(), known_cells);
+
+        if missing_operations > 0 {
+            tracing::debug!(
+                operation = "rgb_std",
+                stage = "known_boundary_missing_operations",
+                contract_id = ?self.contract_id,
+                raw_known_ops = raw_known_opids,
+                missing_operations,
+                operation_decode_fallbacks,
+                known_cells = known_cells.len(),
+                "Ignoring known opid boundaries missing from stock session"
+            );
+        }
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "known_boundary_filter_opids",
+                elapsed_ms,
+                contract_id = ?self.contract_id,
+                raw_known_ops = raw_known_opids,
+                candidate_ops = candidates.len(),
+                accepted_ops = known_opids.len(),
+                missing_operations,
+                operation_decode_fallbacks,
+                output_count_entries,
+                known_cells = known_cells.len(),
+                "Slow rgb-std stage"
+            );
+        }
+
+        known_opids
     }
 
     pub fn consume<E>(
@@ -1683,12 +2072,35 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             let evaluate_started_at = Instant::now();
             let previous_stats =
                 CONSUME_STATS.with(|stats| stats.replace(Some(ConsumeStats::default())));
-            let op_reader = OpReader {
-                stream: reader,
-                seal_resolver,
-                count: u32::MAX,
-                _phantom: PhantomData,
-            };
+            let predecode_started_at = Instant::now();
+            let operations = decode_consignment_operations(reader, seal_resolver)?;
+            if let Some(elapsed_ms) = slow_rgb_stage_elapsed(predecode_started_at) {
+                tracing::warn!(
+                    operation = "rgb_std",
+                    stage = "consume_predecode_operations",
+                    elapsed_ms,
+                    contract_id = ?self.contract_id,
+                    operations = operations.len(),
+                    "Slow rgb-std stage"
+                );
+            }
+
+            let duplicate_cache_started_at = Instant::now();
+            self.prewarm_known_operation_duplicate_caches(&operations);
+            if let Some(elapsed_ms) = slow_rgb_stage_elapsed(duplicate_cache_started_at) {
+                tracing::warn!(
+                    operation = "rgb_std",
+                    stage = "consume_prewarm_duplicate_caches",
+                    elapsed_ms,
+                    contract_id = ?self.contract_id,
+                    operations = operations.len(),
+                    duplicate_seal_def_cache_entries = self.duplicate_seal_def_cache.len(),
+                    duplicate_witness_cache_entries = self.duplicate_witness_cache.len(),
+                    "Slow rgb-std stage"
+                );
+            }
+
+            let op_reader = PredecodedOpReader(VecDeque::from(operations));
             let evaluate_result = self.evaluate_commit(op_reader);
             let stats = CONSUME_STATS
                 .with(|stats| stats.replace(previous_stats))
@@ -1702,12 +2114,28 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     decoded_ops = stats.decoded_ops,
                     known_ops = stats.known_ops,
                     new_ops = stats.new_ops,
+                    witness_known_cache_hits = stats.witness_known_cache_hits,
+                    witness_known_db_checks = stats.witness_known_db_checks,
+                    witness_known_db_elapsed_ms = stats.witness_known_db_elapsed_ms,
+                    known_seal_cache_hits = stats.known_seal_cache_hits,
+                    known_seal_external_hits = stats.known_seal_external_hits,
+                    known_seal_db_checks = stats.known_seal_db_checks,
+                    known_seal_db_elapsed_ms = stats.known_seal_db_elapsed_ms,
+                    seals_known_cache_hits = stats.seals_known_cache_hits,
+                    seals_known_external_hits = stats.seals_known_external_hits,
+                    seals_known_db_checks = stats.seals_known_db_checks,
+                    seals_known_db_elapsed_ms = stats.seals_known_db_elapsed_ms,
                     seal_updates_empty = stats.seal_updates_empty,
                     seal_updates_non_empty = stats.seal_updates_non_empty,
                     duplicate_seal_updates = stats.duplicate_seal_updates,
                     witness_updates = stats.witness_updates,
                     duplicate_witness_updates = stats.duplicate_witness_updates,
                     known_materialized_skips = stats.known_materialized_skips,
+                    seal_def_cache_entries = self.seal_def_cache.len(),
+                    resolved_seal_cache_entries = self.resolved_seal_cache.len(),
+                    duplicate_seal_def_cache_entries = self.duplicate_seal_def_cache.len(),
+                    duplicate_witness_cache_entries = self.duplicate_witness_cache.len(),
+                    contract_cache_max_entries = contract_cache_max_entries(),
                     "Slow rgb-std stage"
                 );
             }
@@ -1742,46 +2170,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     }
 }
 
-pub struct OpReader<
-    'r,
-    Seal: RgbSeal,
-    R: ReadRaw,
-    F: FnMut(&Operation) -> BTreeMap<u16, Seal::Definition>,
-> {
-    stream: &'r mut StrictReader<R>,
-    count: u32,
-    seal_resolver: F,
-    _phantom: PhantomData<Seal>,
-}
-
-impl<'r, Seal: RgbSeal, R: ReadRaw, F: FnMut(&Operation) -> BTreeMap<u16, Seal::Definition>>
-    ReadOperation for OpReader<'r, Seal, R, F>
-{
-    type Seal = Seal;
-    fn read_operation(
-        &mut self,
-    ) -> Result<Option<OperationSeals<Self::Seal>>, impl Error + 'static> {
-        if self.count == 0 {
-            return Result::<_, DecodeError>::Ok(None);
-        }
-        let operation = Operation::strict_decode(self.stream)?;
-        let mut defined_seals = SmallOrdMap::strict_decode(self.stream)?;
-        with_consume_stats(|stats| stats.decoded_ops += 1);
-        defined_seals
-            .extend((self.seal_resolver)(&operation))
-            .map_err(|_| {
-                DecodeError::DataIntegrityError(format!("too many seals for {}", operation.opid()))
-            })?;
-        let witness = Option::<SealWitness<Seal>>::strict_decode(self.stream)?;
-        if self.count == u32::MAX {
-            self.count = u32::strict_decode(self.stream)?;
-        } else {
-            self.count -= 1;
-        }
-        Ok(Some(OperationSeals { operation, defined_seals, witness }))
-    }
-}
-
 impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
     fn contract_id(&self) -> ContractId {
         self.ledger.contract_id()
@@ -1810,16 +2198,27 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
     fn is_witness_known(&mut self, opid: Opid, witness: &SealWitness<P::Seal>) -> bool {
         let wid = witness.published.pub_id();
         if self.duplicate_witness_cache.contains(&(opid, wid)) {
-            with_consume_stats(|stats| stats.duplicate_witness_updates += 1);
+            with_consume_stats(|stats| {
+                stats.witness_known_cache_hits += 1;
+                stats.duplicate_witness_updates += 1;
+            });
             return true;
         }
 
+        let db_started_at = Instant::now();
         let mut ps = self.pile.session();
-        let known = ps.has_witness(wid)
-            && ps.cli_witness(wid) == witness.client
-            && ps.ops_by_witness_id(wid).any(|op| op == opid);
+        let known = ps.op_witness_ids(opid).contains(&wid)
+            && ps.has_witness(wid)
+            && ps.cli_witness(wid) == witness.client;
+        let db_elapsed_ms = db_started_at.elapsed().as_millis();
+        drop(ps);
+        with_consume_stats(|stats| {
+            stats.witness_known_db_checks += 1;
+            stats.witness_known_db_elapsed_ms += db_elapsed_ms;
+        });
         if known {
             self.duplicate_witness_cache.insert((opid, wid));
+            self.prune_contract_caches();
             with_consume_stats(|stats| stats.duplicate_witness_updates += 1);
         }
         known
@@ -1827,31 +2226,58 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
 
     fn known_seal(&mut self, addr: CellAddr) -> Option<P::Seal> {
         if let Some(seal) = self.resolved_seal_cache.get(&addr) {
+            with_consume_stats(|stats| stats.known_seal_cache_hits += 1);
             return Some(seal.clone());
         }
 
         let definition = if let Some(definition) = self.seal_def_cache.get(&addr) {
             definition.clone()
+        } else if let Some(definition) = self.external_seal_def_cache.get(&addr) {
+            let definition = definition.clone();
+            self.seal_def_cache.insert(addr, definition.clone());
+            self.prune_contract_caches();
+            with_consume_stats(|stats| {
+                stats.seals_known_external_hits += 1;
+            });
+            definition
         } else {
-            match self.pile.session().seal(addr) {
+            let db_started_at = Instant::now();
+            let seal = self.pile.session().seal(addr);
+            let db_elapsed_ms = db_started_at.elapsed().as_millis();
+            with_consume_stats(|stats| {
+                stats.known_seal_db_checks += 1;
+                stats.known_seal_db_elapsed_ms += db_elapsed_ms;
+            });
+            match seal {
                 Some(definition) => {
                     self.seal_def_cache.insert(addr, definition.clone());
+                    self.prune_contract_caches();
                     definition
                 }
                 None => {
-                    return self.external_resolved_seal_cache.get(&addr).cloned();
+                    let seal = self.external_resolved_seal_cache.get(&addr).cloned();
+                    if seal.is_some() {
+                        with_consume_stats(|stats| stats.known_seal_external_hits += 1);
+                    }
+                    return seal;
                 }
             }
         };
         if let Some(seal) = definition.to_src() {
             self.resolved_seal_cache.insert(addr, seal.clone());
+            self.prune_contract_caches();
             return Some(seal);
         }
         let Some(witness) = self.retrieve(addr.opid) else {
-            return self.external_resolved_seal_cache.get(&addr).cloned();
+            let seal = self.external_resolved_seal_cache.get(&addr).cloned();
+            if seal.is_some() {
+                with_consume_stats(|stats| stats.known_seal_external_hits += 1);
+            }
+            return seal;
         };
         let seal = definition.resolve(witness.published.pub_id());
         self.resolved_seal_cache.insert(addr, seal.clone());
+        self.prune_contract_caches();
         Some(seal)
     }
 
@@ -1873,36 +2299,108 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         });
         if cached {
             with_consume_stats(|stats| {
+                stats.seals_known_cache_hits += 1;
                 stats.duplicate_seal_updates += 1;
                 stats.known_materialized_skips += 1;
             });
             return true;
         }
 
-        let mut ps = self.pile.session();
-        let known = seals.iter().all(|(no, seal)| {
+        let external_cached = seals.iter().all(|(no, seal)| {
             let addr = CellAddr::new(opid, *no);
-            if self
-                .seal_def_cache
+            self.seal_def_cache
                 .get(&addr)
+                .or_else(|| self.external_seal_def_cache.get(&addr))
                 .is_some_and(|stored| stored == seal)
-            {
-                return true;
-            }
-            let Some(stored) = ps.seal(addr) else {
-                return false;
-            };
-            if stored != *seal {
-                return false;
-            }
-            self.seal_def_cache.insert(addr, stored);
-            true
         });
+        if external_cached {
+            self.seal_def_cache.extend(seals.iter().map(|(no, seal)| {
+                let addr = CellAddr::new(opid, *no);
+                let seal = self
+                    .external_seal_def_cache
+                    .get(&addr)
+                    .cloned()
+                    .unwrap_or_else(|| seal.clone());
+                (addr, seal)
+            }));
+            self.prune_contract_caches();
+            self.duplicate_seal_def_cache
+                .extend(seals.keys().map(|no| CellAddr::new(opid, *no)));
+            self.prune_contract_caches();
+            with_consume_stats(|stats| {
+                stats.seals_known_external_hits += 1;
+                stats.duplicate_seal_updates += 1;
+                stats.known_materialized_skips += 1;
+            });
+            return true;
+        }
+
+        let missing = seals
+            .iter()
+            .filter_map(|(no, seal)| {
+                let addr = CellAddr::new(opid, *no);
+                if self
+                    .seal_def_cache
+                    .get(&addr)
+                    .is_some_and(|stored| stored == seal)
+                {
+                    return None;
+                }
+                if let Some(stored) = self.external_seal_def_cache.get(&addr) {
+                    if stored == seal {
+                        self.seal_def_cache.insert(addr, stored.clone());
+                        return None;
+                    }
+                }
+                Some((*no, seal.clone()))
+            })
+            .collect::<Vec<_>>();
+
+        let db_started_at = Instant::now();
+        let mut ps = self.pile.session();
+        let known = if let Some(up_to) = seals
+            .keys()
+            .next_back()
+            .and_then(|no| no.checked_add(1))
+            .filter(|up_to| *up_to <= SEALS_KNOWN_BATCH_UP_TO_MAX)
+        {
+            let stored = ps.seals(opid, up_to);
+            missing.into_iter().all(|(no, seal)| {
+                let Some(stored_seal) = stored.get(&no) else {
+                    return false;
+                };
+                if *stored_seal != seal {
+                    return false;
+                }
+                self.seal_def_cache
+                    .insert(CellAddr::new(opid, no), stored_seal.clone());
+                true
+            })
+        } else {
+            missing.into_iter().all(|(no, seal)| {
+                let addr = CellAddr::new(opid, no);
+                let Some(stored) = ps.seal(addr) else {
+                    return false;
+                };
+                if stored != seal {
+                    return false;
+                }
+                self.seal_def_cache.insert(addr, stored);
+                true
+            })
+        };
         drop(ps);
+        let db_elapsed_ms = db_started_at.elapsed().as_millis();
+        with_consume_stats(|stats| {
+            stats.seals_known_db_checks += 1;
+            stats.seals_known_db_elapsed_ms += db_elapsed_ms;
+        });
+        self.prune_contract_caches();
 
         if known {
             self.duplicate_seal_def_cache
                 .extend(seals.keys().map(|no| CellAddr::new(opid, *no)));
+            self.prune_contract_caches();
             with_consume_stats(|stats| {
                 stats.duplicate_seal_updates += 1;
                 stats.known_materialized_skips += 1;
@@ -1939,34 +2437,73 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
                     .is_some_and(|stored| stored == seal)
         });
         if cached_duplicate {
+            self.remove_op_aux_cache_entry(opid);
             with_consume_stats(|stats| stats.duplicate_seal_updates += 1);
             return;
         }
 
-        let duplicate = {
-            let mut ps = self.pile.session();
-            seals.iter().all(|(no, seal)| {
+        let missing = seals
+            .iter()
+            .filter_map(|(no, seal)| {
                 let addr = CellAddr::new(opid, *no);
                 if self
                     .seal_def_cache
                     .get(&addr)
                     .is_some_and(|stored| stored == seal)
                 {
-                    return true;
+                    return None;
                 }
-                let Some(stored) = ps.seal(addr) else {
-                    return false;
-                };
-                if stored != *seal {
-                    return false;
+                if let Some(stored) = self.external_seal_def_cache.get(&addr) {
+                    if stored == seal {
+                        self.seal_def_cache.insert(addr, stored.clone());
+                        return None;
+                    }
                 }
-                self.seal_def_cache.insert(addr, stored);
-                true
+                Some((*no, seal.clone()))
             })
+            .collect::<Vec<_>>();
+
+        let duplicate = if missing.is_empty() {
+            true
+        } else {
+            let mut ps = self.pile.session();
+            if let Some(up_to) = seals
+                .keys()
+                .next_back()
+                .and_then(|no| no.checked_add(1))
+                .filter(|up_to| *up_to <= SEALS_KNOWN_BATCH_UP_TO_MAX)
+            {
+                let stored = ps.seals(opid, up_to);
+                missing.into_iter().all(|(no, seal)| {
+                    let Some(stored_seal) = stored.get(&no) else {
+                        return false;
+                    };
+                    if *stored_seal != seal {
+                        return false;
+                    }
+                    self.seal_def_cache
+                        .insert(CellAddr::new(opid, no), stored_seal.clone());
+                    true
+                })
+            } else {
+                missing.into_iter().all(|(no, seal)| {
+                    let addr = CellAddr::new(opid, no);
+                    let Some(stored) = ps.seal(addr) else {
+                        return false;
+                    };
+                    if stored != seal {
+                        return false;
+                    }
+                    self.seal_def_cache.insert(addr, stored);
+                    true
+                })
+            }
         };
         if duplicate {
             self.duplicate_seal_def_cache
                 .extend(seals.keys().map(|no| CellAddr::new(opid, *no)));
+            self.prune_contract_caches();
+            self.remove_op_aux_cache_entry(opid);
             with_consume_stats(|stats| stats.duplicate_seal_updates += 1);
             return;
         }
@@ -1976,6 +2513,7 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
             self.resolved_seal_cache.remove(&addr);
             self.duplicate_seal_def_cache.insert(addr);
         }
+        self.prune_contract_caches();
         self.pile.session().add_seals(opid, seals);
         self.remove_op_aux_cache_entry(opid);
         self.clear_owned_state_status_cache();
@@ -1987,6 +2525,53 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         self.include(opid, witness.client, &witness.published);
         self.duplicate_witness_cache.insert((opid, wid));
         self.resolved_seal_cache.retain(|addr, _| addr.opid != opid);
+    }
+}
+
+fn decode_consignment_operations<Seal: RgbSeal, R: ReadRaw>(
+    reader: &mut StrictReader<R>,
+    mut seal_resolver: impl FnMut(&Operation) -> BTreeMap<u16, Seal::Definition>,
+) -> Result<Vec<OperationSeals<Seal>>, DecodeError>
+where
+    Seal::Client: StrictDecode,
+    Seal::Published: StrictDecode,
+    Seal::WitnessId: StrictDecode,
+{
+    let mut operations = Vec::new();
+    let mut count = u32::MAX;
+    loop {
+        if count == 0 {
+            return Ok(operations);
+        }
+
+        let operation = Operation::strict_decode(reader)?;
+        let mut defined_seals = SmallOrdMap::strict_decode(reader)?;
+        with_consume_stats(|stats| stats.decoded_ops += 1);
+        defined_seals
+            .extend(seal_resolver(&operation))
+            .map_err(|_| {
+                DecodeError::DataIntegrityError(format!("too many seals for {}", operation.opid()))
+            })?;
+        let witness = Option::<SealWitness<Seal>>::strict_decode(reader)?;
+        if count == u32::MAX {
+            count = u32::strict_decode(reader)?;
+            operations.reserve(count.min(MAX_CONSIGNMENT_OPS) as usize);
+        } else {
+            count -= 1;
+        }
+        operations.push(OperationSeals { operation, defined_seals, witness });
+    }
+}
+
+struct PredecodedOpReader<Seal: RgbSeal>(VecDeque<OperationSeals<Seal>>);
+
+impl<Seal: RgbSeal> ReadOperation for PredecodedOpReader<Seal> {
+    type Seal = Seal;
+
+    fn read_operation(
+        &mut self,
+    ) -> Result<Option<OperationSeals<Self::Seal>>, impl Error + 'static> {
+        Result::<_, core::convert::Infallible>::Ok(self.0.pop_front())
     }
 }
 
