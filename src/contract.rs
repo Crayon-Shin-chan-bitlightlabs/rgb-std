@@ -150,28 +150,6 @@ fn apply_path_witness_prewarm_enabled() -> bool {
     })
 }
 
-/// Diagnostic: when `BITLIGHT_CONSIGN_TRACE_OPID` is set to an opid hex substring, the consign
-/// selection walk and seal-emission path log whether that op was selected, its `up_to` output
-/// count, and the size of its emitted `defined_seals`. Off by default (returns `None`), zero cost
-/// when unset. Throwaway — remove once the SealUnknown localization is done.
-fn consign_trace_opid_hex() -> Option<&'static str> {
-    static TARGET: OnceLock<Option<String>> = OnceLock::new();
-    TARGET
-        .get_or_init(|| {
-            env::var("BITLIGHT_CONSIGN_TRACE_OPID")
-                .ok()
-                .map(|value| value.trim().to_ascii_lowercase())
-                .filter(|value| !value.is_empty())
-        })
-        .as_deref()
-}
-
-fn opid_matches_consign_trace(opid: &Opid) -> bool {
-    consign_trace_opid_hex()
-        .map(|target| format!("{opid:?}").to_ascii_lowercase().contains(target))
-        .unwrap_or(false)
-}
-
 fn op_aux_cache_max_bytes() -> usize {
     static MAX_BYTES: OnceLock<usize> = OnceLock::new();
     *MAX_BYTES.get_or_init(|| {
@@ -543,6 +521,20 @@ pub struct Contract<S: Stock, P: Pile> {
     genesis_verification_memory_staged_for: Option<Opid>,
     /// In-memory cache of valid opids for `ContractApi::is_known(&self)` which requires &self.
     valid_cache: HashSet<Opid>,
+    /// Opids applied as *new* (not-known) during the in-flight consume. `apply_operation` runs
+    /// only for not-known ops (rgb-core invariant) and before `apply_seals` for the same op, so a
+    /// hit here means the op's output seals are not yet stored and `apply_seals` can skip the
+    /// per-op `seal_definitions_match` DB round-trip. Cleared at the start of every consume, so it
+    /// stays bounded by one consignment's new cohort (transient, not a persistent cross-contract
+    /// cache).
+    applied_new_ops: HashSet<Opid>,
+    /// Per-consume, non-evicting backstop for seal definitions batch-loaded by the prewarm
+    /// (known-op aux matches + destructible-input seals). Unlike `seal_def_cache` it is never
+    /// pruned mid-consume, so `are_seals_known` and `known_seal` resolve from memory instead of
+    /// re-issuing a per-op/per-cell DB round-trip after the bounded cache evicts the prewarmed
+    /// entries. Cleared at the start of every consume, so it stays bounded by one consignment's
+    /// working set (transient ~MBs, not a persistent per-contract cache that would grow RSS).
+    consume_seal_defs: HashMap<CellAddr, <P::Seal as RgbSeal>::Definition>,
     seal_def_cache: HashMap<CellAddr, <P::Seal as RgbSeal>::Definition>,
     resolved_seal_cache: HashMap<CellAddr, P::Seal>,
     external_seal_def_cache: Arc<HashMap<CellAddr, <P::Seal as RgbSeal>::Definition>>,
@@ -995,6 +987,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
         let cache_apply_started_at = Instant::now();
         for (addr, seal) in aux_matches.seal_definitions {
+            // Non-evicting backstop so `are_seals_known` still resolves after the bounded
+            // `seal_def_cache` gets pruned mid-consume (deep all-known closures otherwise re-issue
+            // ~5k per-op `seal_definitions_match` DB round-trips ≈ 168s).
+            self.consume_seal_defs.insert(addr, seal.clone());
             self.seal_def_cache.insert(addr, seal);
             self.duplicate_seal_def_cache.insert(addr);
         }
@@ -1057,7 +1053,14 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
         let cells_len = cells.len();
         let preload_started_at = Instant::now();
-        self.pile.session().preload_seals(cells);
+        // `seals_for` batch-loads the definitions (and warms the pile cache) like `preload_seals`,
+        // but also returns them so they can land in the non-evicting `consume_seal_defs` backstop.
+        // That keeps `known_seal` resolving input-cell seals from memory even after the bounded
+        // `seal_def_cache` evicts them during a deep closure (otherwise ~5k per-cell DB ≈ 152s).
+        let loaded = self.pile.session().seals_for(cells.iter().copied());
+        for (addr, seal) in loaded {
+            self.consume_seal_defs.insert(addr, seal);
+        }
         let preload_ms = preload_started_at.elapsed().as_millis() as u64;
 
         tracing::warn!(
@@ -1357,6 +1360,8 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             known_verification_memory: GenesisVerificationMemory::default(),
             genesis_verification_memory_staged_for: None,
             valid_cache: HashSet::from([genesis_opid]),
+            applied_new_ops: HashSet::new(),
+            consume_seal_defs: HashMap::new(),
             seal_def_cache: HashMap::new(),
             resolved_seal_cache: HashMap::new(),
             external_seal_def_cache: Arc::new(HashMap::new()),
@@ -1439,6 +1444,8 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             known_verification_memory: GenesisVerificationMemory::default(),
             genesis_verification_memory_staged_for: None,
             valid_cache: HashSet::from([genesis_opid]),
+            applied_new_ops: HashSet::new(),
+            consume_seal_defs: HashMap::new(),
             seal_def_cache: HashMap::new(),
             resolved_seal_cache: HashMap::new(),
             external_seal_def_cache: Arc::new(HashMap::new()),
@@ -1470,6 +1477,8 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             known_verification_memory: GenesisVerificationMemory::default(),
             genesis_verification_memory_staged_for: None,
             valid_cache: HashSet::new(),
+            applied_new_ops: HashSet::new(),
+            consume_seal_defs: HashMap::new(),
             seal_def_cache: HashMap::new(),
             resolved_seal_cache: HashMap::new(),
             external_seal_def_cache: Arc::new(HashMap::new()),
@@ -1500,14 +1509,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             .convert_owned(cell.data, self.ledger.articles().types())
             .ok()
             .flatten()
-    }
-
-    fn best_op_status(&mut self, opid: Opid) -> WitnessStatus {
-        let wids = self.pile.session().op_witness_ids(opid);
-        wids.into_iter()
-            .map(|wid| self.pile.session().witness_status(wid))
-            .reduce(|best, other| best.best(other))
-            .unwrap_or(WitnessStatus::Genesis)
     }
 
     fn best_op_status_cached(
@@ -2384,13 +2385,35 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         &mut self,
         changed: impl IntoIterator<Item = (<P::Seal as RgbSeal>::WitnessId, WitnessStatus)>,
     ) -> Result<(), MultiError<AcceptError, S::Error>> {
-        // Step 1-2: collect reads
+        // Batch-prewarm the pile-shared witness caches (hoard -> has_witness, stand ->
+        // ops_by_witness_id) and resolve every status up front, so the per-witness reads below
+        // hit memory instead of ~4 DB round-trips each. In replay (no mining) unconfirmed
+        // witnesses accumulate unboundedly; a cache-miss balance refresh surfaced >1500 witnesses
+        // here, ~54s of per-witness round-trips that timed out the 60s balance endpoint.
+        let changed = changed.into_iter().collect::<Vec<_>>();
+        let changed_wids = changed.iter().map(|(wid, _)| *wid).collect::<Vec<_>>();
+        let mut witness_status_map: HashMap<<P::Seal as RgbSeal>::WitnessId, WitnessStatus> = {
+            let mut ps = self.pile.session();
+            ps.preload_consume_witnesses(changed_wids.iter().copied());
+            ps.witness_statuses_for(changed_wids.iter().copied())
+                .into_iter()
+                .collect()
+        };
+
+        // Step 1-2: collect reads (has_witness hits the warm hoard cache; status from the batch)
         let mut affected_wids = IndexMap::new();
         for (wid, status) in changed {
             if !self.pile.session().has_witness(wid) {
                 continue;
             }
-            let prev = self.pile.session().witness_status(wid);
+            let prev = match witness_status_map.get(&wid) {
+                Some(prev) => *prev,
+                None => {
+                    let prev = self.pile.session().witness_status(wid);
+                    witness_status_map.insert(wid, prev);
+                    prev
+                }
+            };
             if status == prev {
                 continue;
             }
@@ -2399,19 +2422,51 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         }
         let status_changed = !affected_wids.is_empty();
 
-        let mut affected_ops = IndexMap::new();
-        // Collect opids first, then compute status separately to avoid borrow conflict
+        // Step 2: map affected witnesses to operations (warm stand cache) and compute each op's
+        // best status from batched forward opid->wids + witness-status lookups, mirroring
+        // `best_op_status` without its per-op/per-witness round-trips.
         let opids_per_wid: Vec<Vec<Opid>> = affected_wids
             .keys()
             .copied()
             .map(|wid| self.pile.session().ops_by_witness_id(wid))
             .collect();
-        for opids in opids_per_wid {
-            for opid in opids {
-                let op_status = self.best_op_status(opid);
-                let old = affected_ops.insert(opid, op_status);
-                debug_assert!(old.is_none() || old == Some(op_status));
+        let affected_opids = opids_per_wid.into_iter().flatten().collect::<IndexSet<_>>();
+        let op_witness_ids_map: HashMap<Opid, Vec<<P::Seal as RgbSeal>::WitnessId>> = {
+            let mut ps = self.pile.session();
+            ps.op_witness_ids_for(affected_opids.iter().copied())
+                .into_iter()
+                .collect()
+        };
+        {
+            let involved_wids = op_witness_ids_map
+                .values()
+                .flatten()
+                .copied()
+                .filter(|wid| !witness_status_map.contains_key(wid))
+                .collect::<HashSet<_>>();
+            if !involved_wids.is_empty() {
+                let mut ps = self.pile.session();
+                for (wid, status) in ps.witness_statuses_for(involved_wids) {
+                    witness_status_map.insert(wid, status);
+                }
             }
+        }
+        let mut affected_ops = IndexMap::new();
+        for opid in affected_opids {
+            let op_status = op_witness_ids_map
+                .get(&opid)
+                .and_then(|wids| {
+                    wids.iter()
+                        .map(|wid| {
+                            witness_status_map
+                                .get(wid)
+                                .copied()
+                                .unwrap_or(WitnessStatus::Archived)
+                        })
+                        .reduce(|best, other| best.best(other))
+                })
+                .unwrap_or(WitnessStatus::Genesis);
+            affected_ops.insert(opid, op_status);
         }
 
         // Step 3: write pile status updates
@@ -2428,7 +2483,23 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         for (opid, old_status) in affected_ops {
             self.remove_op_aux_cache_entry(opid);
             self.evict_op_seal_caches(opid);
-            let new_status = self.best_op_status(opid);
+            // Post-update best status, mirroring `best_op_status` but computed from the batched
+            // maps: a witness just written in step 3 takes its new status, every other witness of
+            // the op keeps its pre-sync status. Avoids a per-op/per-witness DB round-trip here.
+            let new_status = op_witness_ids_map
+                .get(&opid)
+                .and_then(|wids| {
+                    wids.iter()
+                        .map(|wid| {
+                            affected_wids
+                                .get(wid)
+                                .copied()
+                                .or_else(|| witness_status_map.get(wid).copied())
+                                .unwrap_or(WitnessStatus::Archived)
+                        })
+                        .reduce(|best, other| best.best(other))
+                })
+                .unwrap_or(WitnessStatus::Genesis);
             if old_status.is_valid() == new_status.is_valid() {
                 continue;
             }
@@ -2626,25 +2697,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     where
         PS: PileSession<Seal = P::Seal>,
     {
-        let up_to = op.destructible_out.len_u16();
-        let defined_seals = ps.seals(opid, up_to);
-        // Anomaly self-trigger (opid-agnostic): a valid op has one seal definition per destructible
-        // output, so a short `defined_seals` is exactly the op whose missing output seal makes a
-        // fresh receiver reject the consignment with SealUnknown. Fires regardless of which op it
-        // is, since the replay's non-deterministic wallet selection changes the failing op
-        // run to run. Also still fires for an explicitly traced opid even when its emit is
-        // complete.
-        if (defined_seals.len() as u16) < up_to || opid_matches_consign_trace(&opid) {
-            tracing::warn!(
-                stage = "consign_trace_seal_emit",
-                ?opid,
-                up_to,
-                defined_seals = defined_seals.len(),
-                defined_positions = ?defined_seals.keys().copied().collect::<Vec<_>>(),
-                short = (defined_seals.len() as u16) < up_to,
-                "consign trace: emitting defined_seals (short => missing output seal)"
-            );
-        }
+        let defined_seals = ps.seals(opid, op.destructible_out.len_u16());
         let witness = Self::retrieve_with_session(ps, opid);
         OperationSeals { operation: op.clone(), defined_seals, witness }
     }
@@ -2986,13 +3039,23 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let mut retained_bytes = 0usize;
         let mut pending = Vec::new();
         for (idx, (opid, op)) in ops.iter().enumerate() {
-            if self
-                .op_aux_cache
-                .get(opid)
-                .is_some_and(Self::op_aux_entry_covers_outputs)
-            {
-                self.record_op_aux_cache_access(*opid);
-                continue;
+            if let Some(entry) = self.op_aux_cache.get(opid) {
+                if Self::op_aux_entry_covers_outputs(entry) {
+                    // Copy the covering entry into the per-consign `retained` snapshot instead of
+                    // just skipping it. `retained` is the authoritative source the write loop reads;
+                    // the persistent `op_aux_cache` is only 3 MiB and warming the *other* pending
+                    // ops below evicts these covered ones (LRU) before the write loop reaches them.
+                    // Dropping them here left the write loop to rebuild each via a per-op DB round
+                    // trip — a linear wall on deep consigns whose ancestry exceeds the cache (a 9k-op
+                    // consign following another only retained ~4.5k, the rest rebuilt ≈ 200s+).
+                    // Retaining them keeps that knowledge local to this consign (transient, freed
+                    // after write) without growing the persistent cache.
+                    let entry = entry.clone();
+                    retained_bytes = retained_bytes.saturating_add(entry.bytes.len());
+                    retained.insert(*opid, entry);
+                    self.record_op_aux_cache_access(*opid);
+                    continue;
+                }
             }
             self.remove_op_aux_cache_entry(*opid);
             pending.push((idx, *opid, op));
@@ -3026,26 +3089,11 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
             for (idx, opid, op) in pending {
                 let op_started_at = Instant::now();
-                let mut defined_seals = seal_snapshot.remove(&opid).unwrap_or_default();
-                let up_to = op.destructible_out.len_u16();
-                if (defined_seals.len() as u16) < up_to {
-                    let fallback = ps.seals(opid, up_to);
-                    if fallback.len() > defined_seals.len() {
-                        defined_seals = fallback;
-                    }
-                    if (defined_seals.len() as u16) < up_to {
-                        tracing::warn!(
-                            stage = "consign_trace_seal_emit",
-                            ?opid,
-                            up_to,
-                            defined_seals = defined_seals.len(),
-                            defined_positions = ?defined_seals.keys().copied().collect::<Vec<_>>(),
-                            short = true,
-                            source = "prewarm_snapshot_fallback",
-                            "consign trace: emitting defined_seals (short => missing output seal)"
-                        );
-                    }
-                }
+                // The batched snapshot (`seals_for`) is authoritative: it already recovers
+                // owned-but-materialized-lagged output seals from legacy. A short map is normal —
+                // a multi-party op's outputs are split across wallets and this wallet only defines
+                // seals for the ones it owns.
+                let defined_seals = seal_snapshot.remove(&opid).unwrap_or_default();
                 let entry = Self::build_op_aux_cache_entry_with_session_timed(
                     &mut ps,
                     opid,
@@ -3660,14 +3708,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                     pending_opids.remove(&opid);
                                     if selected_opids.insert(opid) {
                                         ordered_opids.push(opid);
-                                        if opid_matches_consign_trace(&opid) {
-                                            tracing::warn!(
-                                                stage = "consign_trace_selected",
-                                                ?opid,
-                                                force_include,
-                                                "consign trace: traced op committed to selection"
-                                            );
-                                        }
                                     }
                                     continue;
                                 }
@@ -3698,17 +3738,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                             forced_destructible_edges.saturating_add(1);
                                     }
                                     let prev = input.addr.opid;
-                                    if opid_matches_consign_trace(&prev) {
-                                        tracing::warn!(
-                                            stage = "consign_trace_edge",
-                                            consumer = ?opid,
-                                            producer = ?prev,
-                                            pos = input.addr.pos,
-                                            already_selected = selected_opids.contains(&prev),
-                                            source = "destructible_in",
-                                            "consign trace: traced producer reached via destructible_in edge"
-                                        );
-                                    }
                                     if prev != genesis_opid && !selected_opids.contains(&prev) {
                                         pending_opids.insert(prev);
                                         stack.push((prev, false, true));
@@ -3727,17 +3756,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                     }
 
                                     let prev = addr.opid;
-                                    if opid_matches_consign_trace(&prev) {
-                                        tracing::warn!(
-                                            stage = "consign_trace_edge",
-                                            consumer = ?opid,
-                                            producer = ?prev,
-                                            pos = addr.pos,
-                                            already_selected = selected_opids.contains(&prev),
-                                            source = "destroyed",
-                                            "consign trace: traced producer reached via destroyed edge"
-                                        );
-                                    }
                                     if prev != genesis_opid && !selected_opids.contains(&prev) {
                                         pending_opids.insert(prev);
                                         stack.push((prev, false, true));
@@ -3753,29 +3771,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 }
                 for opid in published_roots.iter().copied() {
                     include_op_with_dependencies!(opid);
-                }
-
-                // Post-walk producer-coverage check (opid-agnostic anomaly detector). In a full
-                // closure every destructible producer of a selected op must itself be selected (or
-                // genesis) — verify.rs iterates each op's `destructible_in` and throws SealUnknown if
-                // the producing cell's seal cannot be resolved. A referenced producer absent from the
-                // closure positively identifies a selection/walk gap (as opposed to a seals()
-                // emission gap, flagged separately by `consign_trace_seal_emit short=true`).
-                for sel in selected_opids.iter().copied() {
-                    if let Some(op) = operation_cache.get(&sel) {
-                        for input in &op.destructible_in {
-                            let prev = input.addr.opid;
-                            if prev != genesis_opid && !selected_opids.contains(&prev) {
-                                tracing::warn!(
-                                    stage = "consign_gap_producer_unselected",
-                                    consumer = ?sel,
-                                    producer = ?prev,
-                                    pos = input.addr.pos,
-                                    "consign gap: destructible producer of a selected op is absent from the closure"
-                                );
-                            }
-                        }
-                    }
                 }
 
                 if let Some(elapsed_ms) = slow_rgb_stage_elapsed(select_ops_started_at) {
@@ -4112,6 +4107,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             }
 
             let duplicate_cache_started_at = Instant::now();
+            // Reset the per-consume seal-definition backstop up front, then let the prewarm below
+            // repopulate it. Clearing here (rather than inside evaluate_commit, which runs after
+            // prewarm) preserves the prewarmed entries through verification.
+            self.consume_seal_defs.clear();
             let (known_ops, new_ops, opids) = self.partition_consume_operations(&operations);
             self.prewarm_known_operation_duplicate_caches(operations.len(), known_ops);
             self.preload_destructible_input_seals(&operations);
@@ -4272,6 +4271,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             }
 
             let duplicate_cache_started_at = Instant::now();
+            // Reset the per-consume seal-definition backstop up front, then let the prewarm below
+            // repopulate it. Clearing here (rather than inside evaluate_commit, which runs after
+            // prewarm) preserves the prewarmed entries through verification.
+            self.consume_seal_defs.clear();
             let (known_ops, new_ops, opids) = self.partition_consume_operations(&operations);
             self.prewarm_known_operation_duplicate_caches(operations.len(), known_ops);
             self.preload_destructible_input_seals(&operations);
@@ -4377,6 +4380,16 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         <P::Seal as RgbSeal>::Published: StrictDecode,
         <P::Seal as RgbSeal>::WitnessId: StrictDecode,
     {
+        // Fresh per-consume set of not-known ops applied in this run (see `applied_new_ops`); keeps
+        // `apply_seals`'s new-op fast path bounded to this consignment's cohort.
+        self.applied_new_ops.clear();
+        // NB: `consume_seal_defs` is intentionally NOT cleared here. The consume prewarm populates it
+        // *before* calling this method, and clearing it here would wipe those 80k+ prewarmed
+        // known-op/input-cell seal defs before verification ever reads them — leaving known_seal /
+        // are_seals_known to re-hit the DB per op (the ~130s + ~40s residuals). The two prewarming
+        // consume paths clear it up front; the one non-prewarming caller is a fresh contract whose
+        // map is already empty.
+
         // The `consume_evaluate` stage timed by the caller wraps this whole method, i.e. verify
         // *and* both commit_transaction calls. A slow `consume_evaluate` therefore is not
         // necessarily verification CPU; split the three phases so a deep-chain consume can be
@@ -4512,6 +4525,11 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
 
         let definition = if let Some(definition) = self.seal_def_cache.get(&addr) {
             definition.clone()
+        } else if let Some(definition) = self.consume_seal_defs.get(&addr) {
+            // Non-evicting prewarm backstop: input-cell seals batch-loaded by
+            // `preload_destructible_input_seals` survive here after `seal_def_cache` evicts them,
+            // so a deep closure resolves them from memory instead of a per-cell DB round-trip.
+            definition.clone()
         } else if let Some(definition) = self.external_seal_def_cache.get(&addr) {
             let definition = definition.clone();
             self.seal_def_cache.insert(addr, definition.clone());
@@ -4595,8 +4613,14 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
 
         let cached = seals.iter().all(|(no, seal)| {
             let addr = CellAddr::new(opid, *no);
+            // Compare the provided definition against the stored one from either the bounded cache
+            // or the non-evicting prewarm backstop (`consume_seal_defs`, populated from known-op aux
+            // matches). Matching stored defs is exactly what `seal_definitions_match` confirms, so a
+            // hit here is authoritative and skips the per-op DB round-trip after the bounded cache
+            // evicts the prewarmed entries.
             self.seal_def_cache
                 .get(&addr)
+                .or_else(|| self.consume_seal_defs.get(&addr))
                 .is_some_and(|stored| stored == seal)
         });
         if cached {
@@ -4635,6 +4659,17 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
                 stats.known_materialized_skips += 1;
             });
             return true;
+        }
+
+        // A genuinely-new op (not yet valid/known) cannot have its seal definitions stored from
+        // previously accepted data, so `are_seals_known` is false. Skip the per-op materialized
+        // `seal_definitions_match` DB round-trip and take the full-verification path such an op
+        // needs anyway. Only known ops (in `valid_cache`, i.e. `is_known`) reach the DB check. This
+        // removes the seals_known_db storm that dominated deep full-closure accepts (~162s) with no
+        // persistent cache growth. Conservative: a rare op whose seals were stored without the op
+        // becoming valid falls back to full verification rather than being skipped — never unsound.
+        if !self.valid_cache.contains(&opid) {
+            return false;
         }
 
         let db_started_at = Instant::now();
@@ -4682,6 +4717,9 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
 
         let cache_started = Instant::now();
         self.valid_cache.insert(opid);
+        // rgb-core calls `apply_operation` only for not-known ops, before `apply_seals` for the
+        // same op — record it so `apply_seals` can skip the guaranteed-false duplicate DB check.
+        self.applied_new_ops.insert(opid);
         self.remove_op_aux_cache_entry(opid);
         self.clear_owned_state_status_cache();
         let cache_us = cache_started.elapsed().as_micros();
@@ -4760,6 +4798,13 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         let match_started = Instant::now();
         let duplicate = if missing.is_empty() {
             true
+        } else if self.applied_new_ops.contains(&opid) {
+            // Genuinely-new op (applied via `apply_operation` this consume, which runs only for
+            // not-known ops): its output seals have not been stored yet — `apply_seals` is what
+            // stores them — so `seal_definitions_match` is guaranteed false. Skip the per-op
+            // materialized DB round-trip that dominated deep full-closure accepts (8267 new ops
+            // ≈ 141s) without growing any persistent cache. `add_seals` below is idempotent.
+            false
         } else {
             let mut ps = self.pile.session();
             ps.seal_definitions_match(opid, &seals)
@@ -4768,6 +4813,13 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         if duplicate {
             let dup_finalize_started = Instant::now();
             self.seal_def_cache.extend(
+                seals
+                    .iter()
+                    .map(|(no, seal)| (CellAddr::new(opid, *no), seal.clone())),
+            );
+            // Same intra-consignment backstop as the fresh-insert path below: keep these producer
+            // cells resolvable from memory after `seal_def_cache` prunes them (see comment there).
+            self.consume_seal_defs.extend(
                 seals
                     .iter()
                     .map(|(no, seal)| (CellAddr::new(opid, *no), seal.clone())),
@@ -4792,6 +4844,13 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         for (no, seal) in &seals {
             let addr = CellAddr::new(opid, *no);
             self.seal_def_cache.insert(addr, seal.clone());
+            // Non-evicting intra-consignment backstop: this op's freshly-applied output seals are the
+            // producer cells that *later* new ops in the same closure consume. `seal_def_cache` is
+            // bounded and prunes them mid-consume, forcing `known_seal` back to a per-cell DB round
+            // trip on deep closures (~5k checks ≈ 136s). Mirroring them here (cleared per consume,
+            // ~working-set MB) keeps that resolution in memory. The pile-time `seals_for` prewarm
+            // cannot cover these because they are not stored until this very `apply_seals` runs.
+            self.consume_seal_defs.insert(addr, seal.clone());
             self.resolved_seal_cache.remove(&addr);
             self.duplicate_seal_def_cache.insert(addr);
         }
