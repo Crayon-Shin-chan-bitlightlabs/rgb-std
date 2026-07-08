@@ -381,11 +381,32 @@ where
         self.with_contract_mut(contract_id, |contract| contract.valid_opids())
     }
 
+    pub fn contract_operation_output_counts(
+        &mut self,
+        contract_id: ContractId,
+    ) -> Vec<(Opid, u16)> {
+        self.with_contract_mut(contract_id, |contract| contract.operation_output_counts())
+    }
+
     pub fn contract_known_resolved_seals(
         &mut self,
         contract_id: ContractId,
     ) -> Vec<(CellAddr, <Sp::Pile as Pile>::Seal)> {
         self.with_contract_mut(contract_id, |contract| contract.known_resolved_seals())
+    }
+
+    /// Known-seal cells this wallet can actually resolve (see
+    /// [`Contract::known_resolvable_seal_cells`]). Use this — not
+    /// [`Self::contract_known_seal_cells`] — when reporting receiver-known boundaries a payer may
+    /// prune against, so definition-only cells with an absent producer witness are not advertised.
+    pub fn contract_known_resolvable_seal_cells(
+        &mut self,
+        contract_id: ContractId,
+    ) -> Vec<CellAddr>
+    where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: Copy + Ord,
+    {
+        self.with_contract_mut(contract_id, |contract| contract.known_resolvable_seal_cells())
     }
 
     pub fn extend_contract_external_resolved_seals(
@@ -485,6 +506,14 @@ where
             },
             Some(None),
         )
+    }
+
+    pub fn contract_raw_owned_state_cell(
+        &mut self,
+        contract_id: ContractId,
+        addr: CellAddr,
+    ) -> Option<(StateName, StrictVal)> {
+        self.with_contract(contract_id, |contract| contract.raw_owned_state_cell(addr), Some(None))
     }
 
     pub fn contract_resolved_owned_state_entries(
@@ -1232,6 +1261,84 @@ where
         result
     }
 
+    pub fn consign_with_trusted_known_opids(
+        &mut self,
+        contract_id: ContractId,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<()>
+    where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        let started_at = Instant::now();
+        tracing::debug!(
+            operation = "rgb_std",
+            stage = "contracts_consign_known_boundaries_start",
+            ?contract_id,
+            trusted_known_opids = true,
+            "Starting rgb-std contracts consignment wrapper"
+        );
+        let result = self.with_contract_mut(contract_id, |contract| {
+            contract.consign_with_trusted_known_opids(terminals, known_opids, writer)
+        });
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "contracts_consign_known_boundaries_total",
+                elapsed_ms,
+                ?contract_id,
+                trusted_known_opids = true,
+                "Slow rgb-std stage"
+            );
+        }
+        result
+    }
+
+    pub fn consign_with_trusted_known_opids_predecoded(
+        &mut self,
+        contract_id: ContractId,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<Vec<OperationSeals<<Sp::Pile as Pile>::Seal>>>
+    where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        let started_at = Instant::now();
+        tracing::debug!(
+            operation = "rgb_std",
+            stage = "contracts_consign_known_boundaries_start",
+            ?contract_id,
+            trusted_known_opids = true,
+            predecoded_operations = true,
+            "Starting rgb-std contracts consignment wrapper"
+        );
+        let result = self.with_contract_mut(contract_id, |contract| {
+            contract.consign_with_trusted_known_opids_predecoded(terminals, known_opids, writer)
+        });
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "contracts_consign_known_boundaries_total",
+                elapsed_ms,
+                ?contract_id,
+                trusted_known_opids = true,
+                predecoded_operations = true,
+                "Slow rgb-std stage"
+            );
+        }
+        result
+    }
+
     pub fn consign_with_known_cells_opids_and_immutable_checkpoints(
         &mut self,
         contract_id: ContractId,
@@ -1398,6 +1505,60 @@ where
         result
     }
 
+    pub fn consign_with_trusted_known_cells_and_opids_predecoded(
+        &mut self,
+        contract_id: ContractId,
+        terminals: impl IntoIterator<Item = impl Borrow<AuthToken>>,
+        known_cells: impl IntoIterator<Item = impl Borrow<CellAddr>>,
+        known_opids: impl IntoIterator<Item = impl Borrow<Opid>>,
+        writer: StrictWriter<impl WriteRaw>,
+    ) -> io::Result<Vec<OperationSeals<<Sp::Pile as Pile>::Seal>>>
+    where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: Clone,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Client: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: Clone,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::Published: StrictDumb + StrictEncode,
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: StrictEncode,
+    {
+        let started_at = Instant::now();
+        tracing::debug!(
+            operation = "rgb_std",
+            stage = "contracts_consign_known_boundaries_start",
+            ?contract_id,
+            trusted_known_opids = true,
+            predecoded_operations = true,
+            "Starting rgb-std contracts consignment wrapper"
+        );
+        let result = self.with_contract_mut(contract_id, |contract| {
+            tracing::debug!(
+                operation = "rgb_std",
+                stage = "contracts_consign_known_boundaries_contract_ready",
+                ?contract_id,
+                trusted_known_opids = true,
+                predecoded_operations = true,
+                "RGB contract ready for consignment"
+            );
+            contract.consign_with_trusted_known_cells_and_opids_predecoded(
+                terminals,
+                known_cells,
+                known_opids,
+                writer,
+            )
+        });
+        if let Some(elapsed_ms) = slow_rgb_stage_elapsed(started_at) {
+            tracing::warn!(
+                operation = "rgb_std",
+                stage = "contracts_consign_known_boundaries_total",
+                elapsed_ms,
+                ?contract_id,
+                trusted_known_opids = true,
+                predecoded_operations = true,
+                "Slow rgb-std stage"
+            );
+        }
+        result
+    }
+
     pub fn consign_by_addrs(
         &mut self,
         contract_id: ContractId,
@@ -1471,6 +1632,20 @@ where
     {
         self.with_contract_mut(contract_id, |contract| {
             contract.resolved_owned_state_entries_filtered_take(name, predicate, limit)
+        })
+    }
+
+    pub fn resolved_owned_state_entries_for_cells(
+        &mut self,
+        contract_id: ContractId,
+        name: &StateName,
+        cells: impl IntoIterator<Item = CellAddr>,
+    ) -> Vec<OwnedState<<Sp::Pile as Pile>::Seal>>
+    where
+        <Sp::Pile as Pile>::Seal: Clone,
+    {
+        self.with_contract_mut(contract_id, |contract| {
+            contract.resolved_owned_state_entries_for_cells(name, cells)
         })
     }
 
