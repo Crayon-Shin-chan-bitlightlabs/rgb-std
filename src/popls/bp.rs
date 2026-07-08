@@ -708,29 +708,23 @@ where
     /// non-distributed state is used in the change.
     pub fn check_request<T>(&mut self, request: &OpRequest<T>) -> Result<(), UnmatchedState> {
         let contract_id = request.contract_id;
-        let state = self.contracts.contract_state(contract_id);
         let articles = self.contracts.contract_articles(contract_id);
         let api = articles.default_api();
         let mut calcs = BTreeMap::new();
 
         for inp in &request.using {
-            let (state_name, val) = state
-                .owned
-                .iter()
-                .find_map(|(state_name, map)| {
-                    map.iter()
-                        .find(|owned| owned.addr == inp.addr)
-                        .map(|owned| (state_name, owned))
-                })
+            let (state_name, val) = self
+                .contracts
+                .contract_owned_state_cell(contract_id, inp.addr)
                 .expect("unknown state included in the contract stock");
-            let calc = match calcs.entry(state_name.clone()) {
+            let calc = match calcs.entry(state_name) {
                 Entry::Vacant(entry) => {
-                    let calc = api.calculate(state_name.clone())?;
+                    let calc = api.calculate(entry.key().clone())?;
                     entry.insert(calc)
                 }
                 Entry::Occupied(entry) => entry.into_mut(),
             };
-            calc.accumulate(&val.assignment.data)?;
+            calc.accumulate(&val)?;
         }
         for out in &request.owned {
             let calc = match calcs.entry(out.name.clone()) {
