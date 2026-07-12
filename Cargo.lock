@@ -678,7 +678,7 @@ dependencies = [
 [[package]]
 name = "hypersonic"
 version = "0.12.0"
-source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=v0.12.0-perf#394a0780b14733c3b9ca80d92c0ea907485de1a6"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=v0.12.0-perf#346b8c1d97a1ae25cb8e8168d846fdcc32599c4e"
 dependencies = [
  "aluvm",
  "amplify",
@@ -1231,7 +1231,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "sonic-api"
 version = "0.12.0"
-source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=v0.12.0-perf#394a0780b14733c3b9ca80d92c0ea907485de1a6"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=v0.12.0-perf#346b8c1d97a1ae25cb8e8168d846fdcc32599c4e"
 dependencies = [
  "aluvm",
  "amplify",
@@ -1254,7 +1254,7 @@ dependencies = [
 [[package]]
 name = "sonic-callreq"
 version = "0.12.0"
-source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=v0.12.0-perf#394a0780b14733c3b9ca80d92c0ea907485de1a6"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=v0.12.0-perf#346b8c1d97a1ae25cb8e8168d846fdcc32599c4e"
 dependencies = [
  "amplify",
  "baid64",
@@ -1274,7 +1274,7 @@ dependencies = [
 [[package]]
 name = "sonic-persist-fs"
 version = "0.12.0"
-source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=v0.12.0-perf#394a0780b14733c3b9ca80d92c0ea907485de1a6"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=v0.12.0-perf#346b8c1d97a1ae25cb8e8168d846fdcc32599c4e"
 dependencies = [
  "amplify",
  "aora",
