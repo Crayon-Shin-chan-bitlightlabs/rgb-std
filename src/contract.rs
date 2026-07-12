@@ -3936,7 +3936,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 }
 
                 operation_decode_fallbacks = operation_decode_fallbacks.saturating_add(1);
-                let op = self.ledger.operation(opid);
+                // Only the output count is needed here; take the shared Arc so the fallback does
+                // not deep-copy the whole operation just to read a length.
+                let op = self.ledger.operation_arc(opid);
                 Some((opid, op.destructible_out.len_u16()))
             })
             .collect::<Vec<_>>();
