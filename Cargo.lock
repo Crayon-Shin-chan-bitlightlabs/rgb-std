@@ -678,7 +678,7 @@ dependencies = [
 [[package]]
 name = "hypersonic"
 version = "0.12.0"
-source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=v0.12.0-perf#2a3e122821b54900ccbc50e9757ee262bb28cfbc"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=v0.12.0-perf#394a0780b14733c3b9ca80d92c0ea907485de1a6"
 dependencies = [
  "aluvm",
  "amplify",
@@ -1232,7 +1232,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 [[package]]
 name = "sonic-api"
 version = "0.12.0"
-source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=v0.12.0-perf#2a3e122821b54900ccbc50e9757ee262bb28cfbc"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=v0.12.0-perf#394a0780b14733c3b9ca80d92c0ea907485de1a6"
 dependencies = [
  "aluvm",
  "amplify",
@@ -1255,7 +1255,7 @@ dependencies = [
 [[package]]
 name = "sonic-callreq"
 version = "0.12.0"
-source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=v0.12.0-perf#2a3e122821b54900ccbc50e9757ee262bb28cfbc"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=v0.12.0-perf#394a0780b14733c3b9ca80d92c0ea907485de1a6"
 dependencies = [
  "amplify",
  "baid64",
@@ -1275,7 +1275,7 @@ dependencies = [
 [[package]]
 name = "sonic-persist-fs"
 version = "0.12.0"
-source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=v0.12.0-perf#2a3e122821b54900ccbc50e9757ee262bb28cfbc"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git?branch=v0.12.0-perf#394a0780b14733c3b9ca80d92c0ea907485de1a6"
 dependencies = [
  "amplify",
  "aora",
@@ -1507,8 +1507,7 @@ checksum = "1dccffe3ce07af9386bfd29e80c0ab1a8205a2fc34e4bcd40364df902cfa8f3f"
 [[package]]
 name = "ultrasonic"
 version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e69fa4148b5009ac0becf7c258b196a4f00e8a9411ef8ee55445cfa4fe9ab0fd"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/ultrasonic.git?branch=0.12-patch#cdfd9a364d5bee3c5dd6f6ad80de38ee8dceb43b"
 dependencies = [
  "amplify",
  "baid64",

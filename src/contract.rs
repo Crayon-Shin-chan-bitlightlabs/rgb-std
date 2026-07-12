@@ -2969,7 +2969,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
     fn prewarm_op_aux_cache(
         &mut self,
-        ops: &[(Opid, Operation)],
+        ops: &[(Opid, Arc<Operation>)],
         contract_id: ContractId,
     ) -> io::Result<(usize, HashMap<Opid, OpAuxCacheEntry<P::Seal>>)> {
         let prewarm_started_at = Instant::now();
@@ -3685,7 +3685,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                 }
 
                                 let st = session.transition(opid);
-                                for addr in st.destroyed.into_keys() {
+                                for addr in st.destroyed.keys().copied() {
                                     // Destroyed entries carry the same definition dependency as
                                     // explicit destructible inputs; keep their producers as well.
                                     if boundaries.has_known_cells(&addr)
