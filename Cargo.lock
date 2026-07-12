@@ -967,7 +967,7 @@ dependencies = [
 [[package]]
 name = "rgb-core"
 version = "0.12.0"
-source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/rgb-core.git?branch=spike%2Fdag-parallel-verify#6506109f9256688c872f2beda84a38f065f7ff7e"
+source = "git+https://github.com/Crayon-Shin-chan-bitlightlabs/rgb-core.git?branch=spike%2Fdag-parallel-verify#63aaf2fbd936910e8c6c225b10212e209fb2e285"
 dependencies = [
  "amplify",
  "bp-core",

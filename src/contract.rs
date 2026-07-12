@@ -660,17 +660,18 @@ impl SelectionPreloadPlan {
         parent_ops: HashMap<Opid, Vec<Opid>>,
         roots: impl IntoIterator<Item = Opid>,
         genesis_opid: Opid,
+        known_opids: &HashSet<Opid>,
     ) -> Self {
         let parent_count = parent_ops.len();
         let parent_edges = parent_ops.values().map(Vec::len).sum::<usize>();
-        // The selection loop never prunes destructible-lineage producers at known boundaries
-        // (accept must resolve their seal definitions), so the walk is deep regardless; pruning
-        // the plan here would only turn those operations' batched reads into per-op point lookups.
+        // `known_opids` has already been filtered to operations for which every output CellAddr
+        // is present in the receiver's exact known-cell set. It is therefore safe to stop the
+        // preload graph there. Candidate opids without that proof never enter this set.
         let mut opids = HashSet::new();
         let mut stack = roots.into_iter().collect::<Vec<_>>();
 
         while let Some(opid) = stack.pop() {
-            if opid == genesis_opid || !opids.insert(opid) {
+            if opid == genesis_opid || known_opids.contains(&opid) || !opids.insert(opid) {
                 continue;
             }
 
@@ -755,8 +756,8 @@ impl ConsignmentSelectionBoundaries {
 
         let known_opids = core::mem::take(&mut self.known_opids);
         self.known_opids = contract.known_boundary_opids_by_cells(known_opids, &self.known_cells);
-        // Keep known cells after filtering opids so destructible dependencies can
-        // still force their producers into the consignment closure.
+        // Keep exact known cells after filtering opids: destructible dependencies may only stop
+        // at an exact receiver-known CellAddr, never at an opid-only boundary.
     }
 
     fn prune_checkpoint_opids(&mut self, genesis_opid: Opid) {
@@ -773,6 +774,57 @@ impl ConsignmentSelectionBoundaries {
     }
 
     fn has_known_cells(&self, addr: &CellAddr) -> bool { self.known_cells.contains(addr) }
+
+    fn skips_destructible_dependency(&self, addr: &CellAddr) -> bool { self.has_known_cells(addr) }
+}
+
+#[cfg(test)]
+mod consignment_boundary_tests {
+    use super::*;
+
+    fn opid(byte: u8) -> Opid { Opid::from([byte; 32]) }
+
+    #[test]
+    fn destructible_dependency_requires_exact_known_cell() {
+        let producer = opid(1);
+        let cell = CellAddr::new(producer, 3);
+        let opid_only = ConsignmentSelectionBoundaries::new(
+            HashSet::from([producer]),
+            HashSet::new(),
+            HashSet::new(),
+            false,
+        );
+        let exact_cell = ConsignmentSelectionBoundaries::new(
+            HashSet::new(),
+            HashSet::from([cell]),
+            HashSet::new(),
+            false,
+        );
+
+        assert!(!opid_only.skips_destructible_dependency(&cell));
+        assert!(exact_cell.skips_destructible_dependency(&cell));
+    }
+
+    #[test]
+    fn selection_preload_stops_only_at_filtered_known_opid() {
+        let genesis = opid(0);
+        let old = opid(1);
+        let known = opid(2);
+        let root = opid(3);
+        let parents =
+            HashMap::from([(root, vec![known]), (known, vec![old]), (old, vec![genesis])]);
+
+        let plan = SelectionPreloadPlan::from_parent_ops(
+            parents,
+            [root],
+            genesis,
+            &HashSet::from([known]),
+        );
+
+        assert!(plan.opids.contains(&root));
+        assert!(!plan.opids.contains(&known));
+        assert!(!plan.opids.contains(&old));
+    }
 }
 
 impl<S: Stock, P: Pile> Contract<S, P> {
@@ -1609,16 +1661,16 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         resolved
     }
 
-    /// Known-seal cells whose seal can actually be *resolved* by this wallet, i.e. exactly the
-    /// cells for which [`Self::known_seal`] would return `Some` during accept.
+    /// Stable known-seal cells whose seal can be resolved by this wallet.
     ///
     /// A cell only holds a seal *definition* in the pile; a witness-resolved (destructible)
-    /// definition additionally needs its producing operation's witness to be present and valid
-    /// before it can be closed. Reporting a definition-only cell as a receiver-known boundary
+    /// definition additionally needs its producing operation's witness to be present and mined
+    /// before it can be used as a pruning boundary. Reporting a definition-only or unconfirmed
+    /// cell as a receiver-known boundary
     /// lets the payer prune the producer from the consignment, after which the receiver cannot
-    /// resolve the seal and accept fails with `SealUnknown`. This mirrors `known_seal`'s
-    /// resolvability test (`to_src`, else a valid producer witness via `retrieve`) but batches
-    /// the witness lookups, and is never *looser* than `known_seal` — at worst it omits a
+    /// resolve the seal and accept fails with `SealUnknown`. This is stricter than `known_seal`:
+    /// direct seals are accepted immediately, while witness-resolved seals require a stable
+    /// Genesis/Mined producer. It batches the witness lookups and at worst omits a
     /// resolvable cell, which only makes the consignment larger, never unsound.
     pub fn known_resolvable_seal_cells(&mut self) -> Vec<CellAddr>
     where <P::Seal as RgbSeal>::WitnessId: Copy + Ord {
@@ -1663,8 +1715,8 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let mut excluded = 0usize;
         let mut unconfirmed_sample: Vec<(Opid, WitnessStatus)> = Vec::new();
         for (addr, opid) in witness_needed {
-            // Mirror `retrieve_with_session`: pick the best-status witness for the producing
-            // operation and accept the cell only when that best status is valid.
+            // Pick the best-status witness for the producing operation, then require it to be
+            // stable before advertising the cell as a pruning boundary.
             let best = op_wids
                 .get(&opid)
                 .into_iter()
@@ -1672,21 +1724,26 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 .filter_map(|wid| statuses.get(wid).copied().map(|status| (status, *wid)))
                 .reduce(|best, other| if best.0.is_better(other.0) { best } else { other });
             match best {
-                Some((status, _)) if status.is_valid() => {
+                Some((status, _))
+                    if status.is_mined() || matches!(status, WitnessStatus::Genesis) =>
+                {
                     resolvable.push(addr);
-                    if status.is_mined() || matches!(status, WitnessStatus::Genesis) {
-                        witness_stable += 1;
-                    } else {
-                        witness_unconfirmed += 1;
-                        if unconfirmed_sample.len() < 64 {
-                            unconfirmed_sample.push((opid, status));
-                        }
+                    witness_stable += 1;
+                }
+                Some((status, _)) if status.is_valid() => {
+                    // A tentative/offchain producer can be archived between pay and accept. Do
+                    // not advertise its cells as pruning boundaries: including extra history is
+                    // safe, while pruning here can leave the receiver unable to resolve the seal.
+                    witness_unconfirmed += 1;
+                    excluded += 1;
+                    if unconfirmed_sample.len() < 8 {
+                        unconfirmed_sample.push((opid, status));
                     }
                 }
                 _ => excluded += 1,
             }
         }
-        tracing::warn!(
+        tracing::debug!(
             target: "rgb_boundary_diag",
             operation = "rgb_std",
             stage = "known_resolvable_seal_cells",
@@ -3596,6 +3653,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                         .collect::<HashMap<_, _>>(),
                     preload_roots,
                     genesis_opid,
+                    &boundaries.known_opids,
                 );
                 session.preload_selection_plan(&preload_plan);
 
@@ -3624,9 +3682,9 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 let mut pending_opids = HashSet::new();
                 let mut ordered_opids = Vec::new();
                 let mut operation_cache = HashMap::new();
-                let known_cell_edges_skipped = 0usize;
+                let mut known_cell_edges_skipped = 0usize;
                 let mut forced_destructible_edges = 0usize;
-                let known_destructible_edges_skipped = 0usize;
+                let mut known_destructible_edges_skipped = 0usize;
 
                 macro_rules! include_op_with_dependencies {
                     ($root:expr) => {{
@@ -3668,12 +3726,18 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                                 }
 
                                 for input in &op.destructible_in {
-                                    // A destructible input always needs its producer in the
-                                    // closure: accept must resolve the producing cell's seal
-                                    // definition even when the receiver already knows the opid.
-                                    if boundaries.has_known_cells(&input.addr)
-                                        || boundaries.skips_operation(&input.addr.opid)
-                                    {
+                                    // Only an exact CellAddr is a sufficient destructible
+                                    // boundary: it proves the receiver already has both the state
+                                    // cell and its resolvable seal definition. An opid-only hint
+                                    // must never prune this edge.
+                                    if boundaries.skips_destructible_dependency(&input.addr) {
+                                        known_cell_edges_skipped =
+                                            known_cell_edges_skipped.saturating_add(1);
+                                        known_destructible_edges_skipped =
+                                            known_destructible_edges_skipped.saturating_add(1);
+                                        continue;
+                                    }
+                                    if boundaries.skips_operation(&input.addr.opid) {
                                         forced_destructible_edges =
                                             forced_destructible_edges.saturating_add(1);
                                     }
@@ -3686,11 +3750,15 @@ impl<S: Stock, P: Pile> Contract<S, P> {
 
                                 let st = session.transition(opid);
                                 for addr in st.destroyed.keys().copied() {
-                                    // Destroyed entries carry the same definition dependency as
-                                    // explicit destructible inputs; keep their producers as well.
-                                    if boundaries.has_known_cells(&addr)
-                                        || boundaries.skips_operation(&addr.opid)
-                                    {
+                                    // Destroyed entries follow the same exact-cell rule.
+                                    if boundaries.skips_destructible_dependency(&addr) {
+                                        known_cell_edges_skipped =
+                                            known_cell_edges_skipped.saturating_add(1);
+                                        known_destructible_edges_skipped =
+                                            known_destructible_edges_skipped.saturating_add(1);
+                                        continue;
+                                    }
+                                    if boundaries.skips_operation(&addr.opid) {
                                         forced_destructible_edges =
                                             forced_destructible_edges.saturating_add(1);
                                     }
