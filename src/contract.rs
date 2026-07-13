@@ -2377,6 +2377,71 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         ContractState { immutable, owned, aggregated: main.aggregated }
     }
 
+    /// Returns the resolved single-use seal for every owned-state cell whose seal definition is
+    /// known to this wallet's pile, across all owned state names.
+    ///
+    /// This is the cheap "which seals carry RGB state" primitive: it batch-loads the seal
+    /// definitions (`seals_for`) and the witness ids of witness-relative definitions
+    /// (`op_witness_ids_for`) in two snapshot queries and performs no witness-status or
+    /// ancestor-status resolution at all. Callers needing per-cell status must use
+    /// [`Self::state`] or the resolved owned-state entry APIs instead.
+    ///
+    /// Seal membership matches [`Self::state`]: cells whose seal definition is unknown to the
+    /// pile are skipped, and a witness-relative definition is expanded once per known witness id.
+    pub fn owned_seals(&mut self) -> Vec<P::Seal>
+    where P::Seal: Clone {
+        let phase_started_at = Instant::now();
+        let mut addrs = self
+            .ledger
+            .state()
+            .main
+            .owned
+            .values()
+            .flat_map(|cells| cells.keys().copied())
+            .collect::<Vec<_>>();
+        addrs.sort_unstable();
+        addrs.dedup();
+        let cells = addrs.len();
+
+        let mut session = self.pile.session();
+        let seals_by_cell = session.seals_for(addrs.into_iter());
+        let unresolved_opids = seals_by_cell
+            .iter()
+            .filter(|(_, seal)| seal.to_src().is_none())
+            .map(|(addr, _)| addr.opid)
+            .collect::<BTreeSet<_>>();
+        let mut op_wids: BTreeMap<Opid, Vec<<P::Seal as RgbSeal>::WitnessId>> = BTreeMap::new();
+        if !unresolved_opids.is_empty() {
+            op_wids = session
+                .op_witness_ids_for(unresolved_opids.into_iter())
+                .into_iter()
+                .collect();
+        }
+
+        let mut result = Vec::with_capacity(seals_by_cell.len());
+        for (addr, seal) in seals_by_cell {
+            if let Some(seal_src) = seal.to_src() {
+                result.push(seal_src);
+            } else {
+                for wid in op_wids.get(&addr.opid).into_iter().flatten() {
+                    result.push(seal.resolve(*wid));
+                }
+            }
+        }
+        tracing::warn!(
+            target: "rgb_owned_state_diag",
+            operation = "rgb_std",
+            stage = "owned_seals_done",
+            contract_id = ?self.contract_id,
+            cells,
+            resolved = result.len(),
+            unresolved_ops = op_wids.len(),
+            elapsed_ms = phase_started_at.elapsed().as_millis() as u64,
+            "owned_seals batched traversal finished"
+        );
+        result
+    }
+
     pub fn sync(
         &mut self,
         changed: impl IntoIterator<Item = (<P::Seal as RgbSeal>::WitnessId, WitnessStatus)>,
