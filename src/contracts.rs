@@ -475,6 +475,20 @@ where
             .into()
     }
 
+    /// Returns the resolved single-use seal for every owned-state cell of the contract known to
+    /// the pile, without resolving witness statuses. See [`Contract::owned_seals`].
+    ///
+    /// # Panics
+    ///
+    /// If the contract id is not known.
+    pub fn contract_owned_seals(
+        &mut self,
+        contract_id: ContractId,
+    ) -> Vec<<Sp::Pile as Pile>::Seal>
+    where <Sp::Pile as Pile>::Seal: Clone {
+        self.with_contract_mut(contract_id, |contract| contract.owned_seals())
+    }
+
     pub fn contract_owned_state_entries(
         &mut self,
         contract_id: ContractId,
