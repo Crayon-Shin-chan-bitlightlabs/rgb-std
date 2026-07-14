@@ -11,9 +11,22 @@ use std::collections::HashSet;
 
 use amplify::confinement::SmallOrdMap;
 use hypersonic::Opid;
-use rgb::RgbSeal;
+use rgb::{OperationSeals, RgbSeal};
+use single_use_seals::{PublishedWitness, SealWitness};
 
 use crate::CellAddr;
+
+const SEALS_MATCH_BATCH_UP_TO_MAX: u16 = 2048;
+
+#[derive(Clone, Debug)]
+pub struct KnownOperationAuxMatches<Seal: RgbSeal> {
+    pub seal_definitions: Vec<(CellAddr, Seal::Definition)>,
+    pub witnesses: Vec<(Opid, Seal::WitnessId)>,
+}
+
+impl<Seal: RgbSeal> Default for KnownOperationAuxMatches<Seal> {
+    fn default() -> Self { Self { seal_definitions: Vec::new(), witnesses: Vec::new() } }
+}
 
 /// Witness transaction confirmation status.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Display, Default)]
@@ -35,21 +48,11 @@ impl WitnessStatus {
     const OFFCHAIN: u64 = u64::MAX ^ 0x02;
     const ARCHIVED: u64 = u64::MAX;
 
-    pub fn is_mined(&self) -> bool {
-        matches!(self, Self::Mined(_))
-    }
-    pub fn is_valid(&self) -> bool {
-        !matches!(self, Self::Archived)
-    }
-    pub fn is_tentative(&self) -> bool {
-        matches!(self, Self::Tentative)
-    }
-    pub fn is_archived(&self) -> bool {
-        matches!(self, Self::Archived)
-    }
-    pub fn is_offchain(&self) -> bool {
-        matches!(self, Self::Offchain)
-    }
+    pub fn is_mined(&self) -> bool { matches!(self, Self::Mined(_)) }
+    pub fn is_valid(&self) -> bool { !matches!(self, Self::Archived) }
+    pub fn is_tentative(&self) -> bool { matches!(self, Self::Tentative) }
+    pub fn is_archived(&self) -> bool { matches!(self, Self::Archived) }
+    pub fn is_offchain(&self) -> bool { matches!(self, Self::Offchain) }
     pub fn is_mature(self, last_block_height: u64, min_confirmations: u32) -> bool {
         let Self::Mined(height) = self else {
             return false;
@@ -73,12 +76,8 @@ impl WitnessStatus {
         }
     }
 
-    pub fn is_better(self, other: Self) -> bool {
-        self.quasi_height() < other.quasi_height()
-    }
-    pub fn is_worse(self, other: Self) -> bool {
-        !self.is_better(other)
-    }
+    pub fn is_better(self, other: Self) -> bool { self.quasi_height() < other.quasi_height() }
+    pub fn is_worse(self, other: Self) -> bool { !self.is_better(other) }
     pub fn best(self, other: Self) -> Self {
         if self.is_better(other) {
             self
@@ -110,9 +109,7 @@ impl From<[u8; 8]> for WitnessStatus {
 }
 
 impl From<WitnessStatus> for [u8; 8] {
-    fn from(value: WitnessStatus) -> Self {
-        (u64::MAX - value.quasi_height()).to_be_bytes()
-    }
+    fn from(value: WitnessStatus) -> Self { (u64::MAX - value.quasi_height()).to_be_bytes() }
 }
 
 #[derive(Clone, Debug)]
@@ -215,8 +212,115 @@ pub trait PileSession {
         up_to: u16,
     ) -> SmallOrdMap<u16, <Self::Seal as RgbSeal>::Definition>;
 
-    fn preload_aux_reads(&mut self, ops: impl IntoIterator<Item = (Opid, u16)>) {
-        let _ = ops;
+    fn witness_matches(&mut self, opid: Opid, witness: &SealWitness<Self::Seal>) -> bool {
+        let wid = witness.published.pub_id();
+
+        self.op_witness_ids(opid).contains(&wid)
+            && self.has_witness(wid)
+            && self.cli_witness(wid) == witness.client
+    }
+
+    fn seal_definitions_match(
+        &mut self,
+        opid: Opid,
+        seals: &SmallOrdMap<u16, <Self::Seal as RgbSeal>::Definition>,
+    ) -> bool {
+        if seals.is_empty() {
+            return true;
+        }
+
+        if let Some(up_to) = seals
+            .keys()
+            .next_back()
+            .and_then(|no| no.checked_add(1))
+            .filter(|up_to| *up_to <= SEALS_MATCH_BATCH_UP_TO_MAX)
+        {
+            let stored = self.seals(opid, up_to);
+
+            return seals
+                .iter()
+                .all(|(no, seal)| stored.get(no).is_some_and(|stored| stored == seal));
+        }
+
+        seals.iter().all(|(no, seal)| {
+            let addr = CellAddr::new(opid, *no);
+
+            self.seal(addr).is_some_and(|stored| stored == *seal)
+        })
+    }
+
+    fn known_operation_aux_matches(
+        &mut self,
+        operations: &[(Opid, &OperationSeals<Self::Seal>)],
+    ) -> KnownOperationAuxMatches<Self::Seal> {
+        let mut matches = KnownOperationAuxMatches::default();
+
+        for (opid, operation_seals) in operations {
+            let opid = *opid;
+
+            if !operation_seals.defined_seals.is_empty()
+                && self.seal_definitions_match(opid, &operation_seals.defined_seals)
+            {
+                matches.seal_definitions.extend(
+                    operation_seals
+                        .defined_seals
+                        .iter()
+                        .map(|(no, seal)| (CellAddr::new(opid, *no), seal.clone())),
+                );
+            }
+
+            if let Some(witness) = &operation_seals.witness {
+                if self.witness_matches(opid, witness) {
+                    matches.witnesses.push((opid, witness.published.pub_id()));
+                }
+            }
+        }
+
+        matches
+    }
+
+    fn preload_aux_reads(&mut self, ops: impl IntoIterator<Item = (Opid, u16)>) { let _ = ops; }
+
+    fn preload_seals(&mut self, addrs: impl IntoIterator<Item = CellAddr>) { let _ = addrs; }
+
+    /// Preloads the apply-path seal-definition existence for an operation's *own* output cells.
+    ///
+    /// Unlike [`Self::preload_seals`] (which only positively caches cells that resolve to a stored
+    /// definition), database backends may override this to *also* negatively cache cells confirmed
+    /// absent, so that the per-op [`Self::seal_definitions_match`] check during apply resolves from
+    /// cache without issuing a database round-trip. Negative caching must only be applied when the
+    /// backing lookups completed successfully; on lookup failure the cell is left uncached for the
+    /// conservative lazy path. The default implementation is a no-op.
+    fn preload_consume_output_seals(&mut self, addrs: impl IntoIterator<Item = CellAddr>) {
+        let _ = addrs;
+    }
+
+    /// Preloads apply-path witness existence for the new-operation cohort.
+    ///
+    /// Backends may override this to batch the lookups used by [`Self::has_witness`]. Missing
+    /// witness ids may be negatively cached only when the backing lookup completes successfully;
+    /// on lookup failure the id must remain uncached for the conservative lazy path. The default
+    /// implementation is a no-op.
+    fn preload_consume_witnesses(
+        &mut self,
+        witness_ids: impl IntoIterator<Item = <Self::Seal as RgbSeal>::WitnessId>,
+    ) {
+        let _ = witness_ids;
+    }
+
+    /// Preloads backend duplicate-check lookups for operation data that may be staged during
+    /// consume evaluation.
+    ///
+    /// The default implementation is a no-op. Database backends may override this to batch the
+    /// existence checks performed by [`Self::add_seals`] and [`Self::add_witness`] without changing
+    /// de-duplication semantics.
+    fn preload_consume_insert_lookups<'a>(
+        &mut self,
+        operations: impl IntoIterator<Item = &'a OperationSeals<Self::Seal>>,
+    ) where
+        Self::Seal: 'a,
+    {
+        let _ = operations;
     }
 
     fn known_boundary_opids_by_cells(
@@ -276,9 +380,7 @@ pub trait PileSession {
     /// method as a no-op to avoid a per-operation database round-trip.  The outer
     /// [`Contract::evaluate_commit`] still calls [`Pile::commit_transaction`] once at the end
     /// to durably persist all accumulated writes.
-    fn include_commit_transaction(&mut self) {
-        self.commit_transaction();
-    }
+    fn include_commit_transaction(&mut self) { self.commit_transaction(); }
 }
 
 /// Persistent storage for contract witness and single-use seal definition data.
@@ -290,16 +392,13 @@ pub trait Pile {
     /// Session type for all I/O access.
     /// For lock-free backends: `type Session<'s> = &'s mut Self`.
     type Session<'s>: PileSession<Seal = Self::Seal, Error = Self::Error>
-    where
-        Self: 's;
+    where Self: 's;
 
     fn new(conf: Self::Conf) -> Result<Self, Self::Error>
-    where
-        Self: Sized;
+    where Self: Sized;
 
     fn load(conf: Self::Conf) -> Result<Self, Self::Error>
-    where
-        Self: Sized;
+    where Self: Sized;
 
     /// Opens a session for all I/O operations.
     fn session(&mut self) -> Self::Session<'_>;

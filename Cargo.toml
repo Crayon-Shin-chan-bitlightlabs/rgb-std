@@ -25,7 +25,7 @@ sonic-persist-fs = "0.12.0"
 sonix = "0.12.0"
 bp-core = "0.12.0"
 bp-invoice = "0.12.0-rc.2"
-rgb-core = { git = "https://github.com/Crayon-Shin-chan-bitlightlabs/rgb-core.git", branch = "v0.12.0-perf" }
+rgb-core = { git = "https://github.com/Crayon-Shin-chan-bitlightlabs/rgb-core.git", branch = "v0.12.0-perf-202607" }
 rgb-std = { version = "0.12.0-rc.3", path = "." }
 rgb-invoice = { version = "0.12.0-rc.3", path = "./invoice" }
 rgb-persist-fs = { version = "0.12.0-rc.3", path = "./persistence/fs" }
@@ -95,6 +95,9 @@ bitcoin = ["bp-core", "bp-invoice", "rgb-core/bitcoin", "rgb-invoice/bitcoin"]
 liquid = ["rgb-core/liquid", "rgb-invoice/liquid"]
 prime = ["rgb-core/prime", "rgb-invoice/prime"]
 
+# Diagnostics-only: forward serial verification timing metrics. Off by default.
+verify-diagnostics = ["std", "rgb-core/verify-diagnostics"]
+
 uri = ["rgb-invoice/uri"]
 binfile = ["std", "dep:binfile", "hypersonic/binfile", "aora/file-strict"]
 
@@ -128,10 +131,11 @@ wasm-bindgen-test = "0.3"
 features = ["all"]
 
 [patch.crates-io]
-hypersonic = { git = "https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git", branch = "feat/session-ledger" }
-sonic-persist-fs = { git = "https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git", branch = "feat/session-ledger" }
-sonic-callreq = { git = "https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git", branch = "feat/session-ledger" }
-sonic-api = { git = "https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git", branch = "feat/session-ledger" }
+hypersonic = { git = "https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git", branch = "v0.12.0-perf" }
+sonic-persist-fs = { git = "https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git", branch = "v0.12.0-perf" }
+sonic-callreq = { git = "https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git", branch = "v0.12.0-perf" }
+sonic-api = { git = "https://github.com/Crayon-Shin-chan-bitlightlabs/sonic.git", branch = "v0.12.0-perf" }
+
 
 [lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = ['cfg(coverage_nightly)'] }
