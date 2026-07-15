@@ -588,6 +588,24 @@ fn with_consume_stats(update: impl FnOnce(&mut ConsumeStats)) {
     });
 }
 
+/// A newly-applied operation must always persist its output-seal membership for this pile.
+/// Prewarm caches may already contain the same immutable definition (for example via a
+/// contract-wide materialized lookup), but that proves byte equality only — not that this
+/// wallet/pile owns a durable membership row. The eventual `add_seals` is idempotent.
+fn output_seals_are_already_persisted(
+    applied_new_operation: bool,
+    all_definitions_cached: bool,
+    durable_match: impl FnOnce() -> bool,
+) -> bool {
+    if applied_new_operation {
+        false
+    } else if all_definitions_cached {
+        true
+    } else {
+        durable_match()
+    }
+}
+
 /// Operation counts of the most recently completed consume on this thread.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LastConsumeOpCounts {
@@ -766,6 +784,21 @@ mod consignment_boundary_tests {
     use super::*;
 
     fn opid(byte: u8) -> Opid { Opid::from([byte; 32]) }
+
+    #[test]
+    fn new_operation_persists_seals_even_when_every_definition_is_prewarmed() {
+        let durable_lookup_called = core::cell::Cell::new(false);
+        let duplicate = output_seals_are_already_persisted(true, true, || {
+            durable_lookup_called.set(true);
+            true
+        });
+
+        assert!(!duplicate, "a cache hit is not proof of this pile's membership");
+        assert!(
+            !durable_lookup_called.get(),
+            "new operations must take the idempotent add_seals path without a DB lookup"
+        );
+    }
 
     #[test]
     fn destructible_dependency_requires_exact_known_cell() {
@@ -4809,16 +4842,18 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         }
         with_consume_stats(|stats| stats.seal_updates_non_empty += 1);
         let total_started = Instant::now();
+        let applied_new_operation = self.applied_new_ops.contains(&opid);
 
         let cached_dup_started = Instant::now();
-        let cached_duplicate = seals.iter().all(|(no, seal)| {
-            let addr = CellAddr::new(opid, *no);
-            self.duplicate_seal_def_cache.contains(&addr)
-                && self
-                    .seal_def_cache
-                    .get(&addr)
-                    .is_some_and(|stored| stored == seal)
-        });
+        let cached_duplicate = !applied_new_operation
+            && seals.iter().all(|(no, seal)| {
+                let addr = CellAddr::new(opid, *no);
+                self.duplicate_seal_def_cache.contains(&addr)
+                    && self
+                        .seal_def_cache
+                        .get(&addr)
+                        .is_some_and(|stored| stored == seal)
+            });
         let cached_dup_us = cached_dup_started.elapsed().as_micros();
         if cached_duplicate {
             self.remove_op_aux_cache_entry(opid);
@@ -4855,19 +4890,15 @@ impl<S: Stock, P: Pile> ContractApi<P::Seal> for Contract<S, P> {
         let missing_us = missing_started.elapsed().as_micros();
 
         let match_started = Instant::now();
-        let duplicate = if missing.is_empty() {
-            true
-        } else if self.applied_new_ops.contains(&opid) {
-            // Genuinely-new op (applied via `apply_operation` this consume, which runs only for
-            // not-known ops): its output seals have not been stored yet — `apply_seals` is what
-            // stores them — so `seal_definitions_match` is guaranteed false. Skip the per-op
-            // materialized DB round-trip that dominated deep full-closure accepts (8267 new ops
-            // ≈ 141s) without growing any persistent cache. `add_seals` below is idempotent.
-            false
-        } else {
-            let mut ps = self.pile.session();
-            ps.seal_definitions_match(opid, &seals)
-        };
+        // Genuinely-new ops take precedence over cache hits. The output-seal prewarm may have
+        // found matching immutable bytes through a contract-wide materialized row, but that does
+        // not prove this wallet's pile membership exists. Always run the idempotent `add_seals`
+        // path for an op applied in this consume; known ops may keep the cached/durable shortcut.
+        let duplicate =
+            output_seals_are_already_persisted(applied_new_operation, missing.is_empty(), || {
+                let mut ps = self.pile.session();
+                ps.seal_definitions_match(opid, &seals)
+            });
         let match_us = match_started.elapsed().as_micros();
         if duplicate {
             let dup_finalize_started = Instant::now();
