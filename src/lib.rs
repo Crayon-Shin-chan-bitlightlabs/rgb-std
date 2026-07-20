@@ -72,8 +72,9 @@ pub mod stl;
 pub use bp::{Outpoint, Txid};
 pub use consignment::{parse_consignment, Consignment, MAX_CONSIGNMENT_OPS};
 pub use contract::{
-    take_last_consume_op_counts, Assignment, ConsumeError, Contract, ContractState, CreateParams,
-    EitherSeal, ImmutableState, LastConsumeOpCounts, OwnedState,
+    take_last_consume_op_counts, take_last_consume_phase_stats, Assignment, ConsumeError, Contract,
+    ContractState, CreateParams, EitherSeal, ImmutableState, LastConsumeOpCounts,
+    LastConsumePhaseStats, OwnedState,
 };
 #[cfg(feature = "async")]
 pub use contracts::TxidResolver;

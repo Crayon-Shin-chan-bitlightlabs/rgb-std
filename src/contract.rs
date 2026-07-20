@@ -640,6 +640,38 @@ pub fn take_last_consume_op_counts() -> LastConsumeOpCounts {
     LAST_CONSUME_OP_COUNTS.with(|c| c.take())
 }
 
+/// Phase timing of the most recently completed consume on this thread. Values are populated only
+/// when `RGB_VERIFY_DIAG` is enabled. The host must take them immediately after its consume call;
+/// this preserves request correlation without a process-global map or any protocol-path state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LastConsumePhaseStats {
+    pub recorded: bool,
+    pub verify_ms: u128,
+    pub flush_witness_ms: u128,
+    pub pending_witness_updates: usize,
+    pub applied_witness_updates: usize,
+    pub ledger_commit_ms: u128,
+    pub pile_commit_ms: u128,
+}
+
+thread_local! {
+    static LAST_CONSUME_PHASE_STATS: core::cell::Cell<LastConsumePhaseStats> =
+        const { core::cell::Cell::new(LastConsumePhaseStats {
+            recorded: false,
+            verify_ms: 0,
+            flush_witness_ms: 0,
+            pending_witness_updates: 0,
+            applied_witness_updates: 0,
+            ledger_commit_ms: 0,
+            pile_commit_ms: 0,
+        }) };
+}
+
+/// Returns and resets the request-local consume phase timing recorded on this thread.
+pub fn take_last_consume_phase_stats() -> LastConsumePhaseStats {
+    LAST_CONSUME_PHASE_STATS.with(|stats| stats.take())
+}
+
 /// Accumulated per-phase wall time of the consign prewarm loop, reported with the
 /// `consign_prewarm_operations` summary so its residual is attributable per phase.
 #[derive(Default)]
@@ -4471,6 +4503,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         <P::Seal as RgbSeal>::Published: StrictDecode,
         <P::Seal as RgbSeal>::WitnessId: StrictDecode,
     {
+        LAST_CONSUME_PHASE_STATS.with(|stats| stats.set(LastConsumePhaseStats::default()));
         // Fresh per-consume set of not-known ops applied in this run (see `applied_new_ops`); keeps
         // `apply_seals`'s new-op fast path bounded to this consignment's cohort.
         self.applied_new_ops.clear();
@@ -4524,6 +4557,17 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             Some(pile_commit_ms),
         ) = (verify_ms, flush_witness_ms, ledger_commit_ms, pile_commit_ms)
         {
+            LAST_CONSUME_PHASE_STATS.with(|stats| {
+                stats.set(LastConsumePhaseStats {
+                    recorded: true,
+                    verify_ms,
+                    flush_witness_ms,
+                    pending_witness_updates: pending_witness_update_count,
+                    applied_witness_updates: applied_witness_update_count,
+                    ledger_commit_ms,
+                    pile_commit_ms,
+                })
+            });
             tracing::warn!(
                 target: "rgb_verify_diag",
                 operation = "rgb_std",
