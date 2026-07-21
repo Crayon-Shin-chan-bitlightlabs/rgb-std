@@ -1204,67 +1204,6 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         );
     }
 
-    /// Batch-preload each operation's *own* output-seal cells so the per-op
-    /// `seal_definitions_match` during apply resolves from the pile cache instead of issuing a
-    /// per-op database round-trip. Cells are opid-scoped; the negative cache is overwritten by
-    /// `add_seals` when an op is applied, so the prewarm snapshot stays coherent within the
-    /// consume.
-    fn preload_consume_output_seals(
-        &mut self,
-        new_operations: &[(Opid, &OperationSeals<P::Seal>)],
-    ) {
-        if new_operations.is_empty() {
-            return;
-        }
-        let total_started_at = Instant::now();
-        let collect_started_at = Instant::now();
-        // Restrict to the new cohort: only ops absent from `valid_cache` miss the rgb-std
-        // `seal_def_cache` and thus reach the pile `seal_definitions_match` during apply. Known /
-        // aux-cached ops are short-circuited by the duplicate prewarm, so preloading their cells is
-        // wasted work.
-        let cells = new_operations
-            .iter()
-            .flat_map(|(opid, operation_seals)| {
-                operation_seals
-                    .defined_seals
-                    .keys()
-                    .map(move |no| CellAddr::new(*opid, *no))
-            })
-            .collect::<BTreeSet<_>>();
-        let collect_ms = collect_started_at.elapsed().as_millis() as u64;
-        if cells.is_empty() {
-            return;
-        }
-
-        let cells_len = cells.len();
-        let preload_started_at = Instant::now();
-        self.pile
-            .session()
-            .preload_consume_output_seals(cells.iter().copied());
-        let preload_ms = preload_started_at.elapsed().as_millis() as u64;
-        let cache_started_at = Instant::now();
-        let loaded_seals = self.pile.session().seals_for(cells.iter().copied());
-        let loaded_seals_len = loaded_seals.len();
-        self.seal_def_cache.extend(loaded_seals);
-        self.prune_contract_caches();
-        let cache_ms = cache_started_at.elapsed().as_millis() as u64;
-
-        tracing::warn!(
-            target: "rgb_prewarm_diag",
-            operation = "rgb_std",
-            stage = "preload_consume_output_seals",
-            contract_id = ?self.contract_id,
-            new_ops = new_operations.len(),
-            cells = cells_len,
-            loaded_seals = loaded_seals_len,
-            collect_ms,
-            preload_ms,
-            cache_ms,
-            total_ms = total_started_at.elapsed().as_millis() as u64,
-            "apply-path output seal preload breakdown"
-        );
-    }
-
     /// Batch-preload the new cohort's witness ids into the pile witness existence cache. This
     /// deliberately only targets `has_witness`; the reverse `ops_by_witness_id` path stays lazy
     /// until measurements show it is worth a separate batch cache.
@@ -4336,11 +4275,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             with_consume_stats(|stats| {
                 stats.prewarm_destructible_inputs_us += phase_started_at.elapsed().as_micros()
             });
-            let phase_started_at = Instant::now();
-            self.preload_consume_output_seals(&new_ops);
-            with_consume_stats(|stats| {
-                stats.prewarm_output_seals_us += phase_started_at.elapsed().as_micros()
-            });
+            // Do not preload the new cohort's own output seals. `apply_operation` records every
+            // genuinely-new op in `applied_new_ops`, and `apply_seals` then unconditionally takes
+            // the idempotent `add_seals` path without consulting durable membership. Preloading
+            // these not-yet-owned cells would only issue materialized + legacy absence reads.
             let phase_started_at = Instant::now();
             self.preload_consume_witnesses(&new_ops);
             with_consume_stats(|stats| {
@@ -4533,11 +4471,8 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             with_consume_stats(|stats| {
                 stats.prewarm_destructible_inputs_us += phase_started_at.elapsed().as_micros()
             });
-            let phase_started_at = Instant::now();
-            self.preload_consume_output_seals(&new_ops);
-            with_consume_stats(|stats| {
-                stats.prewarm_output_seals_us += phase_started_at.elapsed().as_micros()
-            });
+            // See the default consume path above: new output seals are persisted idempotently and
+            // never need a durable-membership preload before verification.
             let phase_started_at = Instant::now();
             self.preload_consume_witnesses(&new_ops);
             with_consume_stats(|stats| {
