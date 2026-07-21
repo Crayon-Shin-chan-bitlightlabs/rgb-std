@@ -574,6 +574,13 @@ struct ConsumeStats {
     known_materialized_skips: usize,
     predecoded_resolver_calls: usize,
     predecoded_resolver_skips: usize,
+    prewarm_total_us: u128,
+    prewarm_partition_us: u128,
+    prewarm_known_duplicates_us: u128,
+    prewarm_destructible_inputs_us: u128,
+    prewarm_output_seals_us: u128,
+    prewarm_witnesses_us: u128,
+    prewarm_insert_lookups_us: u128,
 }
 
 thread_local! {
@@ -652,6 +659,13 @@ pub struct LastConsumePhaseStats {
     pub applied_witness_updates: usize,
     pub ledger_commit_ms: u128,
     pub pile_commit_ms: u128,
+    pub prewarm_total_us: u128,
+    pub prewarm_partition_us: u128,
+    pub prewarm_known_duplicates_us: u128,
+    pub prewarm_destructible_inputs_us: u128,
+    pub prewarm_output_seals_us: u128,
+    pub prewarm_witnesses_us: u128,
+    pub prewarm_insert_lookups_us: u128,
 }
 
 thread_local! {
@@ -664,12 +678,35 @@ thread_local! {
             applied_witness_updates: 0,
             ledger_commit_ms: 0,
             pile_commit_ms: 0,
+            prewarm_total_us: 0,
+            prewarm_partition_us: 0,
+            prewarm_known_duplicates_us: 0,
+            prewarm_destructible_inputs_us: 0,
+            prewarm_output_seals_us: 0,
+            prewarm_witnesses_us: 0,
+            prewarm_insert_lookups_us: 0,
         }) };
 }
 
 /// Returns and resets the request-local consume phase timing recorded on this thread.
 pub fn take_last_consume_phase_stats() -> LastConsumePhaseStats {
     LAST_CONSUME_PHASE_STATS.with(|stats| stats.take())
+}
+
+fn record_last_consume_prewarm_phase_stats(stats: &ConsumeStats) {
+    LAST_CONSUME_PHASE_STATS.with(|last| {
+        let mut phase = last.get();
+        if phase.recorded {
+            phase.prewarm_total_us = stats.prewarm_total_us;
+            phase.prewarm_partition_us = stats.prewarm_partition_us;
+            phase.prewarm_known_duplicates_us = stats.prewarm_known_duplicates_us;
+            phase.prewarm_destructible_inputs_us = stats.prewarm_destructible_inputs_us;
+            phase.prewarm_output_seals_us = stats.prewarm_output_seals_us;
+            phase.prewarm_witnesses_us = stats.prewarm_witnesses_us;
+            phase.prewarm_insert_lookups_us = stats.prewarm_insert_lookups_us;
+            last.set(phase);
+        }
+    });
 }
 
 /// Accumulated per-phase wall time of the consign prewarm loop, reported with the
@@ -829,6 +866,56 @@ mod consignment_boundary_tests {
         assert!(
             !durable_lookup_called.get(),
             "new operations must take the idempotent add_seals path without a DB lookup"
+        );
+    }
+
+    #[test]
+    fn prewarm_phase_stats_merge_preserves_commit_fields_and_is_one_shot() {
+        LAST_CONSUME_PHASE_STATS.with(|last| {
+            last.set(LastConsumePhaseStats {
+                recorded: true,
+                verify_ms: 11,
+                flush_witness_ms: 12,
+                pending_witness_updates: 13,
+                applied_witness_updates: 14,
+                ledger_commit_ms: 15,
+                pile_commit_ms: 16,
+                ..LastConsumePhaseStats::default()
+            })
+        });
+        let stats = ConsumeStats {
+            prewarm_total_us: 101,
+            prewarm_partition_us: 102,
+            prewarm_known_duplicates_us: 103,
+            prewarm_destructible_inputs_us: 104,
+            prewarm_output_seals_us: 105,
+            prewarm_witnesses_us: 106,
+            prewarm_insert_lookups_us: 107,
+            ..ConsumeStats::default()
+        };
+
+        record_last_consume_prewarm_phase_stats(&stats);
+
+        assert_eq!(take_last_consume_phase_stats(), LastConsumePhaseStats {
+            recorded: true,
+            verify_ms: 11,
+            flush_witness_ms: 12,
+            pending_witness_updates: 13,
+            applied_witness_updates: 14,
+            ledger_commit_ms: 15,
+            pile_commit_ms: 16,
+            prewarm_total_us: 101,
+            prewarm_partition_us: 102,
+            prewarm_known_duplicates_us: 103,
+            prewarm_destructible_inputs_us: 104,
+            prewarm_output_seals_us: 105,
+            prewarm_witnesses_us: 106,
+            prewarm_insert_lookups_us: 107,
+        });
+        assert_eq!(
+            take_last_consume_phase_stats(),
+            LastConsumePhaseStats::default(),
+            "taking request-local stats must reset them before the next consume"
         );
     }
 
@@ -4234,12 +4321,37 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             // repopulate it. Clearing here (rather than inside evaluate_commit, which runs after
             // prewarm) preserves the prewarmed entries through verification.
             self.consume_seal_defs.clear();
+            let phase_started_at = Instant::now();
             let (known_ops, new_ops, opids) = self.partition_consume_operations(&operations);
+            with_consume_stats(|stats| {
+                stats.prewarm_partition_us += phase_started_at.elapsed().as_micros()
+            });
+            let phase_started_at = Instant::now();
             self.prewarm_known_operation_duplicate_caches(operations.len(), known_ops);
+            with_consume_stats(|stats| {
+                stats.prewarm_known_duplicates_us += phase_started_at.elapsed().as_micros()
+            });
+            let phase_started_at = Instant::now();
             self.preload_destructible_input_seals(&operations);
+            with_consume_stats(|stats| {
+                stats.prewarm_destructible_inputs_us += phase_started_at.elapsed().as_micros()
+            });
+            let phase_started_at = Instant::now();
             self.preload_consume_output_seals(&new_ops);
+            with_consume_stats(|stats| {
+                stats.prewarm_output_seals_us += phase_started_at.elapsed().as_micros()
+            });
+            let phase_started_at = Instant::now();
             self.preload_consume_witnesses(&new_ops);
+            with_consume_stats(|stats| {
+                stats.prewarm_witnesses_us += phase_started_at.elapsed().as_micros()
+            });
+            let phase_started_at = Instant::now();
             self.preload_consume_insert_lookups(operations.len(), new_ops);
+            with_consume_stats(|stats| {
+                stats.prewarm_insert_lookups_us += phase_started_at.elapsed().as_micros();
+                stats.prewarm_total_us += duplicate_cache_started_at.elapsed().as_micros();
+            });
             if let Some(elapsed_ms) = slow_rgb_stage_elapsed(duplicate_cache_started_at) {
                 tracing::warn!(
                     operation = "rgb_std",
@@ -4260,6 +4372,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 .with(|stats| stats.replace(previous_stats))
                 .unwrap_or_default();
             record_last_consume_op_counts(&stats);
+            record_last_consume_prewarm_phase_stats(&stats);
             if let Some(elapsed_ms) = slow_rgb_stage_elapsed(evaluate_started_at) {
                 tracing::warn!(
                     operation = "rgb_std",
@@ -4307,6 +4420,13 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     apply_operation_ledger_apply_us = stats.apply_operation_ledger_apply_us,
                     apply_operation_cache_us = stats.apply_operation_cache_us,
                     known_materialized_skips = stats.known_materialized_skips,
+                    prewarm_total_us = stats.prewarm_total_us,
+                    prewarm_partition_us = stats.prewarm_partition_us,
+                    prewarm_known_duplicates_us = stats.prewarm_known_duplicates_us,
+                    prewarm_destructible_inputs_us = stats.prewarm_destructible_inputs_us,
+                    prewarm_output_seals_us = stats.prewarm_output_seals_us,
+                    prewarm_witnesses_us = stats.prewarm_witnesses_us,
+                    prewarm_insert_lookups_us = stats.prewarm_insert_lookups_us,
                     seal_def_cache_entries = self.seal_def_cache.len(),
                     resolved_seal_cache_entries = self.resolved_seal_cache.len(),
                     duplicate_seal_def_cache_entries = self.duplicate_seal_def_cache.len(),
@@ -4398,12 +4518,37 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             // repopulate it. Clearing here (rather than inside evaluate_commit, which runs after
             // prewarm) preserves the prewarmed entries through verification.
             self.consume_seal_defs.clear();
+            let phase_started_at = Instant::now();
             let (known_ops, new_ops, opids) = self.partition_consume_operations(&operations);
+            with_consume_stats(|stats| {
+                stats.prewarm_partition_us += phase_started_at.elapsed().as_micros()
+            });
+            let phase_started_at = Instant::now();
             self.prewarm_known_operation_duplicate_caches(operations.len(), known_ops);
+            with_consume_stats(|stats| {
+                stats.prewarm_known_duplicates_us += phase_started_at.elapsed().as_micros()
+            });
+            let phase_started_at = Instant::now();
             self.preload_destructible_input_seals(&operations);
+            with_consume_stats(|stats| {
+                stats.prewarm_destructible_inputs_us += phase_started_at.elapsed().as_micros()
+            });
+            let phase_started_at = Instant::now();
             self.preload_consume_output_seals(&new_ops);
+            with_consume_stats(|stats| {
+                stats.prewarm_output_seals_us += phase_started_at.elapsed().as_micros()
+            });
+            let phase_started_at = Instant::now();
             self.preload_consume_witnesses(&new_ops);
+            with_consume_stats(|stats| {
+                stats.prewarm_witnesses_us += phase_started_at.elapsed().as_micros()
+            });
+            let phase_started_at = Instant::now();
             self.preload_consume_insert_lookups(operations.len(), new_ops);
+            with_consume_stats(|stats| {
+                stats.prewarm_insert_lookups_us += phase_started_at.elapsed().as_micros();
+                stats.prewarm_total_us += duplicate_cache_started_at.elapsed().as_micros();
+            });
             if let Some(elapsed_ms) = slow_rgb_stage_elapsed(duplicate_cache_started_at) {
                 tracing::warn!(
                     operation = "rgb_std",
@@ -4425,6 +4570,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 .with(|stats| stats.replace(previous_stats))
                 .unwrap_or_default();
             record_last_consume_op_counts(&stats);
+            record_last_consume_prewarm_phase_stats(&stats);
             if let Some(elapsed_ms) = slow_rgb_stage_elapsed(evaluate_started_at) {
                 tracing::warn!(
                     operation = "rgb_std",
@@ -4475,6 +4621,13 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     known_materialized_skips = stats.known_materialized_skips,
                     predecoded_resolver_calls = stats.predecoded_resolver_calls,
                     predecoded_resolver_skips = stats.predecoded_resolver_skips,
+                    prewarm_total_us = stats.prewarm_total_us,
+                    prewarm_partition_us = stats.prewarm_partition_us,
+                    prewarm_known_duplicates_us = stats.prewarm_known_duplicates_us,
+                    prewarm_destructible_inputs_us = stats.prewarm_destructible_inputs_us,
+                    prewarm_output_seals_us = stats.prewarm_output_seals_us,
+                    prewarm_witnesses_us = stats.prewarm_witnesses_us,
+                    prewarm_insert_lookups_us = stats.prewarm_insert_lookups_us,
                     seal_def_cache_entries = self.seal_def_cache.len(),
                     resolved_seal_cache_entries = self.resolved_seal_cache.len(),
                     duplicate_seal_def_cache_entries = self.duplicate_seal_def_cache.len(),
@@ -4566,6 +4719,13 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     applied_witness_updates: applied_witness_update_count,
                     ledger_commit_ms,
                     pile_commit_ms,
+                    prewarm_total_us: 0,
+                    prewarm_partition_us: 0,
+                    prewarm_known_duplicates_us: 0,
+                    prewarm_destructible_inputs_us: 0,
+                    prewarm_output_seals_us: 0,
+                    prewarm_witnesses_us: 0,
+                    prewarm_insert_lookups_us: 0,
                 })
             });
             tracing::warn!(
