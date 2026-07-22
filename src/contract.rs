@@ -261,6 +261,18 @@ pub struct ContractState<Seal> {
     pub aggregated: BTreeMap<StateName, StrictVal>,
 }
 
+/// Receiver-known cells together with the operations whose complete output set is contained in
+/// those cells.
+///
+/// Instances are built from the pile's authoritative known-cell membership and live witness
+/// statuses. In particular, this is not a monotonic snapshot: witness reorgs may remove cells from
+/// a later result.
+#[derive(Clone, Eq, PartialEq, Debug, Default)]
+pub struct KnownResolvableBoundary {
+    pub cells: Vec<CellAddr>,
+    pub opids: Vec<Opid>,
+}
+
 impl<Seal> ContractState<Seal> {
     pub fn map<To>(self, f: impl Fn(Seal) -> To) -> ContractState<To> {
         ContractState {
@@ -1749,10 +1761,17 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     pub fn known_resolvable_seal_cells(&mut self) -> Vec<CellAddr>
     where <P::Seal as RgbSeal>::WitnessId: Copy + Ord {
         let cells = self.known_seal_cells();
+        let member_cells = cells.iter().copied().collect::<HashSet<_>>();
         let definitions = self.pile.session().seals_for(cells);
         let mut resolvable = Vec::with_capacity(definitions.len());
         let mut witness_needed: Vec<(CellAddr, Opid)> = Vec::new();
         for (addr, definition) in definitions {
+            // `seals_for` is required to answer only requested cells, but retain the membership
+            // proof locally so the combined boundary API below never trusts an implementation
+            // that accidentally returns an extra definition.
+            if !member_cells.contains(&addr) {
+                continue;
+            }
             if definition.to_src().is_some() {
                 resolvable.push(addr);
             } else {
@@ -1833,6 +1852,20 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         resolvable
     }
 
+    /// Returns receiver-known resolvable cells and their complete-output operation boundary.
+    ///
+    /// Unlike calling [`Self::known_resolvable_seal_cells`] followed by
+    /// [`Self::boundary_opids_for_known_cells`], this reuses the membership proof established by
+    /// the first traversal instead of loading all known seal cells from the pile a second time.
+    /// The existing public boundary method keeps its independent membership check for arbitrary
+    /// caller-provided cells.
+    pub fn known_resolvable_boundary(&mut self) -> KnownResolvableBoundary
+    where <P::Seal as RgbSeal>::WitnessId: Copy + Ord {
+        let cells = self.known_resolvable_seal_cells();
+        let opids = self.boundary_opids_for_member_cells(cells.iter().copied());
+        KnownResolvableBoundary { cells, opids }
+    }
+
     pub fn valid_opids(&mut self) -> Vec<Opid> {
         self.refresh_valid_cache();
         self.valid_cache.iter().copied().collect()
@@ -1892,13 +1925,22 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             return vec![];
         }
 
-        let mut pile_session = self.pile.session();
-        let known_seal_cells = pile_session
+        let known_seal_cells = self
+            .pile
+            .session()
             .known_seal_cells()
             .into_iter()
-            .filter(|cell| known_cells.contains(cell));
+            .filter(|cell| known_cells.contains(cell))
+            .collect::<Vec<_>>();
+        self.boundary_opids_for_member_cells(known_seal_cells)
+    }
+
+    fn boundary_opids_for_member_cells(
+        &mut self,
+        member_cells: impl IntoIterator<Item = CellAddr>,
+    ) -> Vec<Opid> {
         let mut known_positions_by_opid = HashMap::<Opid, HashSet<u16>>::new();
-        for cell in known_seal_cells {
+        for cell in member_cells {
             known_positions_by_opid
                 .entry(cell.opid)
                 .or_default()

@@ -53,8 +53,9 @@ use strict_types::StrictVal;
 
 use crate::{
     parse_consignment, Articles, Assignment, Consensus, Consignment, ConsumeError, Contract,
-    ContractRef, ContractState, CreateParams, Identity, ImmutableState, Issuer, Operation,
-    OwnedState, Pile, SigBlob, StateName, Stockpile, WitnessStatus,
+    ContractRef, ContractState, CreateParams, Identity, ImmutableState, Issuer,
+    KnownResolvableBoundary, Operation, OwnedState, Pile, SigBlob, StateName, Stockpile,
+    WitnessStatus,
 };
 
 const RGB_STD_SLOW_STAGE_THRESHOLD: Duration = Duration::from_millis(500);
@@ -407,6 +408,18 @@ where
         <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: Copy + Ord,
     {
         self.with_contract_mut(contract_id, |contract| contract.known_resolvable_seal_cells())
+    }
+
+    /// Returns the receiver-known resolvable cells and complete-output operation boundary in one
+    /// membership-verified traversal. See [`Contract::known_resolvable_boundary`].
+    pub fn contract_known_resolvable_boundary(
+        &mut self,
+        contract_id: ContractId,
+    ) -> KnownResolvableBoundary
+    where
+        <<Sp::Pile as Pile>::Seal as RgbSeal>::WitnessId: Copy + Ord,
+    {
+        self.with_contract_mut(contract_id, |contract| contract.known_resolvable_boundary())
     }
 
     pub fn extend_contract_external_resolved_seals(
