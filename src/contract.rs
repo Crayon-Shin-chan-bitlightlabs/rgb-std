@@ -665,6 +665,7 @@ pub fn take_last_consume_op_counts() -> LastConsumeOpCounts {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LastConsumePhaseStats {
     pub recorded: bool,
+    pub evaluate_total_ms: u128,
     pub verify_ms: u128,
     pub flush_witness_ms: u128,
     pub pending_witness_updates: usize,
@@ -684,6 +685,7 @@ thread_local! {
     static LAST_CONSUME_PHASE_STATS: core::cell::Cell<LastConsumePhaseStats> =
         const { core::cell::Cell::new(LastConsumePhaseStats {
             recorded: false,
+            evaluate_total_ms: 0,
             verify_ms: 0,
             flush_witness_ms: 0,
             pending_witness_updates: 0,
@@ -705,10 +707,82 @@ pub fn take_last_consume_phase_stats() -> LastConsumePhaseStats {
     LAST_CONSUME_PHASE_STATS.with(|stats| stats.take())
 }
 
-fn record_last_consume_prewarm_phase_stats(stats: &ConsumeStats) {
+/// Request-local timing and population counters for the most recent receiver-boundary traversal.
+///
+/// The host must take this immediately after `known_resolvable_boundary`. Keeping the snapshot
+/// thread-local preserves request correlation without making cache residency or diagnostics part
+/// of the receiver-boundary correctness decision.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LastKnownResolvableBoundaryPhaseStats {
+    pub recorded: bool,
+    pub total_us: u128,
+    pub known_cells_query_us: u128,
+    pub membership_set_us: u128,
+    pub seals_for_query_us: u128,
+    pub definition_partition_us: u128,
+    pub witness_opid_set_us: u128,
+    pub witness_session_open_us: u128,
+    pub op_witness_ids_query_us: u128,
+    pub witness_id_set_us: u128,
+    pub witness_statuses_query_us: u128,
+    pub witness_classify_us: u128,
+    pub boundary_positions_us: u128,
+    pub operation_output_counts_query_us: u128,
+    pub boundary_filter_us: u128,
+    pub known_cells: usize,
+    pub seal_definitions: usize,
+    pub direct_cells: usize,
+    pub witness_needed_cells: usize,
+    pub witness_opids: usize,
+    pub witness_ids: usize,
+    pub witness_statuses: usize,
+    pub boundary_cells: usize,
+    pub operation_output_counts: usize,
+    pub boundary_opids: usize,
+}
+
+thread_local! {
+    static LAST_KNOWN_RESOLVABLE_BOUNDARY_PHASE_STATS:
+        core::cell::Cell<LastKnownResolvableBoundaryPhaseStats> =
+            const { core::cell::Cell::new(LastKnownResolvableBoundaryPhaseStats {
+                recorded: false,
+                total_us: 0,
+                known_cells_query_us: 0,
+                membership_set_us: 0,
+                seals_for_query_us: 0,
+                definition_partition_us: 0,
+                witness_opid_set_us: 0,
+                witness_session_open_us: 0,
+                op_witness_ids_query_us: 0,
+                witness_id_set_us: 0,
+                witness_statuses_query_us: 0,
+                witness_classify_us: 0,
+                boundary_positions_us: 0,
+                operation_output_counts_query_us: 0,
+                boundary_filter_us: 0,
+                known_cells: 0,
+                seal_definitions: 0,
+                direct_cells: 0,
+                witness_needed_cells: 0,
+                witness_opids: 0,
+                witness_ids: 0,
+                witness_statuses: 0,
+                boundary_cells: 0,
+                operation_output_counts: 0,
+                boundary_opids: 0,
+            }) };
+}
+
+/// Returns and resets the receiver-boundary timing recorded on this thread.
+pub fn take_last_known_resolvable_boundary_phase_stats() -> LastKnownResolvableBoundaryPhaseStats {
+    LAST_KNOWN_RESOLVABLE_BOUNDARY_PHASE_STATS.with(|stats| stats.take())
+}
+
+fn record_last_consume_prewarm_phase_stats(stats: &ConsumeStats, evaluate_total_ms: u128) {
     LAST_CONSUME_PHASE_STATS.with(|last| {
         let mut phase = last.get();
         if phase.recorded {
+            phase.evaluate_total_ms = evaluate_total_ms;
             phase.prewarm_total_us = stats.prewarm_total_us;
             phase.prewarm_partition_us = stats.prewarm_partition_us;
             phase.prewarm_known_duplicates_us = stats.prewarm_known_duplicates_us;
@@ -906,10 +980,11 @@ mod consignment_boundary_tests {
             ..ConsumeStats::default()
         };
 
-        record_last_consume_prewarm_phase_stats(&stats);
+        record_last_consume_prewarm_phase_stats(&stats, 108);
 
         assert_eq!(take_last_consume_phase_stats(), LastConsumePhaseStats {
             recorded: true,
+            evaluate_total_ms: 108,
             verify_ms: 11,
             flush_witness_ms: 12,
             pending_witness_updates: 13,
@@ -1760,11 +1835,21 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     /// resolvable cell, which only makes the consignment larger, never unsound.
     pub fn known_resolvable_seal_cells(&mut self) -> Vec<CellAddr>
     where <P::Seal as RgbSeal>::WitnessId: Copy + Ord {
+        let total_started_at = Instant::now();
+        let known_cells_started_at = Instant::now();
         let cells = self.known_seal_cells();
+        let known_cells_query_us = known_cells_started_at.elapsed().as_micros();
+        let known_cells = cells.len();
+        let membership_set_started_at = Instant::now();
         let member_cells = cells.iter().copied().collect::<HashSet<_>>();
+        let membership_set_us = membership_set_started_at.elapsed().as_micros();
+        let seals_for_started_at = Instant::now();
         let definitions = self.pile.session().seals_for(cells);
+        let seals_for_query_us = seals_for_started_at.elapsed().as_micros();
+        let seal_definitions = definitions.len();
         let mut resolvable = Vec::with_capacity(definitions.len());
         let mut witness_needed: Vec<(CellAddr, Opid)> = Vec::new();
+        let definition_partition_started_at = Instant::now();
         for (addr, definition) in definitions {
             // `seals_for` is required to answer only requested cells, but retain the membership
             // proof locally so the combined boundary API below never trusts an implementation
@@ -1778,24 +1863,56 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 witness_needed.push((addr, addr.opid));
             }
         }
+        let definition_partition_us = definition_partition_started_at.elapsed().as_micros();
+        let direct_cells = resolvable.len();
+        let witness_needed_cells = witness_needed.len();
+        let mut phase_stats = LastKnownResolvableBoundaryPhaseStats {
+            recorded: true,
+            known_cells_query_us,
+            membership_set_us,
+            seals_for_query_us,
+            definition_partition_us,
+            known_cells,
+            seal_definitions,
+            direct_cells,
+            witness_needed_cells,
+            ..LastKnownResolvableBoundaryPhaseStats::default()
+        };
         if witness_needed.is_empty() {
+            phase_stats.boundary_cells = resolvable.len();
+            phase_stats.total_us = total_started_at.elapsed().as_micros();
+            LAST_KNOWN_RESOLVABLE_BOUNDARY_PHASE_STATS.with(|last| last.set(phase_stats));
             return resolvable;
         }
 
+        let witness_opid_set_started_at = Instant::now();
         let opids = witness_needed
             .iter()
             .map(|(_, opid)| *opid)
             .collect::<BTreeSet<_>>();
+        phase_stats.witness_opid_set_us = witness_opid_set_started_at.elapsed().as_micros();
+        phase_stats.witness_opids = opids.len();
+        let witness_session_started_at = Instant::now();
         let mut session = self.pile.session();
+        phase_stats.witness_session_open_us = witness_session_started_at.elapsed().as_micros();
+        let op_witness_ids_started_at = Instant::now();
         let op_wids = session
             .op_witness_ids_for(opids.into_iter())
             .into_iter()
             .collect::<BTreeMap<Opid, Vec<<P::Seal as RgbSeal>::WitnessId>>>();
+        phase_stats.op_witness_ids_query_us = op_witness_ids_started_at.elapsed().as_micros();
+        let witness_id_set_started_at = Instant::now();
         let all_wids = op_wids.values().flatten().copied().collect::<BTreeSet<_>>();
+        phase_stats.witness_id_set_us = witness_id_set_started_at.elapsed().as_micros();
+        phase_stats.witness_ids = all_wids.len();
+        let witness_statuses_started_at = Instant::now();
         let statuses = session
             .witness_statuses_for(all_wids.into_iter())
             .into_iter()
             .collect::<BTreeMap<<P::Seal as RgbSeal>::WitnessId, WitnessStatus>>();
+        phase_stats.witness_statuses_query_us =
+            witness_statuses_started_at.elapsed().as_micros();
+        phase_stats.witness_statuses = statuses.len();
 
         // Diagnostics: how the witness-resolved cells were classified. A cell reported as a
         // boundary on the strength of a *tentative/offchain* producer witness is fragile — that
@@ -1807,6 +1924,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         let mut witness_unconfirmed = 0usize;
         let mut excluded = 0usize;
         let mut unconfirmed_sample: Vec<(Opid, WitnessStatus)> = Vec::new();
+        let witness_classify_started_at = Instant::now();
         for (addr, opid) in witness_needed {
             // Pick the best-status witness for the producing operation, then require it to be
             // stable before advertising the cell as a pruning boundary.
@@ -1836,6 +1954,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 _ => excluded += 1,
             }
         }
+        phase_stats.witness_classify_us = witness_classify_started_at.elapsed().as_micros();
+        phase_stats.boundary_cells = resolvable.len();
+        phase_stats.total_us = total_started_at.elapsed().as_micros();
+        LAST_KNOWN_RESOLVABLE_BOUNDARY_PHASE_STATS.with(|last| last.set(phase_stats));
         tracing::debug!(
             target: "rgb_boundary_diag",
             operation = "rgb_std",
@@ -1861,8 +1983,17 @@ impl<S: Stock, P: Pile> Contract<S, P> {
     /// caller-provided cells.
     pub fn known_resolvable_boundary(&mut self) -> KnownResolvableBoundary
     where <P::Seal as RgbSeal>::WitnessId: Copy + Ord {
+        let total_started_at = Instant::now();
         let cells = self.known_resolvable_seal_cells();
         let opids = self.boundary_opids_for_member_cells(cells.iter().copied());
+        LAST_KNOWN_RESOLVABLE_BOUNDARY_PHASE_STATS.with(|last| {
+            let mut stats = last.get();
+            stats.recorded = true;
+            stats.total_us = total_started_at.elapsed().as_micros();
+            stats.boundary_cells = cells.len();
+            stats.boundary_opids = opids.len();
+            last.set(stats);
+        });
         KnownResolvableBoundary { cells, opids }
     }
 
@@ -1939,6 +2070,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
         &mut self,
         member_cells: impl IntoIterator<Item = CellAddr>,
     ) -> Vec<Opid> {
+        let boundary_positions_started_at = Instant::now();
         let mut known_positions_by_opid = HashMap::<Opid, HashSet<u16>>::new();
         for cell in member_cells {
             known_positions_by_opid
@@ -1946,9 +2078,15 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 .or_default()
                 .insert(cell.pos);
         }
+        let boundary_positions_us = boundary_positions_started_at.elapsed().as_micros();
 
-        self.ledger
-            .operation_output_counts()
+        let operation_output_counts_started_at = Instant::now();
+        let operation_output_counts = self.ledger.operation_output_counts();
+        let operation_output_counts_query_us =
+            operation_output_counts_started_at.elapsed().as_micros();
+        let operation_output_count = operation_output_counts.len();
+        let boundary_filter_started_at = Instant::now();
+        let opids = operation_output_counts
             .into_iter()
             .filter_map(|(opid, count)| {
                 let known_positions = known_positions_by_opid.get(&opid)?;
@@ -1956,7 +2094,19 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                     && (0..count).all(|pos| known_positions.contains(&pos)))
                 .then_some(opid)
             })
-            .collect()
+            .collect::<Vec<_>>();
+        let boundary_filter_us = boundary_filter_started_at.elapsed().as_micros();
+        LAST_KNOWN_RESOLVABLE_BOUNDARY_PHASE_STATS.with(|last| {
+            let mut stats = last.get();
+            stats.recorded = true;
+            stats.boundary_positions_us = boundary_positions_us;
+            stats.operation_output_counts_query_us = operation_output_counts_query_us;
+            stats.boundary_filter_us = boundary_filter_us;
+            stats.operation_output_counts = operation_output_count;
+            stats.boundary_opids = opids.len();
+            last.set(stats);
+        });
+        opids
     }
 
     pub fn witness_ids(&mut self) -> Vec<<P::Seal as RgbSeal>::WitnessId> {
@@ -4352,7 +4502,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 .with(|stats| stats.replace(previous_stats))
                 .unwrap_or_default();
             record_last_consume_op_counts(&stats);
-            record_last_consume_prewarm_phase_stats(&stats);
+            record_last_consume_prewarm_phase_stats(
+                &stats,
+                evaluate_started_at.elapsed().as_millis(),
+            );
             if let Some(elapsed_ms) = slow_rgb_stage_elapsed(evaluate_started_at) {
                 tracing::warn!(
                     operation = "rgb_std",
@@ -4547,7 +4700,10 @@ impl<S: Stock, P: Pile> Contract<S, P> {
                 .with(|stats| stats.replace(previous_stats))
                 .unwrap_or_default();
             record_last_consume_op_counts(&stats);
-            record_last_consume_prewarm_phase_stats(&stats);
+            record_last_consume_prewarm_phase_stats(
+                &stats,
+                evaluate_started_at.elapsed().as_millis(),
+            );
             if let Some(elapsed_ms) = slow_rgb_stage_elapsed(evaluate_started_at) {
                 tracing::warn!(
                     operation = "rgb_std",
@@ -4690,6 +4846,7 @@ impl<S: Stock, P: Pile> Contract<S, P> {
             LAST_CONSUME_PHASE_STATS.with(|stats| {
                 stats.set(LastConsumePhaseStats {
                     recorded: true,
+                    evaluate_total_ms: 0,
                     verify_ms,
                     flush_witness_ms,
                     pending_witness_updates: pending_witness_update_count,

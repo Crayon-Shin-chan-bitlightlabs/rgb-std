@@ -14,7 +14,7 @@ use bp::seals::{Anchor, TxoSeal, WTxoSeal};
 use bp::{LockTime, Tx};
 use commit_verify::{Digest, DigestExt, Sha256};
 use hypersonic::{CallParams, CellAddr};
-use rgb::{CoreParams, NamedState, Outpoint};
+use rgb::{take_last_known_resolvable_boundary_phase_stats, CoreParams, NamedState, Outpoint};
 use rgbcore::{ContractApi, RgbSealDef};
 use single_use_seals::SealWitness;
 use strict_encoding::{vname, StrictDumb};
@@ -133,9 +133,20 @@ fn known_resolvable_boundary_matches_membership_checked_path() {
 
     let expected_cells = contract.known_resolvable_seal_cells();
     let expected_opids = contract.boundary_opids_for_known_cells(expected_cells.iter().copied());
+    let _ = take_last_known_resolvable_boundary_phase_stats();
     let boundary = contract.known_resolvable_boundary();
+    let phase_stats = take_last_known_resolvable_boundary_phase_stats();
 
     assert!(!expected_opids.is_empty());
+    assert!(phase_stats.recorded);
+    assert_eq!(phase_stats.boundary_cells, boundary.cells.len());
+    assert_eq!(phase_stats.boundary_opids, boundary.opids.len());
+    assert_eq!(phase_stats.operation_output_counts, contract.operation_output_counts().len());
+    assert_eq!(
+        take_last_known_resolvable_boundary_phase_stats(),
+        Default::default(),
+        "taking request-local boundary stats must clear the previous traversal"
+    );
     assert_eq!(
         boundary.cells.into_iter().collect::<BTreeSet<_>>(),
         expected_cells.iter().copied().collect::<BTreeSet<_>>()
